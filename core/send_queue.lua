@@ -22,10 +22,14 @@ local SendQueue = {
   lastSentAt = nil,
   floodChain = 0,
   sent = 0,
+  -- Bytes of the lines handed to the client; read by the activity meter only.
+  sentBytes = 0,
   delayed = 0,
   coalesced = 0,
   dropped = 0,
   maxWait = 0,
+  -- Submission counter: the age order for drops once live entries go first.
+  submitted = 0,
 }
 
 WF.SendQueue = SendQueue
@@ -38,6 +42,22 @@ local function Call(entry)
   if n == 2 then return pcall(entry.fn, entry.a1, entry.a2) end
   if n == 3 then return pcall(entry.fn, entry.a1, entry.a2, entry.a3) end
   return pcall(entry.fn, entry.a1, entry.a2, entry.a3, entry.a4)
+end
+
+-- The line is the longest string argument in every send shape (prefix, chat
+-- type and target are shorter than any envelope). Counting only, no effect.
+local function Longer(value, longest)
+  if type(value) == "string" and #value > longest then return #value end
+  return longest
+end
+
+local function CountBytes(entry)
+  local n = entry.n or 4
+  local longest = Longer(entry.a1, 0)
+  if n >= 2 then longest = Longer(entry.a2, longest) end
+  if n >= 3 then longest = Longer(entry.a3, longest) end
+  if n >= 4 then longest = Longer(entry.a4, longest) end
+  SendQueue.sentBytes = SendQueue.sentBytes + longest
 end
 
 -- done(ok, err, skipped): skipped is true when the entry never reached the client.
@@ -59,7 +79,7 @@ local function Dispatch(entry, now)
     SendQueue.maxWait = now - entry.queuedAt
   end
   local ok, err = Call(entry)
-  if ok then err = nil else err = tostring(err) end
+  if ok then err = nil; CountBytes(entry) else err = tostring(err) end
   Finish(entry, ok, err, false)
   return ok, err
 end
@@ -98,10 +118,31 @@ end
 SendQueue.DropRank = DropRank
 
 -- entry = { fn, n (argument count, so a probe can omit trailing arguments),
--- a1..a4, done, key, priority }. A queued entry with the same key is
--- superseded: removed and replaced by the new one at the tail, which keeps
--- sequence order. Returns accepted, error, queued; an immediate send reports
+-- a1..a4, done, key, priority, live }. A queued entry with the same key is
+-- superseded: removed and replaced by the new one at the tail (the live tail for
+-- a live entry), which keeps sequence order. Returns accepted, error, queued; an immediate send reports
 -- its own result.
+-- The lowest lane (decision 0110): sends entry at once only when nothing waits
+-- in the gate and nothing left it for `quiet` seconds, else refuses it. It
+-- never queues and never touches lastSentAt or floodChain, so a gameplay line
+-- submitted next is never held back by it. One such send every 4 s at most
+-- (modules/boards.lua) stays inside the anti-flood margin above FLOOD_BURST.
+function SendQueue:SendIdle(entry, quiet)
+  if type(entry) ~= "table" or type(entry.fn) ~= "function" then return false, "send function is unavailable", false end
+  local now = WF.Now()
+  if #self.queue > 0 then return false, "gate busy", false end
+  if self.lastSentAt and now - self.lastSentAt < (quiet or self.FLOOD_GAP) then return false, "gate recently used", false end
+  if entry.accounted then
+    local ok, err = Dispatch(entry, now)
+    return ok, err, true
+  end
+  self.idleSent = (self.idleSent or 0) + 1
+  local ok, err = Call(entry)
+  if ok then err = nil; CountBytes(entry) else err = tostring(err) end
+  Finish(entry, ok, err, false)
+  return ok, err, true
+end
+
 function SendQueue:Submit(entry)
   if type(entry) ~= "table" or type(entry.fn) ~= "function" then
     return false, "send function is unavailable"
@@ -127,13 +168,15 @@ function SendQueue:Submit(entry)
     end
   end
   while #queue >= self.MAX_QUEUED do
-    -- The oldest entry of the lowest rank goes; the new entry itself goes when
-    -- everything queued matters more. Queue order is never changed.
+    -- The oldest submitted entry of the lowest rank goes; the new entry itself
+    -- goes when everything queued matters more. Queue order is never changed.
     local victim, rank = 1, DropRank(queue[1])
     local index = 2
     while index <= #queue do
       local candidate = DropRank(queue[index])
-      if candidate < rank then victim, rank = index, candidate end
+      if candidate < rank or (candidate == rank and queue[index].submitted < queue[victim].submitted) then
+        victim, rank = index, candidate
+      end
       index = index + 1
     end
     self.dropped = self.dropped + 1
@@ -145,10 +188,45 @@ function SendQueue:Submit(entry)
     Finish(old, false, "dropped: send queue full", true)
   end
   entry.queuedAt = now
-  queue[#queue + 1] = entry
+  self.submitted = self.submitted + 1
+  entry.submitted = self.submitted
+  if entry.live then
+    -- Presence and state lines carry age 0 when built (risk B10, decision
+    -- 0095): after the last live entry, ahead of the others, order kept.
+    local at = 1
+    for index = 1, #queue do
+      if queue[index].live then at = index + 1 end
+    end
+    table.insert(queue, at, entry)
+  else
+    queue[#queue + 1] = entry
+  end
   self.delayed = self.delayed + 1
   if frame then frame:SetScript("OnUpdate", OnUpdate) end
   return true, nil, true
+end
+
+-- Drops the queued entries whose text argument stale(text) names (a line of
+-- an ended campaign, decision 0103 § 4b); each reports a skipped send.
+function SendQueue:Purge(stale)
+  local queue, dropped, index = self.queue, 0, 1
+  while index <= #queue do
+    local entry = queue[index]
+    local hit = false
+    local args = { entry.a1, entry.a2, entry.a3, entry.a4 }
+    for i = 1, 4 do
+      if type(args[i]) == "string" and stale(args[i]) then hit = true end
+    end
+    if hit then
+      table.remove(queue, index)
+      dropped = dropped + 1
+      Finish(entry, false, "dropped: campaign over", true)
+    else
+      index = index + 1
+    end
+  end
+  self.dropped = self.dropped + dropped
+  return dropped
 end
 
 function SendQueue:Summary()

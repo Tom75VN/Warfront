@@ -34,6 +34,8 @@ local MAX_GATHERERS = 40
 local PLAUSIBILITY_SLACK = 5
 local REPLY_MATCHES = 2
 local REPLY_ANY = 4
+-- Gathering bonus on enemy-held ground (decision 0117): +30 %, in tenths.
+local PLUNDER_TENTHS = 3
 
 Stock.TYPES = TYPES
 Stock.GATHER_TICK = GATHER_TICK
@@ -195,7 +197,7 @@ end
 function Stock:TakeOver(id, now)
   local st, info = self.states[id], self:Info(id)
   Anchor(st, info, now)
-  st.epoch = st.epoch + 1
+  st.epoch = WF.Serial.Next(st.epoch)
   st.seq = 0
   st.authority = Me()
   st.epochHolder = st.authority
@@ -297,7 +299,7 @@ function Stock:ParseState(parts)
   if not info then return nil, "unknown resource POI" end
   local f = {
     id = parts[1],
-    epoch = Int(parts[2], 1000000),
+    epoch = Int(parts[2], WF.Serial.MAX),
     seq = Int(parts[3], 100000000),
     stock = Int(parts[4], info.capacity),
     n = Int(parts[5], MAX_GATHERERS),
@@ -329,7 +331,7 @@ function Stock:OnStateMessage(sender, f, now)
     WF.Capture:RefreshPresence(id, sender, now)
     -- A provisional or restored stock never refuses a live one.
     if st.known and not st.provisional then
-      if f.epoch < st.epoch then return self:Reject("old stock epoch", sender) end
+      if WF.Serial.Newer(st.epoch, f.epoch) then return self:Reject("old stock epoch", sender) end
       if f.epoch == st.epoch then
         local holder = st.authority or st.epochHolder
         if holder and holder ~= sender then
@@ -441,7 +443,35 @@ function Stock:Gather(now)
   local amount = math.min(GATHER_AMOUNT, level)
   if amount <= 0 then return end
   local added = WF.Economy:Add(info.resource, amount)
+  if added > 0 and self:PlunderApplies(here.id) then
+    local extra = self:Plunder(info.resource, added)
+    if extra > 0 then added = added + WF.Economy:Add(info.resource, extra) end
+  end
   here.gathered = (here.gathered or 0) + added
+  if added > 0 and WF.ScoreFloat then pcall(WF.ScoreFloat.Gathered, WF.ScoreFloat, info.resource, added) end
+end
+
+-- Decision 0117: a zone held by the other faction gives +30 % on each tick.
+-- Never taken from the shared stock, so the stock state and its messages are
+-- unchanged.
+function Stock:PlunderApplies(id)
+  local area = self:Resource(id)
+  local front, capture = WF.Front, WF.Capture
+  if not area or not front or not capture or type(front.ZoneOwner) ~= "function" then return false end
+  local faction = capture:MyFaction()
+  local owner = front:ZoneOwner(area.map)
+  return faction ~= nil and owner ~= nil and owner ~= faction
+end
+
+-- Exact over time with whole units: the fraction stays in memory, in tenths,
+-- one remainder per resource, and is paid once it makes a whole unit. Never
+-- saved; a /reload loses less than one unit.
+function Stock:Plunder(resource, amount)
+  self.plunder = self.plunder or {}
+  local rest = (self.plunder[resource] or 0) + amount * PLUNDER_TENTHS
+  local extra = math.floor(rest / 10)
+  self.plunder[resource] = rest - extra * 10
+  return extra
 end
 
 function Stock:Enter(id, now)
@@ -480,23 +510,32 @@ end
 -- Stocks below capacity survive /reload and logout, so a reload never refills
 -- a mine; they are restored with n = 0 and never relayed nor broadcast as such.
 function Stock:Save(now)
+  if not self.loaded then self:Load() end
+  if not self.loaded then return end
   local bucket = WF.Economy and WF.Economy:RealmBucket()
   if not bucket then return end
-  local stocks = {}
+  local stocks = bucket.stocks
+  if type(stocks) ~= "table" then stocks = {}; bucket.stocks = stocks end
+  local wall = Epoch()
+  for id in pairs(stocks) do
+    local st, info = self.states[id], self:Info(id)
+    if not st or not info or not (st.known or st.restored)
+        or (Stock.Level(st, info, now) >= info.capacity and st.n == 0) then stocks[id] = nil end
+  end
   for id, st in pairs(self.states) do
     local info = self:Info(id)
     if info and (st.known or st.restored) then
       local level = Stock.Level(st, info, now)
       if level < info.capacity or st.n > 0 then
-        stocks[id] = { stock = level, t = Epoch(), epoch = st.epoch }
+        local entry = stocks[id]
+        if type(entry) ~= "table" then entry = {}; stocks[id] = entry end
+        entry.stock, entry.t, entry.epoch = level, wall, st.epoch
       end
     end
   end
-  bucket.stocks = stocks
 end
 
 function Stock:Load()
-  self.loaded = true
   local bucket = WF.Economy and WF.Economy:RealmBucket()
   if not bucket then return end
   local now, wall = Now(), Epoch()
@@ -508,17 +547,22 @@ function Stock:Load()
       local st = self:GetState(id)
       if level < info.capacity and not st.known then
         st.stock, st.at, st.n = level, now, 0
-        st.epoch = math.max(st.epoch, math.floor(tonumber(entry.epoch) or 0))
+        -- Not known yet: its 0 means "no epoch"; a saved epoch outside the
+        -- serial space is ignored (decision 0083).
+        local saved = tonumber(entry.epoch)
+        if saved and saved >= 0 and saved <= WF.Serial.MAX then st.epoch = math.floor(saved) end
         st.restored = true
       end
     end
   end
+  self.loaded = true
 end
 
 -- Driver ----------------------------------------------------------------------
 
 function Stock:Tick(now)
   if not self.loaded then self:Load() end
+  if not self.loaded then return end
   if self.here and (not self.lastEligibilityAt or now - self.lastEligibilityAt >= ELIGIBILITY_INTERVAL) then
     self.lastEligibilityAt = now
     self:UpdateHere(now, false)
@@ -579,6 +623,7 @@ function Stock:GetHud(now)
   local cap = WF.Economy and WF.Economy.CAPS[view.resource] or 0
   return {
     id = here.id, area = area, resource = view, status = here.status, reason = here.reason,
+    plunder = self:PlunderApplies(here.id),
     owned = WF.Economy and WF.Economy:Get(view.resource) or 0, cap = cap,
   }
 end
@@ -596,11 +641,9 @@ function Stock:PrintStatus()
   end
   local hud = self:GetHud()
   if hud then
-    local st = self.states[hud.id]
-    Print(hud.id .. " " .. hud.resource.name .. " stock " .. hud.resource.level .. "/" .. hud.resource.capacity
+    Print(hud.resource.name .. " stock " .. hud.resource.level .. "/" .. hud.resource.capacity
       .. " - " .. hud.resource.status .. " - you: " .. tostring(hud.status or "not counted")
-      .. (hud.reason and (" (" .. hud.reason .. ")") or "")
-      .. " - authority " .. tostring(st and st.authority or "none") .. " epoch " .. tostring(st and st.epoch or 0))
+      .. (hud.reason and (" (" .. hud.reason .. ")") or ""))
   else
     Print("not in a gold mine, forest or farm")
   end

@@ -192,7 +192,7 @@ function FileProbe:Start(seconds)
   frame:SetScript("OnUpdate", OnUpdate)
   self.running = true
   WF.Print("fileprobe running: read " .. IN_FILE .. " every " .. readInterval .. " s, write "
-    .. OUT_FILE .. " every " .. WRITE_INTERVAL .. " s. Start tools/file_probe_writer.py, then /wf fileprobe report")
+    .. OUT_FILE .. " every " .. WRITE_INTERVAL .. " s. Start tools/file_probe_writer.py, then /wfd fileprobe report")
 end
 
 function FileProbe:Stop()
@@ -214,7 +214,7 @@ end
 
 function FileProbe:Report()
   if not stats then
-    WF.Print("fileprobe: not started (/wf fileprobe start)")
+    WF.Print("fileprobe: not started (/wfd fileprobe start)")
     return
   end
   local average = 0
@@ -242,6 +242,6 @@ function FileProbe:Command(rest)
   elseif word == "report" then
     self:Report()
   else
-    WF.Print("/wf fileprobe start [readSeconds] | report | stop")
+    WF.Print("/wfd fileprobe start [readSeconds] | report | stop")
   end
 end

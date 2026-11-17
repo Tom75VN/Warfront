@@ -7,15 +7,29 @@ local WF = Warfront
 -- learns that a newer one exists. A claimed version is unverified P2P data: it
 -- only ever produces a warning, never a capture decision.
 local Version = {
-  -- A newer version seen once is recalled at login for this long.
-  REMEMBER_SECONDS = 7 * 24 * 3600,
+  -- A newer version heard from players is recalled at every login until the
+  -- installed version reaches it, or after this long without two players
+  -- showing it again (decision 0108).
+  CONFIRM_SECONDS = 30 * 24 * 3600,
   -- A reply to an older announce waits 1 to 5 s and is cancelled when a peer at
   -- least as new answers first (rule R14); at most one per REPLY_GAP seconds.
   REPLY_DELAY = 1,
   REPLY_SPREAD = 4,
   REPLY_GAP = 60,
+  -- Per sender identity, the newest { version, level, at } it showed (decision
+  -- 0094); local memory only, the least recently heard dropped first.
+  MAX_SENDERS = 32,
+  senders = {},
+  senderCount = 0,
+  -- Newest known version: the larger of what players showed (p2p) and the
+  -- release named by the companion import (cloud, decision 0108).
   newest = nil,
   newestLevel = nil,
+  p2p = nil,
+  p2pLevel = nil,
+  cloud = nil,
+  cloudLevel = nil,
+  confirmed = false,
   warnedFor = nil,
   replyAt = nil,
   lastAnnounceAt = nil,
@@ -88,35 +102,123 @@ function Version:Warn()
   if WF.Record then WF.Record("VERSION_OUTDATED", { newest = self.newest, level = self.newestLevel }) end
 end
 
+local function Epoch()
+  return WF.Epoch and WF.Epoch() or 0
+end
+
+-- newest = the larger of both sources; at equal versions the cloud level wins.
+local function Pick(self)
+  local version, level = self.p2p, self.p2pLevel
+  if self.cloud and (not version or Version.Compare(self.cloud, version) >= 0) then
+    version, level = self.cloud, self.cloudLevel
+  end
+  self.newest, self.newestLevel = version, level
+end
+
+-- The newest version that two distinct senders showed or exceeded, at the
+-- lowest level among them (decision 0094, risk B18): one liar is not enough.
+local function Supported(senders)
+  local best, bestLevel
+  for _, a in pairs(senders) do
+    if not best or Version.Compare(a.version, best) > 0 then
+      local support, low = 0, nil
+      for _, b in pairs(senders) do
+        if Version.Compare(b.version, a.version) >= 0 then
+          support = support + 1
+          if not low or b.level < low then low = b.level end
+        end
+      end
+      if support >= 2 then best, bestLevel = a.version, low end
+    end
+  end
+  return best, bestLevel
+end
+
 -- Called for every readable WF<n> line, valid or not, whatever its level.
-function Version:Note(remote, level)
+-- sender: the line's author (chat sender or Battle.net character).
+function Version:Note(remote, level, sender)
   local newer = Version.Compare(remote, WF.version)
-  if not newer or newer <= 0 or type(level) ~= "number" then return false end
-  if self.newest and Version.Compare(remote, self.newest) <= 0 then return false end
-  self.newest, self.newestLevel = remote, level
+  if not newer or newer <= 0 or type(level) ~= "number" or type(sender) ~= "string" or sender == "" then
+    return false
+  end
+  local capture = WF.Capture
+  local who = capture and type(capture.Identity) == "function" and capture.Identity(sender) or sender
+  if type(who) ~= "string" then return false end
+  local now = WF.Now and WF.Now() or 0
+  local seen = self.senders[who]
+  if seen then
+    seen.at = now
+    if Version.Compare(remote, seen.version) <= 0 then return false end
+    seen.version, seen.level = remote, level
+  else
+    if self.senderCount >= self.MAX_SENDERS then
+      local oldest, at
+      for name, entry in pairs(self.senders) do
+        if not at or entry.at < at then oldest, at = name, entry.at end
+      end
+      self.senders[oldest] = nil
+      self.senderCount = self.senderCount - 1
+    end
+    self.senders[who] = { version = remote, level = level, at = now }
+    self.senderCount = self.senderCount + 1
+  end
+  remote, level = Supported(self.senders)
+  if not remote then return false end
   local db = DB()
-  if db then db.newestVersion = { version = remote, level = level, seenAt = WF.Epoch and WF.Epoch() or 0 } end
+  local order = self.p2p and Version.Compare(remote, self.p2p)
+  if order and order <= 0 then
+    -- Two players show the remembered version again: keep it 30 more days,
+    -- once per session (decision 0108).
+    if order == 0 and not self.confirmed then
+      self.confirmed = true
+      local saved = db and db.newestVersion
+      if type(saved) == "table" and saved.version == self.p2p then saved.confirmedAt = Epoch() end
+    end
+    return false
+  end
+  self.p2p, self.p2pLevel, self.confirmed = remote, level, true
+  if db then db.newestVersion = { version = remote, level = level, seenAt = Epoch(), confirmedAt = Epoch() } end
+  Pick(self)
   self:Warn()
   return true
 end
 
--- At login: recall a newer version seen recently, forget it once installed or stale.
+-- The release named by the companion import (decision 0108): trusted alone,
+-- reread at each import rebuild, never copied into newestVersion.
+function Version:FromImport()
+  local import = WF.Import
+  local release = import and type(import.data) == "table" and import.data.release
+  local version, level
+  if type(release) == "table" and type(release.wf) == "number" then
+    local newer = Version.Compare(release.v, WF.version)
+    if newer and newer > 0 then version, level = release.v, release.wf end
+  end
+  self.cloud, self.cloudLevel = version, level
+  Pick(self)
+  if self.restored then self:Warn() end
+end
+
+-- At every login or /reload: recall the newest known version and warn once
+-- this session; forget the players' one once installed or unconfirmed for 30
+-- days (decision 0108).
 function Version:Restore()
   if self.restored then return end
   self.restored = true
+  self:FromImport()
   local db = DB()
   local saved = db and db.newestVersion
-  if type(saved) ~= "table" then return end
-  local age = (WF.Epoch and WF.Epoch() or 0) - (tonumber(saved.seenAt) or 0)
-  local newer = Version.Compare(saved.version, WF.version)
-  local level = tonumber(saved.level)
-  if not newer or newer <= 0 or not level or age < 0 or age > self.REMEMBER_SECONDS then
-    db.newestVersion = nil
-    return
+  if type(saved) == "table" then
+    local at = tonumber(saved.confirmedAt) or tonumber(saved.seenAt) or 0
+    local age = Epoch() - at
+    local newer = Version.Compare(saved.version, WF.version)
+    local level = tonumber(saved.level)
+    if not newer or newer <= 0 or not level or age < 0 or age > self.CONFIRM_SECONDS then
+      db.newestVersion = nil
+    elseif not self.p2p or Version.Compare(saved.version, self.p2p) > 0 then
+      self.p2p, self.p2pLevel = saved.version, level
+    end
   end
-  if not self.newest or Version.Compare(saved.version, self.newest) > 0 then
-    self.newest, self.newestLevel = saved.version, level
-  end
+  Pick(self)
   self:Warn()
 end
 
@@ -178,7 +280,7 @@ end
 
 function Version:Summary()
   return "version " .. tostring(WF.version) .. " level " .. tostring(WF.channelLevel)
-    .. " newest=" .. tostring(self.newest or "-") .. " announced=" .. self.announced
+    .. " newest=" .. tostring(self.newest or "-") .. " cloud=" .. tostring(self.cloud or "-") .. " announced=" .. self.announced
     .. " replies=" .. self.replies .. " suppressed=" .. self.suppressed
 end
 

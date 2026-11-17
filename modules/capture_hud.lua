@@ -12,6 +12,20 @@ local HUD = {}
 
 WF.CaptureHUD = HUD
 
+function HUD:ApplyScale()
+  local factor = WF.Preferences and WF.Preferences:ScaleFactor() or 1
+  if self.frame and type(self.frame.SetScale) == "function" then self.frame:SetScale(factor) end
+  if self.banner and type(self.banner.SetScale) == "function" then self.banner:SetScale(factor) end
+end
+
+function HUD:ApplyAlertVisibility()
+  if WF.Alerts and WF.Alerts.ApplyPreferences then WF.Alerts:ApplyPreferences() end
+end
+
+function HUD:HideAlert()
+  if self.banner then self.banner:Hide() end
+end
+
 -- Top-of-screen capture HUD shown while the player stands in a POI, plus the
 -- alert banner sent to the defending faction (docs/capture.md, Affichage),
 -- textured with the sprite atlas (modules/ui_skin.lua): no corner crests,
@@ -45,6 +59,8 @@ local PEOPLE_X, REGEN_X, WALLET_X = -82, -40, 18
 -- optional remaining-time group stays in the content column.
 local HORDE_COUNT_X, ALLIANCE_COUNT_X, COUNT_CLOCK_X = 76, -103, 0
 local TOGGLE_SIZE = 16
+-- The join-the-fight button (decision 0119 § 7).
+local JUMP_WIDTH, JUMP_HEIGHT = 96, 20
 local TOGGLE_INSET = 2
 -- The title leaves room for the toggle on its right (and the same on its left).
 local TITLE_WIDTH = WIDTH - 2 * (TOGGLE_SIZE + TOGGLE_INSET + 2)
@@ -54,6 +70,15 @@ local MEDAL_BACKGROUND = { 0.09, 0.08, 0.07 }
 local BANNER_WIDTH, BANNER_HEIGHT = 540, 56
 local BANNER_SHOWN = 5
 local BANNER_FADE = 1.5
+local BANNER_TEXTURES = {
+  A = "Interface\\AddOns\\Warfront\\media\\Textures\\UI\\Alert\\AlertAlliance",
+  H = "Interface\\AddOns\\Warfront\\media\\Textures\\UI\\Alert\\AlertHorde",
+  N = "Interface\\AddOns\\Warfront\\media\\Textures\\UI\\Alert\\AlertNeutral",
+}
+local BANNER_TEX_W, BANNER_TEX_H = 512, 128
+local BANNER_PIECE_X, BANNER_PIECE_Y = 12, 7
+local BANNER_PIECE_W, BANNER_PIECE_H = 487, 114
+local BANNER_CAP = 196
 local FLAGS = { A = "flag.alliance", H = "flag.horde", N = "flag.neutral" }
 local RESOURCE_FILLS = { gold = "fill.gold", wood = "fill.brown", food = "fill.green" }
 
@@ -64,11 +89,13 @@ local function GetGlobal(name)
 end
 
 local function FactionName(code)
-  return Capture and Capture.FACTION_NAMES[code] or tostring(code)
+  local name = Capture and Capture.FACTION_NAMES[code] or tostring(code)
+  return WF.L and WF.L(name) or name
 end
 
 local function AreaName(area)
-  return tostring(area.label or area.id)
+  local name = tostring(area.label or area.id)
+  return WF.L and WF.L(name) or name
 end
 
 local function Clock(seconds)
@@ -142,6 +169,7 @@ end
 -- Sets the text only when it differs: SetText makes the client lay it out.
 local function SetText(region, text)
   if text == nil then text = "" end
+  if WF.L then text = WF.L(text) end
   if (region:GetText() or "") ~= text then region:SetText(text) end
 end
 
@@ -255,6 +283,17 @@ function HUD:Build()
   self.warning = NewText(frame, "GameFontHighlightSmall", "TOP", -PAD, WIDE_WIDTH)
   self.warning:SetTextColor(1, 0.35, 0.35)
 
+  -- Join the arena's layer (decision 0119 § 7): shown under the warning only
+  -- while the fight of this POI is on another layer.
+  if skin and skin.Button then
+    self.jump = skin:Button(frame, "dark", JUMP_WIDTH, JUMP_HEIGHT, function()
+      if WF.LayerJump and WF.LayerJump.Click then WF.LayerJump:Click() end
+      HUD:Update()
+    end)
+    if self.jump.SetFrameLevel and frame.GetFrameLevel then self.jump:SetFrameLevel(frame:GetFrameLevel() + 4) end
+    self.jump:Hide()
+  end
+
   local bar = create("Frame", nil, frame)
   bar:SetWidth(BAR_WIDTH)
   bar:SetHeight(BAR_HEIGHT)
@@ -296,7 +335,7 @@ function HUD:Build()
     self.badgeH:SetPoint("LEFT", bar, "RIGHT", 1, 0)
   end
 
-  -- Why an Outpost takes 3 to 20 minutes, or what a siege still needs (WP10).
+  -- Current 3..8 or 10..18 minute occupancy duration, or what a siege needs.
   self.detail = NewText(frame, "GameFontHighlightSmall", "TOP", -PAD, WIDE_WIDTH)
   self.detail:SetTextColor(0.8, 0.8, 0.8)
 
@@ -313,6 +352,7 @@ function HUD:Build()
 
   frame:Hide()
   self.frame = frame
+  self:ApplyScale()
   return frame
 end
 
@@ -347,10 +387,10 @@ function HUD:ShowTip(zone)
   self.hoverText = table.concat(lines, "\n")
   tooltip:SetOwner(zone, "ANCHOR_BOTTOM")
   if tooltip.ClearLines then tooltip:ClearLines() end
-  tooltip:AddLine(lines[1], 1, 0.82, 0)
+  tooltip:AddLine(WF.L and WF.L(lines[1]) or lines[1], 1, 0.82, 0)
   local index = 2
   while lines[index] do
-    tooltip:AddLine(lines[index], 1, 1, 1)
+    tooltip:AddLine(WF.L and WF.L(lines[index]) or lines[index], 1, 1, 1)
     index = index + 1
   end
   tooltip:Show()
@@ -454,6 +494,7 @@ local function LayoutUnchanged(hud, collapsed, resourceRow, countRow)
     clock = hud.countClock.GetStringWidth and hud.countClock:GetStringWidth() or 0
   end
   same = Remember(last, "clock", clock, same)
+  same = Remember(last, "jump", hud.jump and hud.jump:IsShown() and true or false, same)
   for index = 1, #LAYOUT_TEXTS do
     local region = hud[LAYOUT_TEXTS[index]]
     same = Remember(last, LAYOUT_TEXTS[index], HasText(region) and TextHeight(region) or false, same)
@@ -470,6 +511,7 @@ function HUD:Layout()
     SetShown(self.info, false)
     SetShown(self.detail, false)
     SetShown(self.warning, false)
+    if self.jump then SetShown(self.jump, false) end
     SetShown(self.medal, false)
     if self.resourceStateIcon then
       SetShown(self.resourceStateIcon, false)
@@ -541,6 +583,7 @@ function HUD:Layout()
   if not collapsed then
     if HasText(self.detail) then y = Place(frame, self.detail, y, TextHeight(self.detail)) end
     if HasText(self.warning) then y = Place(frame, self.warning, y, TextHeight(self.warning)) end
+    if self.jump and self.jump:IsShown() then y = Place(frame, self.jump, y, JUMP_HEIGHT) end
   end
   frame:SetHeight(y - LINE_GAP + edge)
 
@@ -682,15 +725,6 @@ function HUD.HeldAtRest(view, mine)
   return view ~= nil and mine ~= nil and view.owner == mine and view.challenger == "-"
 end
 
--- What the player's kills do here: nothing when their faction holds the ground
--- at rest, defend when it is contested, capture otherwise.
-function HUD.HuntingObjective(view, mine)
-  if not view or not mine then return "Kill the required creatures" end
-  if HUD.HeldAtRest(view, mine) then return "" end
-  if view.owner == mine then return "Kill the required creatures to defend it" end
-  return "Kill the required creatures to capture it"
-end
-
 -- Horde and Alliance shares of the bar (0 to 1); the rest is neutral grey.
 function HUD.Shares(view)
   local p = view.progress / 1000
@@ -715,18 +749,18 @@ function HUD:VersionNotice(data)
   if not version or not version.newest then return nil end
   if self.enteredId ~= data.id then
     self.enteredId = data.id
-    self:Alert(version:Text(), "info", "Newer Warfront version")
+    WF.Alerts:Push("updates", version:Text(), { title = "Newer Warfront version", sound = true })
   end
   return version:Notice()
 end
 
 function HUD:Update()
-  local data = Capture and (Capture:GetHud() or (WF.Hunting and WF.Hunting:GetHud())
-    or (WF.Stock and WF.Stock:GetHud()))
+  local data = Capture and (Capture:GetHud() or (WF.Stock and WF.Stock:GetHud()))
   local notice = self:VersionNotice(data)
   local frame = self.frame or (data and self:Build())
   if not frame then return end
-  if not data then
+  -- A locked siege cannot be captured: no HUD (the map tooltip keeps the reason).
+  if not data or data.locked then
     self.barId = nil
     SetShown(frame, false)
     return
@@ -740,6 +774,7 @@ function HUD:Update()
   -- Reset every widget, then show what this state needs; Layout applies the
   -- final visibility once (BeginShown / FlushShown).
   BeginShown()
+  if self.jump then SetShown(self.jump, false) end
   SetShown(self.medal, false)
   SetShown(self.mode, true)
   SetShown(self.info, true)
@@ -833,20 +868,6 @@ function HUD:Update()
   SetText(self.title, AreaName(data.area))
   SetPOICrest(self.medal, data.area)
 
-  if data.hunting then
-    -- Kills move the bar; there is no presence count or countdown.
-    local horde, alliance = HUD.Shares(view)
-    self:SetShares(horde, alliance)
-    SetText(self.mode, WF.Hunting:ModeText(view))
-    SetText(self.info, data.known and HUD.HuntingObjective(view, Capture:MyFaction())
-      or "Waiting for the hunting ground state...")
-    self:SetWarning(data.warning or notice)
-    SetText(self.detail, "")
-    self:Layout()
-    SetShown(frame, true)
-    return
-  end
-
   if view then
     local horde, alliance = HUD.Shares(view)
     self:SetShares(horde, alliance)
@@ -881,6 +902,8 @@ function HUD:Update()
     SetText(self.info, "")
   end
 
+  -- The fight of this POI is on another layer (decision 0119 § 7).
+  local jump = WF.LayerJump and WF.LayerJump.HudState and WF.LayerJump:HudState(WF.Now and WF.Now() or 0) or nil
   if Capture:IsLockReason(data.reason) then
     self:SetWarning("You cannot capture: " .. data.reason)
   elseif data.status == "NC" or not data.status then
@@ -889,16 +912,62 @@ function HUD:Update()
     else
       self:SetWarning("You are not counted: " .. tostring(data.reason or "unknown"))
     end
-  else
+  elseif notice then
     self:SetWarning(notice)
+  elseif jump then
+    self:SetWarning(jump.text)
+  elseif (data.otherLayer or 0) > 0 then
+    -- Decision 0119 step 2: enemies counted here who stand on another layer.
+    self:SetWarning(data.otherLayer == 1 and "1 enemy on another layer"
+      or (data.otherLayer .. " enemies on another layer"))
+  else
+    self:SetWarning(nil)
   end
   SetText(self.detail, not HUD.HeldAtRest(view, Capture:MyFaction()) and data.detail or "")
+  if self.jump then
+    if jump and not self.collapsed and WF.Skin then
+      WF.Skin:SetButton(self.jump, jump.button, jump.enabled)
+      SetShown(self.jump, true)
+    else
+      SetShown(self.jump, false)
+    end
+  end
   self:Layout()
   SetShown(frame, true)
 end
 
--- Centre-screen banner: red for a threat, gold for information, with the
--- flag of the faction it concerns on both ends; it fades out by itself.
+local function BuildBannerCloth(frame)
+  local slice = { L = frame:CreateTexture(nil, "BORDER"), M = frame:CreateTexture(nil, "BORDER"),
+    R = frame:CreateTexture(nil, "BORDER"), height = BANNER_HEIGHT }
+  slice.L:SetPoint("TOPLEFT", frame, "TOPLEFT", 0, 0)
+  slice.L:SetPoint("BOTTOMLEFT", frame, "BOTTOMLEFT", 0, 0)
+  slice.R:SetPoint("TOPRIGHT", frame, "TOPRIGHT", 0, 0)
+  slice.R:SetPoint("BOTTOMRIGHT", frame, "BOTTOMRIGHT", 0, 0)
+  slice.M:SetPoint("TOPLEFT", slice.L, "TOPRIGHT", 0, 0)
+  slice.M:SetPoint("BOTTOMRIGHT", slice.R, "BOTTOMLEFT", 0, 0)
+  return slice
+end
+
+local function SetBannerSide(slice, side)
+  side = BANNER_TEXTURES[side] and side or "N"
+  local path = BANNER_TEXTURES[side]
+  local scale = slice.height / BANNER_PIECE_H
+  slice.L:SetWidth(BANNER_CAP * scale)
+  slice.R:SetWidth(BANNER_CAP * scale)
+  local y0, y1 = BANNER_PIECE_Y / BANNER_TEX_H, (BANNER_PIECE_Y + BANNER_PIECE_H) / BANNER_TEX_H
+  local middleEnd = BANNER_PIECE_W - BANNER_CAP
+  slice.L:SetTexture(path)
+  slice.L:SetTexCoord(BANNER_PIECE_X / BANNER_TEX_W, (BANNER_PIECE_X + BANNER_CAP) / BANNER_TEX_W, y0, y1)
+  slice.M:SetTexture(path)
+  slice.M:SetTexCoord((BANNER_PIECE_X + BANNER_CAP) / BANNER_TEX_W,
+    (BANNER_PIECE_X + middleEnd) / BANNER_TEX_W, y0, y1)
+  slice.R:SetTexture(path)
+  slice.R:SetTexCoord((BANNER_PIECE_X + middleEnd) / BANNER_TEX_W,
+    (BANNER_PIECE_X + BANNER_PIECE_W) / BANNER_TEX_W, y0, y1)
+end
+
+-- Centre-screen banner: red for Horde, blue for Alliance and grey for neutral,
+-- with the matching flag on both ends; it fades out by itself.
 function HUD:BuildBanner()
   if self.banner then return self.banner end
   local create = GetGlobal("CreateFrame")
@@ -910,7 +979,7 @@ function HUD:BuildBanner()
   banner:SetHeight(BANNER_HEIGHT)
   banner:SetPoint("TOP", UIParent, "TOP", 0, -190)
   banner:SetFrameStrata("HIGH")
-  banner.cloth = skin:Slice3(banner, "banner.red", BANNER_HEIGHT, "BORDER")
+  banner.cloth = BuildBannerCloth(banner)
   banner.flagLeft = skin:Icon(banner, nil, 34, 56, "ARTWORK")
   banner.flagLeft:SetPoint("TOPLEFT", banner, "TOPLEFT", -14, 6)
   banner.flagRight = skin:Icon(banner, nil, 34, 56, "ARTWORK")
@@ -918,43 +987,48 @@ function HUD:BuildBanner()
   local medallion = skin:Icon(banner, "banner.medallion", 30, 36, "OVERLAY")
   medallion:SetPoint("BOTTOM", banner, "TOP", 0, -12)
   banner.title = banner:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
-  banner.title:SetPoint("TOP", banner, "TOP", 0, -10)
+  banner.title:SetPoint("BOTTOM", banner, "CENTER", 0, -4)
   banner.title:SetWidth(BANNER_WIDTH - 200)
   banner.text = banner:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-  banner.text:SetPoint("TOP", banner, "TOP", 0, -30)
+  banner.text:SetPoint("TOP", banner, "CENTER", 0, -7)
   banner.text:SetWidth(BANNER_WIDTH - 200)
   banner:SetScript("OnUpdate", function()
     local now = WF.Now and WF.Now() or 0
     local age = now - (banner.shownAt or now)
     if age >= BANNER_SHOWN + BANNER_FADE then
       banner:Hide()
+      if WF.Alerts and WF.Alerts.Finish then WF.Alerts:Finish() end
     elseif age > BANNER_SHOWN then
       banner:SetAlpha(1 - (age - BANNER_SHOWN) / BANNER_FADE)
     end
   end)
   banner:Hide()
   self.banner = banner
+  self:ApplyScale()
   return banner
 end
 
--- text goes to chat; the banner shows title (or text) and text. kind "info"
--- draws the gold banner, anything else the red one; side picks the flags.
-function HUD:Alert(text, kind, title, side)
-  if WF.Print then WF.Print(text) end
+-- Shows one queued alert. Chat and category filtering belong to WF.Alerts.
+-- side picks both the faction colour and flags; missing is neutral grey.
+function HUD:ShowAlert(text, title, side, playSound, category)
+  text = WF.L and WF.L(text) or text
+  if title and WF.L then title = WF.L(title) end
   local banner = self:BuildBanner()
-  local shown = false
+  local shown, waits = false, false
   if banner then
     local skin = WF.Skin
-    skin:SetSlice3(banner.cloth, kind == "info" and "banner.gold" or "banner.red")
-    local flag = FLAGS[side or (kind == "info" and "N" or "H")] or FLAGS.N
+    side = FLAGS[side] and side or "N"
+    SetBannerSide(banner.cloth, side)
+    local flag = FLAGS[side]
     skin:Apply(banner.flagLeft, flag)
     skin:Apply(banner.flagRight, flag)
     banner.title:SetText(title or text)
     banner.text:SetText(title and text or "")
+    banner.alertCategory = category
     banner.shownAt = WF.Now and WF.Now() or 0
     banner:SetAlpha(1)
     banner:Show()
-    shown = true
+    shown, waits = true, true
   end
   local raidFrame = not shown and GetGlobal("RaidWarningFrame")
   if raidFrame and type(raidFrame.AddMessage) == "function" then
@@ -963,30 +1037,42 @@ function HUD:Alert(text, kind, title, side)
   if not shown then
     local errors = GetGlobal("UIErrorsFrame")
     if errors and type(errors.AddMessage) == "function" then
-      pcall(errors.AddMessage, errors, text, 1.0, 0.28, 0.0)
+      shown = pcall(errors.AddMessage, errors, text, 1.0, 0.28, 0.0)
     end
   end
   -- Forever's PlaySound takes a sound kit ID, not the 1.12 sound name.
-  local sound = GetGlobal("PlaySound")
-  local kits = GetGlobal("SOUNDKIT")
-  local kit = type(kits) == "table" and kits.RAID_WARNING or nil
-  if type(sound) == "function" and type(kit) == "number" then pcall(sound, kit) end
+  local soundEnabled = not WF.Preferences or WF.Preferences:Get("soundEnabled")
+  if playSound and soundEnabled then
+    local sound = GetGlobal("PlaySound")
+    local kits = GetGlobal("SOUNDKIT")
+    local kit = type(kits) == "table" and kits.RAID_WARNING or nil
+    if type(sound) == "function" and type(kit) == "number" then pcall(sound, kit) end
+  end
+  return shown, waits
 end
 
-function HUD:OnCaptureEvent(kind, id, side)
+function HUD:OnCaptureEvent(kind, id, side, previousOwner)
   local area = Capture:Capturable(id)
   if not area then return end
   local where = AreaName(area) .. " (" .. tostring(area.map) .. ")"
   if kind == "ALERT" then
-    self:Alert("The " .. FactionName(side) .. " is attacking " .. where .. "!", "threat",
-      "Enemy capture at " .. AreaName(area) .. "!", side)
-  elseif kind == "CAPTURED" and WF.Print then
-    WF.Print("The " .. FactionName(side) .. " captured " .. where .. ".")
+    WF.Alerts:Push("captures", "The " .. FactionName(side) .. " is attacking " .. where .. "!",
+      { title = "Enemy capture at " .. AreaName(area) .. "!", side = side, sound = true })
+  elseif kind == "CAPTURED" then
+    local text = "The " .. FactionName(side) .. " captured " .. where .. "."
+    local mine = Capture:MyFaction()
+    if side == mine then
+      WF.Alerts:Push("captures", text, { title = "Territory captured", side = side })
+    elseif previousOwner == mine then
+      WF.Alerts:Push("captures", text, { title = "Territory lost", side = side, sound = true })
+    elseif WF.Print then
+      WF.Print(text)
+    end
   end
 end
 
 if Capture then
-  Capture:OnEvent(function(kind, id, side) HUD:OnCaptureEvent(kind, id, side) end)
+  Capture:OnEvent(function(kind, id, side, previousOwner) HUD:OnCaptureEvent(kind, id, side, previousOwner) end)
 end
 
 local create = GetGlobal("CreateFrame")

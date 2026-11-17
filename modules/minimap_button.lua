@@ -15,7 +15,7 @@ local DEFAULT_ANGLE = 200
 local FALLBACK_RADIUS = 80
 local BUTTON_RADIUS = 5
 local FRAME_SIZE = 31
-local ICON_SIZE = 20
+local ICON_SIZE = 24 -- slightly under the ring so the disc fills it
 local BACKGROUND_SIZE = 20
 local BORDER_SIZE = 53
 local ICON_TEXTURE = "Interface\\AddOns\\Warfront\\media\\Textures\\UI\\WarfrontMinimapIcon"
@@ -119,6 +119,17 @@ function Button:SetAngle(angle)
   self:Place(angle)
 end
 
+function Button:Enabled()
+  return not WF.Preferences or WF.Preferences:Get("minimapButton")
+end
+
+function Button:ApplyVisibility()
+  local frame = self.frame
+  if not frame and self:Enabled() then frame = self:Build() end
+  if not frame then return end
+  if self:Enabled() then frame:Show() else frame:Hide() end
+end
+
 local function OnDragUpdate()
   Button:SetAngle(Button:CursorAngle())
 end
@@ -128,8 +139,9 @@ function Button:ShowTooltip()
   if not tooltip or not self.frame then return end
   tooltip:SetOwner(self.frame, "ANCHOR_LEFT")
   tooltip:AddLine("|cfff5ae0aWarfront|r")
-  tooltip:AddLine("Click: open or close the window", 1, 1, 1)
-  tooltip:AddLine("Drag: move this button", 0.8, 0.8, 0.8)
+  tooltip:AddLine(WF.L("Left-click: open or close the window"), 1, 1, 1)
+  tooltip:AddLine(WF.L("Right-click: open settings"), 1, 1, 1)
+  tooltip:AddLine(WF.L("Drag: move this button"), 0.8, 0.8, 0.8)
   tooltip:Show()
 end
 
@@ -145,7 +157,7 @@ function Button:Build()
   frame:SetFrameStrata("MEDIUM")
   frame:SetFrameLevel(minimap:GetFrameLevel() + 8)
 
-  -- Match Questie's LibDBIcon layers and visible sizing exactly.
+  -- LibDBIcon-style layers; the round icon is enlarged to fill the ring.
   local background = frame:CreateTexture(nil, "BACKGROUND")
   background:SetTexture(BACKGROUND)
   background:SetWidth(BACKGROUND_SIZE)
@@ -168,7 +180,7 @@ function Button:Build()
   self.border = border
   self.icon = icon
 
-  frame:RegisterForClicks("LeftButtonUp")
+  frame:RegisterForClicks("LeftButtonUp", "RightButtonUp")
   frame:RegisterForDrag("LeftButton")
   frame:SetScript("OnMouseDown", function()
     Button.icon:ClearAllPoints()
@@ -178,7 +190,7 @@ function Button:Build()
     Button.icon:ClearAllPoints()
     Button.icon:SetPoint("CENTER", Button.background, "CENTER", 0, 0)
   end)
-  frame:SetScript("OnClick", function() Button:OnClick() end)
+  frame:SetScript("OnClick", function(_, mouseButton) Button:OnClick(mouseButton) end)
   frame:SetScript("OnDragStart", function(self)
     self:LockHighlight()
     self:SetScript("OnUpdate", OnDragUpdate)
@@ -198,10 +210,15 @@ function Button:Build()
     watcher:SetScript("OnUpdate", OnShapeWatch)
     self.watcher = watcher
   end
+  self:ApplyVisibility()
   return frame
 end
 
-function Button:OnClick()
+function Button:OnClick(mouseButton)
+  if mouseButton == "RightButton" then
+    if WF.SettingsPanel and WF.SettingsPanel.Open then WF.SettingsPanel:Open() end
+    return
+  end
   if WF.MainWindow and WF.MainWindow.Toggle then WF.MainWindow:Toggle() end
 end
 

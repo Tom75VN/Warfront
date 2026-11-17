@@ -12,14 +12,23 @@ WF.Import = Import
 
 -- Companion import (decision 0032): WarfrontImport is the only per-character
 -- SavedVariable, written by the companion with the client closed. It is checked
--- whole before any use and never modified. Cloud data stays out of the shared
--- capture state and is never sent on the channel (C11, rule R16).
--- Schema 5 (decisions 0060, 0061, 0072) is the only one accepted: it names the
+-- whole before any use and never modified. Cloud ownership stays out of shared
+-- capture state (C11, rule R16). Schema 5 (decisions 0060, 0061, 0072) remains
+-- accepted: it names the
 -- ruleset scope and the commercial region the import was built for, carries the
 -- scope's cloud owners (saved observations included), the character's
--- membership ticket, the revocation list and the faction history. An import of
--- another scope or region, or of an older schema, is ignored whole.
-local SCHEMA = 5
+-- membership ticket, the revocation list and the faction history. Schema 6
+-- adds the optional durable garrison baseline of decision 0078. Schema 7 adds
+-- the PvP boards (companion contract, decision 0105); schema 8 replaces them
+-- with every scoreboard board, current campaign and history (decision 0109
+-- § 5). Schema 9 is schema 8 whose scoreboard rows may also carry the War
+-- Camp counters capW and defW (decision 0123 § 9); schema 8 stays accepted, so
+-- an older companion keeps working. Schema 10 is schema 9 plus the campaign
+-- (n, s) its owners and garrisons belong to (decision 0125). Schema 11 is
+-- schema 10 whose scoreboard rows may also carry atkS, the scouts sent
+-- (decision 0126 § 6); 5 to 10 stay accepted. Scoreboard rows are display
+-- only: never shared state (R16).
+local SCHEMA = 11
 local U32 = 4294967296
 local I31 = 2147483648
 local CRC_POLY = 3988292384 -- 0xEDB88320
@@ -31,6 +40,7 @@ local MAX_PROGRESS = 500
 local MAX_ROWS = 100
 local MAX_OWNERS = 512
 local MAX_GENERATION = 1000000
+local MAX_GARRISONS = 512
 local OWNER_RANKS = { U = 0, C = 1, Q = 2, W = 3, D = 4 }
 
 Import.SCHEMA = SCHEMA
@@ -59,7 +69,7 @@ local ROW = { kind = "record", fields = { char = CHAR, region = REGION, value = 
 local SPEC = {
   kind = "record",
   fields = {
-    schema = Int(SCHEMA),
+    schema = Int(5),
     importId = Id(MAX_IMPORT_ID, "^[%w%-]+$"),
     generatedAt = Int(U32 - 1),
     catalogVersion = Int(U32 - 1),
@@ -78,7 +88,7 @@ local SPEC = {
         value = { kind = "record", fields = { correctionEpoch = EPOCH, value = VALUE } },
       },
     },
-    leaderboard = {
+    scoreboard = {
       kind = "map", key = ID, max = MAX_CAMPAIGNS,
       value = {
         kind = "record",
@@ -92,7 +102,7 @@ local SPEC = {
     owners = {
       kind = "map", key = ID, max = MAX_OWNERS,
       value = { kind = "record", fields = {
-        g = Int(MAX_GENERATION), o = Id(1, "^[HA%-]$"),
+        g = Int(MAX_GENERATION), o = Id(1, "^[HAN%-]$"),
         t = Id(1, "^[UCQWD]$"), c = { kind = "char", dash = true },
       } },
     },
@@ -117,15 +127,155 @@ local SPEC = {
       kind = "list", max = 7,
       value = { kind = "record", fields = { d = Int(MAX_DAY), h = Int(MAX_OWNERS), a = Int(MAX_OWNERS) } },
     },
+    allies = { kind = "record", optional = true, fields = {
+      active = { kind = "bool" }, checkedAt = Int(U32 - 1), lockedUntil = Int(U32 - 1),
+      matches = { kind = "map", max = 3, key = Id(36, "^[0-9a-f%-]+$"), value = { kind = "record", fields = {
+        name = CHAR, faction = Id(1, "^[AH]$"), tag = Id(32, "^[^%s#|]+#%d+$"), expiresAt = Int(U32 - 1),
+      } } },
+    } },
+    -- Decision 0102 section 7: display only, never campaign/capture input.
+    campaignHistory = { kind = "list", optional = true, max = 14, value = { kind = "record", fields = {
+      n = Int(1000000), s = Int(U32 - 1), e = Int(U32 - 1),
+      reason = { kind = "enum", values = { time = true, capital = true } },
+      winner = Id(1, "^[HA%-]$"), h = Int(512), a = Int(512), captures = Int(1000000000),
+      set = { kind = "string", optional = true, max = 64, pattern = "^[%w_.%-]+$" },
+      rev = { kind = "int", optional = true, max = 999999 },
+    } } },
     check = Int(U32 - 1),
+    -- Optional latest released addon version from the Worker (decision 0108),
+    -- written only for an addon declaring WarfrontDB.importRelease.
+    release = { kind = "record", optional = true, fields = { v = Id(11, "^%d+%.%d+%.%d+$"), wf = Int(1000) } },
+    -- Optional Worker-signed copy of the current boards (decision 0110), written
+    -- only for an addon declaring WarfrontDB.importBoards; verified before use.
+    boards = { kind = "record", optional = true, fields = {
+      c = { kind = "record", optional = true, fields = {
+        p = Id(40000, "^[%w ._~,;=/%-]+$"), s = Id(86, "^[%w%-_]+$"), k = Id(1, "^[0-9a-z]$"),
+      } },
+      h = { kind = "record", optional = true, fields = {
+        p = Id(40000, "^[%w ._~,;=/%-]+$"), s = Id(86, "^[%w%-_]+$"), k = Id(1, "^[0-9a-z]$"),
+      } },
+    } },
   },
 }
-local SPECS = { [SCHEMA] = SPEC }
+local SPEC6_FIELDS = {}
+for key, value in pairs(SPEC.fields) do SPEC6_FIELDS[key] = value end
+SPEC6_FIELDS.schema = Int(6)
+SPEC6_FIELDS.garrisons = {
+  kind = "map", key = ID, max = MAX_GARRISONS,
+  value = { kind = "record", fields = {
+    g = Int(MAX_GENERATION), v = Int(MAX_GENERATION), e = EPOCH,
+    f = Int(50), r = Int(50), m = Int(50), gold = Int(3600), wood = Int(900),
+  } },
+}
+local SPEC6 = { kind = "record", fields = SPEC6_FIELDS }
+
+-- Scoreboards (decision 0109 § 5). Optional fields may be absent (= 0 or unknown).
+local function Opt(spec)
+  local copy = {}
+  for key, value in pairs(spec) do copy[key] = value end
+  copy.optional = true
+  return copy
+end
+local MAX_GUILDS = 32
+local STAT = Opt(VALUE)
+local FACTION = { kind = "enum", values = { Alliance = true, Horde = true } }
+local CLUB = Id(16, "^[1-9]%d*$")
+-- Any byte but control characters and the UI escape character.
+local GUILD_NAME = Id(64, "^[^%c|]+$")
+local STAT_KEYS = {
+  "capO", "capS", "capC", "defO", "defS", "defC", "conf", "kills", "assists", "deaths",
+  "gold", "wood", "atkF", "atkR", "atkM", "garF", "garR", "garM",
+}
+-- Schema 9 rows: the same counters plus the War Camp ones (decision 0123 § 9).
+local STAT_KEYS9 = {}
+for index = 1, #STAT_KEYS do STAT_KEYS9[index] = STAT_KEYS[index] end
+STAT_KEYS9[#STAT_KEYS9 + 1] = "capW"
+STAT_KEYS9[#STAT_KEYS9 + 1] = "defW"
+-- Schema 11 rows: the schema 9 counters plus the scouts sent (decision 0126 § 6).
+local STAT_KEYS11 = {}
+for index = 1, #STAT_KEYS9 do STAT_KEYS11[index] = STAT_KEYS9[index] end
+STAT_KEYS11[#STAT_KEYS11 + 1] = "atkS"
+local function Stats(fields, keys)
+  keys = keys or STAT_KEYS
+  for index = 1, #keys do fields[keys[index]] = STAT end
+  return { kind = "record", fields = fields }
+end
+local CLASS = Opt(Id(16, "^%u+$"))
+local RACE = Opt(Id(16, "^%a+$"))
+-- The row specs of one stat key set.
+local function Rows(keys)
+  local rows = {}
+  rows.player = Stats({ char = CHAR, region = REGION, class = CLASS, race = RACE, faction = Opt(FACTION) }, keys)
+  rows.guild = Stats({ guild = CLUB, region = REGION, name = Opt(GUILD_NAME), faction = Opt(FACTION) }, keys)
+  rows.own = Stats({ class = CLASS, race = RACE, faction = Opt(FACTION) }, keys)
+  rows.mine = { kind = "map", key = CLUB, max = MAX_GUILDS,
+    value = Stats({ name = Opt(GUILD_NAME), faction = Opt(FACTION) }, keys) }
+  return rows
+end
+local ROWS8, ROWS9, ROWS11 = Rows(STAT_KEYS), Rows(STAT_KEYS9), Rows(STAT_KEYS11)
+local PLAYER_ROW, GUILD_ROW, OWN_ROW, MINE = ROWS8.player, ROWS8.guild, ROWS8.own, ROWS8.mine
+local function Lists(row)
+  local list = Opt({ kind = "list", max = MAX_ROWS, value = row })
+  return Opt({ kind = "record", fields = { points = list, confirmed = list, pvp = list, effort = list } })
+end
+local function Period(withCampaign, rows)
+  rows = rows or ROWS8
+  local fields = { players = Lists(rows.player), guilds = Lists(rows.guild), own = Opt(rows.own), mine = Opt(rows.mine) }
+  if withCampaign then fields.campaign = ID end
+  return Opt({ kind = "record", fields = fields })
+end
+
+-- Schema 7: schema 6 plus pvp (boards, own and guild rows per campaign).
+local SPEC7_FIELDS = {}
+for key, value in pairs(SPEC6_FIELDS) do SPEC7_FIELDS[key] = value end
+SPEC7_FIELDS.schema = Int(7)
+SPEC7_FIELDS.pvp = {
+  kind = "record",
+  fields = {
+    boards = {
+      kind = "map", key = ID, max = MAX_CAMPAIGNS,
+      value = { kind = "record", fields = {
+        players = { kind = "list", max = MAX_ROWS, value = PLAYER_ROW },
+        guilds = { kind = "list", max = MAX_ROWS, value = GUILD_ROW },
+      } },
+    },
+    own = { kind = "map", key = ID, max = MAX_CAMPAIGNS, value = OWN_ROW },
+    guilds = { kind = "map", key = ID, max = MAX_CAMPAIGNS, value = MINE },
+  },
+}
+-- Schema 8: schema 6 plus ranks (current campaign and history).
+local SPEC8_FIELDS = {}
+for key, value in pairs(SPEC6_FIELDS) do SPEC8_FIELDS[key] = value end
+SPEC8_FIELDS.schema = Int(8)
+SPEC8_FIELDS.ranks = { kind = "record", fields = { current = Period(true), history = Period(false) } }
+-- Schema 9: schema 8 with capW and defW allowed in every scoreboard row.
+local SPEC9_FIELDS = {}
+for key, value in pairs(SPEC6_FIELDS) do SPEC9_FIELDS[key] = value end
+SPEC9_FIELDS.schema = Int(9)
+SPEC9_FIELDS.ranks = { kind = "record", fields = { current = Period(true, ROWS9), history = Period(false, ROWS9) } }
+-- Schema 10: schema 9 plus the campaign its owners and garrisons belong to
+-- (decision 0125); they apply only in that campaign (Campaign:CloudAllowed).
+local SPEC10_FIELDS = {}
+for key, value in pairs(SPEC9_FIELDS) do SPEC10_FIELDS[key] = value end
+SPEC10_FIELDS.schema = Int(10)
+SPEC10_FIELDS.campaign = { kind = "record", fields = { n = Int(1000000), s = Int(U32 - 1) } }
+-- Schema 11: schema 10 with atkS allowed in every scoreboard row (0126 § 6).
+local SPEC11_FIELDS = {}
+for key, value in pairs(SPEC10_FIELDS) do SPEC11_FIELDS[key] = value end
+SPEC11_FIELDS.schema = Int(SCHEMA)
+SPEC11_FIELDS.ranks = { kind = "record", fields = { current = Period(true, ROWS11), history = Period(false, ROWS11) } }
+
+local SPECS = {
+  [5] = SPEC, [6] = SPEC6, [7] = { kind = "record", fields = SPEC7_FIELDS },
+  [8] = { kind = "record", fields = SPEC8_FIELDS },
+  [9] = { kind = "record", fields = SPEC9_FIELDS },
+  [10] = { kind = "record", fields = SPEC10_FIELDS },
+  [SCHEMA] = { kind = "record", fields = SPEC11_FIELDS },
+}
 
 local function ValidChar(text)
-  if type(text) ~= "string" or #text > MAX_CHAR or string.find(text, "%c") then return false end
-  local at = string.find(text, "@", 1, true)
-  return at ~= nil and at > 1 and at < #text and not string.find(text, "@", at + 1, true)
+  return type(text) == "string" and #text <= MAX_CHAR and WF.Names
+    and WF.Names.Valid(text) and WF.Names.Complete(text)
 end
 
 -- Returns nil when value matches spec, else the path of the first mismatch.
@@ -141,6 +291,8 @@ local function Check(value, spec, path)
     if not ValidChar(value) and not (spec.dash and value == "-") then return path end
   elseif kind == "bool" then
     if type(value) ~= "boolean" then return path end
+  elseif kind == "enum" then
+    if type(value) ~= "string" or not spec.values[value] then return path end
   elseif kind == "record" then
     if type(value) ~= "table" then return path end
     local key, field
@@ -148,8 +300,10 @@ local function Check(value, spec, path)
       if type(key) ~= "string" or not spec.fields[key] then return path .. ".?" end
     end
     for key, field in pairs(spec.fields) do
-      local bad = Check(value[key], field, path .. "." .. key)
-      if bad then return bad end
+      if value[key] ~= nil or not field.optional then
+        local bad = Check(value[key], field, path .. "." .. key)
+        if bad then return bad end
+      end
     end
   elseif kind == "map" or kind == "list" then
     if type(value) ~= "table" then return path end
@@ -350,10 +504,16 @@ function Import:Validate(raw)
     for poi, e in pairs(raw.owners) do
       -- An owner and a capturer exactly when the entry is not disputed.
       local disputed = e.t == "Q" or e.t == "D"
-      if e.g < 1 or (e.t == "U" and (e.c ~= "-" or e.g > 1000))
+      -- N (neutral after a failed siege) is only ever a claim.
+      if e.g < 1 or (e.o == "N" and e.t ~= "C") or (e.t == "U" and (e.c ~= "-" or e.g > 1000))
           or (e.t ~= "U" and (disputed ~= (e.o == "-") or disputed ~= (e.c == "-"))) then
         return nil, "invalid import.owners." .. poi
       end
+    end
+  end
+  if raw.garrisons then
+    for poi, e in pairs(raw.garrisons) do
+      if e.g < 1 or e.v < 1 then return nil, "invalid import.garrisons." .. poi end
     end
   end
   if raw.tickets then
@@ -363,6 +523,23 @@ function Import:Validate(raw)
         return nil, "invalid import.tickets"
       end
     end
+  end
+  if raw.campaignHistory then
+    local seen = {}
+    for _, row in ipairs(raw.campaignHistory) do
+      local key = row.n .. "." .. row.s
+      if row.n < 1 or row.s < 1 or row.e <= row.s or row.e > raw.generatedAt
+          or row.h + row.a > 512 or (row.reason == "capital" and row.winner == "-")
+          or (row.reason == "time" and row.winner ~= (row.h > row.a and "H" or row.a > row.h and "A" or "-"))
+          or (row.set == nil) ~= (row.rev == nil) or seen[key] then
+        return nil, "invalid import.campaignHistory"
+      end
+      seen[key] = true
+    end
+  end
+  if raw.campaign and (raw.campaign.n < 1 or raw.campaign.s < 1) then return nil, "invalid import.campaign" end
+  if raw.release and not (WF.Version and WF.Version.Valid(raw.release.v)) then
+    return nil, "invalid import.release"
   end
   if raw.wf ~= WF.channelLevel then return nil, "level" end
   local me = Me()
@@ -375,7 +552,7 @@ end
 -- Folds data into into (decision 0059). Campaigns keep the higher correctionEpoch
 -- (at equal epoch an ended campaign stays ended), progress the higher
 -- (correctionEpoch, value): the result does not depend on the arrival order.
--- The leaderboard and identifiers come from data, the later import.
+-- The scoreboard and identifiers come from data, the later import.
 local function MergeInto(into, data)
   for id, campaign in pairs(data.campaigns) do
     local old = into.campaigns[id]
@@ -399,6 +576,12 @@ local function MergeInto(into, data)
       end
     end
   end
+  -- Owners and garrisons of another campaign (decision 0125: generations restart
+  -- with each campaign) are never mixed: the later import's replace them.
+  local a, b = into.campaign, data.campaign
+  if (a == nil) ~= (b == nil) or (a and (a.n ~= b.n or a.s ~= b.s)) then
+    into.owners, into.garrisons, into.campaign = nil, nil, Copy(b)
+  end
   -- Owners: the larger (generation, rank) per POI, as the Worker ledger (decision 0060).
   if data.owners then
     if not into.owners then into.owners = {} end
@@ -411,6 +594,22 @@ local function MergeInto(into, data)
       elseif old.t == "U" and entry.t == "U" and entry.g == old.g and entry.o ~= old.o then
         old.o = "-"
       end
+    end
+  end
+  -- Garrisons: same total order as modules/garrison.lua, generation first.
+  if data.garrisons then
+    if not into.garrisons then into.garrisons = {} end
+    for poi, entry in pairs(data.garrisons) do
+      local old = into.garrisons[poi]
+      local newer = not old or entry.g > old.g
+      if old and entry.g == old.g then
+        local keys = { "v", "e", "f", "r", "m", "gold", "wood" }
+        for index = 1, #keys do
+          local key = keys[index]
+          if entry[key] ~= old[key] then newer = entry[key] > old[key]; break end
+        end
+      end
+      if newer then into.garrisons[poi] = Copy(entry) end
     end
   end
   -- Tickets (decision 0061): the newest epoch, the ticket that lasts longer; the
@@ -429,7 +628,22 @@ local function MergeInto(into, data)
     into.revoked = Copy(data.revoked)
     into.history = Copy(data.history)
   end
-  into.leaderboard = Copy(data.leaderboard)
+  -- Latest release (decision 0108): the newer of the two.
+  if data.release and (not into.release
+      or (WF.Version and WF.Version.Compare(data.release.v, into.release.v) or 0) > 0) then
+    into.release = Copy(data.release)
+  end
+  -- Absence means an older producer, not an empty archive. Only a newer
+  -- explicitly supplied archive replaces it (including an empty list).
+  local archiveAt = into.campaignHistoryAt or into.generatedAt
+  if data.campaignHistory and (not into.campaignHistory or data.generatedAt >= archiveAt) then
+    into.campaignHistory = Copy(data.campaignHistory)
+    into.campaignHistoryAt = data.generatedAt
+  elseif into.campaignHistory then
+    into.campaignHistoryAt = archiveAt
+  end
+  into.scoreboard = Copy(data.scoreboard)
+  into.pvp, into.ranks = Copy(data.pvp), Copy(data.ranks)
   into.importId, into.generatedAt, into.catalogVersion = data.importId, data.generatedAt, data.catalogVersion
   return into
 end
@@ -443,11 +657,14 @@ local function Rebuild(self)
   end
   -- Cloud owners: shown and used as a generation floor only (decision 0060).
   if WF.Capture and WF.Capture.SetCloud then WF.Capture:SetCloud(self.data and self.data.owners) end
+  if WF.Garrison and WF.Garrison.ApplyCloud then WF.Garrison:ApplyCloud(self.data and self.data.garrisons) end
   -- Membership ticket and revocation list (modules/ticket.lua, decision 0061).
   if WF.Ticket and self.data then
     local ok, err = pcall(WF.Ticket.OnImport, WF.Ticket, self.data)
     if not ok and WF.RecordError then WF.RecordError("ticket import", err) end
   end
+  -- Latest released addon version, trusted alone (decision 0108).
+  if WF.Version and WF.Version.FromImport then WF.Version:FromImport() end
 end
 
 local MAX_FRESH = 64
@@ -457,7 +674,7 @@ local MAX_FRESH = 64
 local function NoteFresh(state, importId)
   if type(state) ~= "table" or not importId then return end
   local me = Me()
-  if not me then return end
+  if not me or (WF.Names and not WF.Names.Complete(me)) then return end
   if type(state.fresh) ~= "table" then state.fresh = {} end
   if WF.Names then WF.Names.Adopt(state.fresh, me) end
   local entry = state.fresh[me]
@@ -498,6 +715,7 @@ end
 -- A validated import received during play through the nampower bridge
 -- (decision 0059, WF.Companion). Never touches the SavedVariables import.
 function Import:Merge(data)
+  if WF.Allies and WF.Allies.LoadCompanion then WF.Allies:LoadCompanion(data.allies) end
   if self.bridged then
     MergeInto(self.bridged, data)
   else
@@ -513,6 +731,7 @@ function Import:Load()
   self.loaded = true
   local data, reason = self:Validate(WarfrontImport)
   self.saved = data
+  if WF.Allies and WF.Allies.LoadCompanion then WF.Allies:LoadCompanion(data and data.allies) end
   Rebuild(self)
   local db = WF.Storage and WF.Storage.GetDB and not WF.Storage.readOnly and WF.Storage:GetDB()
   local state = type(db) == "table" and db.import

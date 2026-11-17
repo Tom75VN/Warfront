@@ -27,11 +27,18 @@ local Map = {
   visiblePatches = 0,
   visibleIcons = 0,
   failures = 0,
-  -- What the last world map refresh saw, kept after the map closes for /wf map.
+  -- What the last world map refresh saw, kept after the map closes for /wfd map.
   probe = {},
 }
 
 WF.Map = Map
+
+-- Shared with modules/map_routes.lua and modules/map_hover.lua, which load
+-- next: each aliases what it uses and adds the functions map.lua calls back.
+-- Keep every map file far below Lua 5.1's limit of 200 active locals
+-- (.claude/forever-compatibility.md, Top-level local limit).
+local Kit = {}
+Map.Kit = Kit
 
 Map.COLORS = {
   HORDE = { 0.90, 0.12, 0.08 },
@@ -43,10 +50,24 @@ Map.COLORS = {
 Map.POI_TYPES = {
   OUTPOST = true,
   SETTLEMENT = true,
-  HUNTING_GROUNDS = true,
   FOREST = true,
   GOLD_MINE = true,
   FARM = true,
+  CAPITAL = true,
+  -- A secondary capturable objective feeding the Front Network (decision 0123).
+  WAR_CAMP = true,
+}
+
+-- A faction capital (decisions 0103, 0107): never captured outside its siege,
+-- always held by the faction of its zone. One per city, traced on the zone map
+-- that shows the city; any other map refuses the definition.
+Map.CAPITAL_FACTIONS = {
+stormwindcity = "ALLIANCE",
+ironforge = "ALLIANCE",
+darnassus = "ALLIANCE",
+orgrimmar = "HORDE",
+undercity = "HORDE",
+thunderbluff = "HORDE",
 }
 
 -- Resource POIs are harvested, never controlled: no faction owner (decision 0029).
@@ -56,20 +77,20 @@ Map.RESOURCE_TYPES = {
   FARM = true,
 }
 
--- Every POI picture comes from one 512 x 512 RLE atlas of 72 px cells, built
--- by tools/make_poi_icon_atlas.py (this client draws large uncompressed TGA
--- atlases as diagonal bands). Rows: hunting grounds, outpost, Settlement levels
--- 1 to 3, resources. Columns: 0 neutral, 1 half Horde, 2 Horde, 3 half
--- Alliance, 4 Alliance.
+-- Every POI picture comes from one 512 x 512 RLE atlas of 72 px cells (this
+-- client draws large uncompressed TGA atlases as diagonal bands). Active rows:
+-- War Camp, Outpost, Settlement levels 1 to 3, resources, capital. Columns:
+-- 0 neutral, 1 half Horde, 2 Horde, 3 half Alliance, 4 Alliance.
 local POI_ICON_ATLAS = "Interface\\AddOns\\Warfront\\media\\Textures\\Icons\\MapPOIIconAtlas"
 local POI_ICON_ATLAS_SIZE = 512
 local POI_ICON_CELL = 72
 
 -- First row of each type; a Settlement adds its level minus one.
 Map.POI_ICON_ROWS = {
-  HUNTING_GROUNDS = 0,
+  WAR_CAMP = 0,
   OUTPOST = 1,
   SETTLEMENT = 2,
+  CAPITAL = 6,
   GOLD_MINE = 5,
   FOREST = 5,
   FARM = 5,
@@ -127,14 +148,22 @@ local PROFILE_ALPHA = 1.00
 -- the normal ones, which raises the fill from about 50 % to about 62 %.
 local HOVER_ALPHA = 0.50
 local HOVER_INTERVAL = 0.05
-local POI_ICON_SIZE = 28
+local POI_ICON_SIZE = 21.42
 -- Types drawn at another size than POI_ICON_SIZE, as a size multiplier.
 local POI_ICON_SCALE = {
   SETTLEMENT = 1.15,
+  CAPITAL = 1.3,
 }
 local function IconSize(poiType)
-  return POI_ICON_SIZE * (POI_ICON_SCALE[poiType] or 1)
+  local preferences = WF.Preferences
+  local scale = preferences and preferences:Get("mapIconScale") or 1
+  return POI_ICON_SIZE * scale * (POI_ICON_SCALE[poiType] or 1)
 end
+-- Zoomed in, POI icons and their labels grow less than the map: their size
+-- follows the zoom to `power` (0 = fixed on screen, 1 = grows with the map),
+-- never below `min` of their unzoomed size. Map.iconZoom holds the factor.
+Map.ICON_ZOOM = { power = 0.6, min = 0.55 }
+Map.iconZoom = 1
 -- Half-width of the icon hover square, as a share of the icon size (the art
 -- leaves a transparent margin, so the full 0.5 would catch empty corners).
 local ICON_HIT_RATIO = 0.4
@@ -218,31 +247,6 @@ local function CopyLocations(locations)
   return output
 end
 
--- Creature IDs that must be killed to capture the area (HUNTING_GROUNDS).
--- Absent means no kill requirement; duplicates are dropped, order is kept.
-local function CopyMobIds(ids)
-  local output = {}
-  if ids == nil then return output end
-  if type(ids) ~= "table" then
-    return nil, "requiredMobIds must be a list of creature IDs"
-  end
-  local seen = {}
-  local index = 1
-  local total = #ids
-  while index <= total do
-    local id = ids[index]
-    if type(id) ~= "number" or id < 1 or mathFloor(id) ~= id then
-      return nil, "requiredMobIds must contain positive integer creature IDs"
-    end
-    if not seen[id] then
-      seen[id] = true
-      output[#output + 1] = id
-    end
-    index = index + 1
-  end
-  return output
-end
-
 local function ResolveColor(value)
   if type(value) == "string" then
     local preset = Map.COLORS[string.upper(value)]
@@ -278,7 +282,12 @@ local function NormalizeDefinition(definition)
 
   local poiType = definition.type
   if type(poiType) ~= "string" or not Map.POI_TYPES[poiType] then
-    return nil, "type must be OUTPOST, SETTLEMENT, HUNTING_GROUNDS, FOREST, GOLD_MINE, or FARM"
+    return nil, "type must be OUTPOST, SETTLEMENT, WAR_CAMP, FOREST, GOLD_MINE, FARM, or CAPITAL"
+  end
+  local capitalFaction = nil
+  if poiType == "CAPITAL" then
+    capitalFaction = Map.CAPITAL_FACTIONS[mapKey]
+if not capitalFaction then return nil, "a capital must be on a faction capital map" end
   end
 
   local locations = definition.locations
@@ -337,9 +346,12 @@ local function NormalizeDefinition(definition)
   elseif type(definition.colorKey) == "string" then
     colorKey = definition.colorKey
   end
-
-  local requiredMobIds, mobError = CopyMobIds(definition.requiredMobIds)
-  if not requiredMobIds then return nil, mobError end
+  -- The catalog always ships NEUTRAL: a capital takes its faction's color.
+  if capitalFaction then
+    local preset = Map.COLORS[capitalFaction]
+    color = { preset[1], preset[2], preset[3] }
+    colorKey = capitalFaction
+  end
 
   return {
     id = definition.id,
@@ -354,7 +366,6 @@ local function NormalizeDefinition(definition)
     vertices = copiedVertices,
     controlVertices = copiedControlVertices,
     shape = shape,
-    requiredMobIds = requiredMobIds,
     enabled = definition.enabled ~= false,
   }
 end
@@ -433,20 +444,6 @@ function Map:RegisterAreas(definitions)
   return true, total
 end
 
--- Returns a copy of the creature IDs required to capture the area, or nil for an unknown area.
-function Map:GetRequiredMobIds(id)
-  local area = type(id) == "string" and self.areas[id] or nil
-  if not area then return nil end
-  local copy = {}
-  local index = 1
-  local total = #(area.requiredMobIds or {})
-  while index <= total do
-    copy[#copy + 1] = area.requiredMobIds[index]
-    index = index + 1
-  end
-  return copy
-end
-
 -- Shows the captured owner (HORDE, ALLIANCE, or nil for the static colour) and a
 -- half-captured icon for the challenger at 50 % or more. Returns true on change.
 -- unconfirmed: the owner is only a hint of other players (decision 0038), drawn
@@ -461,17 +458,15 @@ function Map:SetCaptureView(id, ownerKey, halfKey, unconfirmed)
   local colorKey = area.baseColorKey or nil
   local color = area.baseColor
   local preset = ownerKey and Map.COLORS[ownerKey]
-  if preset then
-    colorKey = ownerKey
-    color = { preset[1], preset[2], preset[3] }
-    if unconfirmed then
-      color = { (preset[1] + 0.5) / 2, (preset[2] + 0.5) / 2, (preset[3] + 0.5) / 2 }
-    end
-  end
+  if preset then colorKey = ownerKey end
   unconfirmed = preset and unconfirmed and true or nil
   local column = halfKey and Map.POI_ICON_HALF_COLUMNS[halfKey] or nil
   if area.colorKey == colorKey and area.iconColumn == column and area.unconfirmed == unconfirmed then
     return false
+  end
+  if preset then
+    if unconfirmed then color = { (preset[1] + 0.5) / 2, (preset[2] + 0.5) / 2, (preset[3] + 0.5) / 2 }
+    else color = { preset[1], preset[2], preset[3] } end
   end
   area.colorKey = colorKey
   area.color = color
@@ -517,25 +512,88 @@ local function Settings()
   return db.settings
 end
 
--- Player choice from the world map filter, saved in
--- WarfrontDB.settings.mapHidden. Hides the world map and minimap drawing.
+function Map:IconScale()
+  return WF.Preferences and WF.Preferences:Get("mapIconScale") or 1
+end
+
+function Map:AreaOpacity()
+  return WF.Preferences and WF.Preferences:Get("mapAreaOpacity") or PROFILE_ALPHA
+end
+
+function Map:PathOpacity()
+  return WF.Preferences and WF.Preferences:Get("mapPathOpacity") or 0.4
+end
+
+function Map:LabelMode()
+  return WF.Preferences and WF.Preferences:Get("mapLabelMode") or "always"
+end
+
+function Map:ApplyLabelVisibility(entry)
+  if not entry or not entry.labelFrame then return end
+  local mode = self:LabelMode()
+  if mode == "hidden" or (mode == "hover" and self.hoverId ~= entry.id) then
+    HideObject(entry.labelFrame)
+  elseif type(entry.labelFrame.Show) == "function" then
+    entry.labelFrame:Show()
+  end
+end
+
+-- Player choices from the world map filter's Warfront category.
+-- "Points of interest", saved in WarfrontDB.settings.mapHidden: POI areas and
+-- icons, and the minimap drawing.
 function Map:Hidden()
   local settings = Settings()
   if settings then return settings.mapHidden and true or false end
   return self.hidden and true or false
 end
 
+-- "Campaign routes", saved in WarfrontDB.settings.mapRoutesHidden: the
+-- continent campaign route and the secured zone emblems.
+function Map:RoutesHidden()
+  local settings = Settings()
+  if settings then return settings.mapRoutesHidden and true or false end
+  return self.routesHidden and true or false
+end
+
+local function RedrawAfterFilter(self)
+  self.dirty = true
+  self:HideAll()
+  self.lastSignature = nil
+  self:Refresh(true)
+end
+
+function Map:ApplyPreferences()
+  for _, entry in pairs(self.groups) do self:ApplyLabelVisibility(entry) end
+  RedrawAfterFilter(self)
+end
+
 function Map:SetHidden(hidden)
   self.hidden = hidden and true or false
   local settings = Settings()
   if settings then settings.mapHidden = self.hidden or nil end
-  self.dirty = true
-  if self.hidden then
-    self:HideAll()
-    self.lastSignature = nil
-  else
-    self:Refresh(true)
-  end
+  RedrawAfterFilter(self)
+end
+
+-- "Scouts and armies", saved in WarfrontDB.settings.mapUnitsHidden: travelling
+-- scouts and armies on every map.
+function Map:UnitsHidden()
+  local settings = Settings()
+  if settings then return settings.mapUnitsHidden and true or false end
+  return self.unitsHidden and true or false
+end
+
+function Map:SetUnitsHidden(hidden)
+  self.unitsHidden = hidden and true or false
+  local settings = Settings()
+  if settings then settings.mapUnitsHidden = self.unitsHidden or nil end
+  RedrawAfterFilter(self)
+end
+
+function Map:SetRoutesHidden(hidden)
+  self.routesHidden = hidden and true or false
+  local settings = Settings()
+  if settings then settings.mapRoutesHidden = self.routesHidden or nil end
+  RedrawAfterFilter(self)
 end
 
 local function GetCanvas()
@@ -656,6 +714,19 @@ end
 -- The level Warfront's layers stack on: the canvas, or above OpenMap's art.
 -- OpenMap (optional map addon) draws its stitched world on this canvas up to
 -- OpenMapAPI.ArtTopLevel(), which would cover frames at the canvas level.
+-- Frame level of one of the world map's pin layers, or nil.
+local function PinLevel(kind)
+  local worldMap = GetGlobal("WorldMapFrame")
+  if not worldMap or type(worldMap.GetPinFrameLevelsManager) ~= "function" then return nil end
+  local managerOk, manager = pcall(worldMap.GetPinFrameLevelsManager, worldMap)
+  if not managerOk or not manager or type(manager.GetValidFrameLevel) ~= "function" then
+    return nil
+  end
+  local levelOk, level = pcall(manager.GetValidFrameLevel, manager, kind)
+  if levelOk and type(level) == "number" then return level end
+  return nil
+end
+
 local function BaseLevel(canvas)
   if not canvas or type(canvas.GetFrameLevel) ~= "function" then return nil end
   local ok, base = pcall(canvas.GetFrameLevel, canvas)
@@ -663,18 +734,8 @@ local function BaseLevel(canvas)
 
   -- Blizzard's exploration pin covers the canvas at its own high frame level.
   -- Keep Warfront above it while remaining below the native map's other POIs.
-  local worldMap = GetGlobal("WorldMapFrame")
-  if worldMap and type(worldMap.GetPinFrameLevelsManager) == "function" then
-    local managerOk, manager = pcall(worldMap.GetPinFrameLevelsManager, worldMap)
-    if managerOk and manager and type(manager.GetValidFrameLevel) == "function" then
-      local levelOk, level = pcall(
-        manager.GetValidFrameLevel,
-        manager,
-        "PIN_FRAME_LEVEL_MAP_EXPLORATION"
-      )
-      if levelOk and type(level) == "number" and level > base then base = level end
-    end
-  end
+  local level = PinLevel("PIN_FRAME_LEVEL_MAP_EXPLORATION")
+  if level and level > base then base = level end
 
   local api = GetGlobal("OpenMapAPI")
   if type(api) == "table" and type(api.IsStitched) == "function"
@@ -716,7 +777,18 @@ local function GetCurrentMapFile()
   return name
 end
 
-local function CreateGroup(name, levelOffset)
+-- Route and bar layers sit above the native zone hover highlight (user,
+-- 2026-11-14): the hovered zone must never cover a route line or node.
+local function GroupLevel(frame, base)
+  local want = base + frame.wfLevelOffset
+  if frame.wfAboveHighlight then
+    local highlight = PinLevel("PIN_FRAME_LEVEL_MAP_HIGHLIGHT")
+    if highlight and highlight + 1 > base then want = highlight + frame.wfLevelOffset end
+  end
+  return want
+end
+
+local function CreateGroup(name, levelOffset, aboveHighlight)
   local canvas = GetCanvas()
   local create = GetGlobal("CreateFrame")
   if not canvas or type(create) ~= "function" then return nil end
@@ -730,9 +802,10 @@ local function CreateGroup(name, levelOffset)
   if type(frame.SetAllPoints) == "function" then pcall(frame.SetAllPoints, frame, canvas) end
   if type(frame.EnableMouse) == "function" then pcall(frame.EnableMouse, frame, false) end
   frame.wfLevelOffset = levelOffset or 1
+  frame.wfAboveHighlight = aboveHighlight and true or nil
   local base = BaseLevel(canvas)
   if base and type(frame.SetFrameLevel) == "function" then
-    pcall(frame.SetFrameLevel, frame, base + frame.wfLevelOffset)
+    pcall(frame.SetFrameLevel, frame, GroupLevel(frame, base))
   end
   HideObject(frame)
   return frame
@@ -743,7 +816,7 @@ local function GetEntry(id)
   if entry then return entry end
   local frame = CreateGroup()
   if not frame then return nil end
-  entry = { frame = frame, textures = {}, visible = 0, active = false }
+  entry = { id = id, frame = frame, textures = {}, visible = 0, active = false }
   Map.groups[id] = entry
   return entry
 end
@@ -910,6 +983,7 @@ local function LabelFrame(entry)
   pcall(function()
     frame:SetAllPoints(entry.frame)
     frame:EnableMouse(false)
+    frame:SetScale(Map.iconZoom)
   end)
   entry.labelFrame = frame
   RaiseLabelFrame(entry)
@@ -997,18 +1071,17 @@ local function RefreshLevelIcon(entry, area)
   if ok then entry.icon.WarfrontLevel = level end
 end
 
--- Label under the icon of a resource POI (its stock) or of a held Settlement
--- (its level); anchored once to the icon, its text is set only when it
--- changes. Only a stock draws the bar.
+-- Label under a resource POI icon (its stock); anchored once to the icon, its
+-- text is set only when it changes. Settlement levels live in the tooltip.
 local function PlaceStockLabel(entry, area)
   local text, share
   if entry.iconShown then
     text, share = StockText(area)
-    if not text then text = LevelText(area) end
   end
   if not text then
     if entry.stockLabel then HideObject(entry.stockLabel) end
     HideStockBar(entry)
+    Map:ApplyLabelVisibility(entry)
     return
   end
   if not entry.stockLabel then
@@ -1033,6 +1106,7 @@ local function PlaceStockLabel(entry, area)
     label:Show()
   end)
   if share then PlaceStockBar(entry, share) else HideStockBar(entry) end
+  Map:ApplyLabelVisibility(entry)
 end
 
 local function PlaceIcon(entry, area, width, height, stitchedAPI, hostID)
@@ -1070,13 +1144,58 @@ local function PlaceIcon(entry, area, width, height, stitchedAPI, hostID)
     entry.icon:ClearAllPoints()
     entry.icon:SetPoint("CENTER", entry.frame, "TOPLEFT", x * width, -y * height)
     local iconWidth, iconHeight = Map.FitIcon(IconSize(area.type), pw, ph)
-    entry.icon:SetWidth(iconWidth)
-    entry.icon:SetHeight(iconHeight)
+    entry.icon.WarfrontWidth, entry.icon.WarfrontHeight = iconWidth, iconHeight
+    entry.icon:SetWidth(iconWidth * Map.iconZoom)
+    entry.icon:SetHeight(iconHeight * Map.iconZoom)
     entry.icon:Show()
   end)
   entry.iconShown = ok and true or false
   PlaceStockLabel(entry, area)
   return entry.iconShown
+end
+
+-- Icon factor for the current zoom: the canvas scale over the scale that fits
+-- the whole canvas in the view (Blizzard's least zoom; OpenMap's host map
+-- filling the window). 1 at that view, zoomed out, or when unknown.
+function Map:IconZoomFactor()
+  local frame = GetGlobal("WorldMapFrame")
+  local container = frame and frame.ScrollContainer
+  local canvas = GetCanvas()
+  if not container or not canvas or type(container.GetCanvasScale) ~= "function"
+      or type(container.GetWidth) ~= "function" or type(container.GetHeight) ~= "function" then
+    return 1
+  end
+  local ok, scale, viewW, viewH, canvasW, canvasH = pcall(function()
+    return container:GetCanvasScale(), container:GetWidth(), container:GetHeight(),
+      canvas:GetWidth(), canvas:GetHeight()
+  end)
+  if not ok or type(scale) ~= "number" or scale <= 0 or type(viewW) ~= "number"
+      or type(viewH) ~= "number" or type(canvasW) ~= "number" or type(canvasH) ~= "number"
+      or canvasW <= 0 or canvasH <= 0 then
+    return 1
+  end
+  local fit = mathMin(viewW / canvasW, viewH / canvasH)
+  if fit <= 0 or scale <= fit then return 1 end
+  local config = self.ICON_ZOOM
+  return mathMax(config.min, (scale / fit) ^ (config.power - 1))
+end
+
+-- Resizes shown icons and scales their label layer (stock text and bar) when
+-- the zoom factor moves; called on every canvas zoom step and refresh.
+function Map:ApplyIconZoom()
+  local factor = self:IconZoomFactor()
+  if mathAbs(factor - self.iconZoom) < 0.005 then return end
+  self.iconZoom = factor
+  for _, entry in pairs(self.groups) do
+    local icon = entry.icon
+    if icon and icon.WarfrontWidth then
+      pcall(function()
+        icon:SetWidth(icon.WarfrontWidth * factor)
+        icon:SetHeight(icon.WarfrontHeight * factor)
+      end)
+    end
+    if entry.labelFrame then pcall(entry.labelFrame.SetScale, entry.labelFrame, factor) end
+  end
 end
 
 local function PlacePatch(entry, texture, record, width, height, color, alpha,
@@ -1100,7 +1219,7 @@ local function PlacePatch(entry, texture, record, width, height, color, alpha,
       texture.WarfrontPath = PROFILE_TEXTURE
     end
     texture:SetTexCoord(record[5], record[6], record[7], record[8])
-    texture:SetVertexColor(color[1], color[2], color[3], alpha or PROFILE_ALPHA)
+    texture:SetVertexColor(color[1], color[2], color[3], (alpha or PROFILE_ALPHA) * Map:AreaOpacity())
     texture:ClearAllPoints()
     texture:SetPoint("TOPLEFT", entry.frame, "TOPLEFT",
       left * width, -top * height)
@@ -1230,407 +1349,11 @@ function Map:GetAreaRecords(area)
   return shadow.records
 end
 
--- Scout routes (roadmap WP8, docs/scouting.md, decision 0051) ----------------
--- Every scout still travelling is drawn on the displayed zone map, for both
--- factions and without its sender: a dotted straight line from its origin to
--- its target and its icon at the share of the trip elapsed. A route between
--- two zones of one continent is drawn in continent coordinates and clipped to
--- the displayed zone, so each zone shows its own part; a route to another
--- continent (abstract sea crossing) and the continent maps show nothing.
--- Local display only: nothing is sent.
-local ROUTE_TEXTURE = "Interface\\Buttons\\WHITE8X8"
-local ROUTE_DOT_SIZE = 5
-local ROUTE_DOT_GAP = 9
-local ROUTE_DOT_ALPHA = 0.9
--- Dots this close to an endpoint would sit under its POI icon.
-local ROUTE_ICON_CLEAR = POI_ICON_SIZE * ICON_HIT_RATIO
-local ROUTE_MAX = 16
-local ROUTE_MAX_DOTS = 800
-local SCOUT_ICON_SIZE = 20
-local SCOUT_ICON_DIR = "Interface\\AddOns\\Warfront\\media\\Textures\\Icons\\War3Units\\"
-local SCOUT_ICONS = { A = SCOUT_ICON_DIR .. "BTNKnight", H = SCOUT_ICON_DIR .. "BTNRaider" }
--- Armies (decision 0052): the faction's basic soldier.
-local ARMY_ICONS = { A = SCOUT_ICON_DIR .. "BTNFootman", H = SCOUT_ICON_DIR .. "BTNGrunt" }
-local SCOUT_COLORS = { A = Map.COLORS.ALLIANCE, H = Map.COLORS.HORDE }
--- Zone rectangles on their continent in world yards: left, right, top,
--- bottom, continent (1.12 WorldMapArea, not measured on OctoWoW). Widths and
--- heights equal Scout.ZONES; tools/smoke.py checks both stay equal.
-local ROUTE_ZONES = {
-  elwynn = { 1535.4166, -1935.4166, -7939.5833, -10254.1666, "EK" },
-  westfall = { 3016.6665, -1483.3334, -9400.0, -12400.0, "EK" },
-  durotar = { -1962.4999, -7249.9995, 1808.3333, -1716.6666, "KA" },
-  barrens = { 2622.9165, -7510.4165, 1612.4999, -5143.75, "KA" },
-}
-
-Map.ROUTE_ZONES = ROUTE_ZONES
-Map.routes = { slots = {}, dots = {}, count = 0, dotCount = 0, iconCount = 0 }
-
--- An area's icon anchor in units of the displayed zone map (outside 0-1 when
--- it lies on another zone), or nil when the zones share no continent.
-local function RoutePoint(area, mapKey)
-  if not area or not area.enabled then return nil end
-  local x, y = GetIconPosition(area)
-  if not x or area.mapKey == mapKey then return x, y end
-  local from, to = ROUTE_ZONES[area.mapKey or ""], ROUTE_ZONES[mapKey or ""]
-  if not from or not to or from[5] ~= to[5] then return nil end
-  local worldY = from[1] - x * (from[1] - from[2])
-  local worldX = from[3] - y * (from[3] - from[4])
-  return (to[1] - worldY) / (to[1] - to[2]), (to[3] - worldX) / (to[3] - to[4])
-end
-
--- Continent maps and the world map (decision 0051 revision, 2026-11-01). The
--- view is a zone map key, "azeroth", "kalimdor" or "world". A zone's place on
--- its continent map is Map.CONTINENT_ZONES (measured); the continents' place
--- on the world map is the continent map's rectangle (left, top, width, height
--- in world map units), drawing only. Derived 2026-11-02 from the continent
--- map yard bounds (WorldMapArea) and the classic world map's extent in each
--- continent's yards (HereBeDragons data), which agrees with OctoWoW's
--- WorldMapContinent.dbc offsets and 0.75 scale; not measured on OctoWoW.
-local WORLD_CONTINENTS = {
-  azeroth = { 0.371483, 0.081501, 0.787673, 0.787599 },
-  kalimdor = { -0.185892, 0.067677, 0.819985, 0.820069 },
-}
-
-Map.WORLD_CONTINENTS = WORLD_CONTINENTS
-
--- An area's icon anchor in units of the displayed view, or nil when the view
--- does not show it (a zone map of another continent, the other continent map).
-local function ViewPoint(area, view)
-  local continent = WORLD_CONTINENTS[view or ""]
-  if not continent and view ~= "world" then return RoutePoint(area, view) end
-  if not area or not area.enabled then return nil end
-  local zone = Map.CONTINENT_ZONES[area.mapKey or ""]
-  local x, y = GetIconPosition(area)
-  if not zone or not x then return nil end
-  if view ~= "world" and zone[1] ~= view then return nil end
-  local cx, cy = zone[2] + x * zone[4], zone[3] + y * zone[5]
-  if view ~= "world" then return cx, cy end
-  local place = WORLD_CONTINENTS[zone[1]]
-  if not place then return nil end
-  return place[1] + cx * place[3], place[2] + cy * place[4]
-end
-
--- One edge of the Liang-Barsky clip: keeps the shares t where p * t <= q.
-local function ClipEdge(p, q, t0, t1)
-  if p == 0 then
-    if q < 0 then return nil end
-    return t0, t1
-  end
-  local t = q / p
-  if p < 0 then
-    if t > t1 then return nil end
-    if t > t0 then t0 = t end
-  else
-    if t < t0 then return nil end
-    if t < t1 then t1 = t end
-  end
-  return t0, t1
-end
-
--- The shares [t0, t1] of the segment inside the 0-1 map, or nil when none is.
-local function ClipRoute(ax, ay, bx, by)
-  local dx, dy = bx - ax, by - ay
-  local t0, t1 = ClipEdge(-dx, ax, 0, 1)
-  if t0 then t0, t1 = ClipEdge(dx, 1 - ax, t0, t1) end
-  if t0 then t0, t1 = ClipEdge(-dy, ay, t0, t1) end
-  if t0 then t0, t1 = ClipEdge(dy, 1 - ay, t0, t1) end
-  if not t0 or t0 > t1 then return nil end
-  return t0, t1
-end
-
--- The texture list[key], created once on the route frame.
-local function RouteTexture(list, key, frame, layer)
-  local texture = list[key]
-  if texture then return texture end
-  if type(frame.CreateTexture) ~= "function" then return nil end
-  local ok, created = pcall(frame.CreateTexture, frame, nil, layer)
-  if not ok or not created then return nil end
-  list[key] = created
-  return created
-end
-
--- The dots of the hovered route are lighter, opaque and a little larger.
-local ROUTE_DOT_HOVER_SIZE = 7
-local ROUTE_DOT_HOVER_LIGHTEN = 0.5
-
-local function PaintDot(dot)
-  local color = dot.WarfrontColor
-  if not color then return end
-  if dot.WarfrontRecord and dot.WarfrontRecord == Map.hoverRoute then
-    local k = ROUTE_DOT_HOVER_LIGHTEN
-    dot:SetVertexColor(color[1] + (1 - color[1]) * k, color[2] + (1 - color[2]) * k,
-      color[3] + (1 - color[3]) * k, 1)
-    dot:SetWidth(ROUTE_DOT_HOVER_SIZE)
-    dot:SetHeight(ROUTE_DOT_HOVER_SIZE)
-  else
-    dot:SetVertexColor(color[1], color[2], color[3], ROUTE_DOT_ALPHA)
-    dot:SetWidth(ROUTE_DOT_SIZE)
-    dot:SetHeight(ROUTE_DOT_SIZE)
-  end
-end
-
-local function RefreshRouteDots()
-  local routes = Map.routes
-  local index = 1
-  while index <= routes.dotCount do
-    if routes.dots[index] then PaintDot(routes.dots[index]) end
-    index = index + 1
-  end
-end
-
--- Lays one route's dots from dot number first + 1; returns the last number used.
-local function LayoutDots(frame, slot, first, width, height)
-  local dots = Map.routes.dots
-  local dx, dy = (slot.bx - slot.ax) * width, (slot.by - slot.ay) * height
-  local length = math.sqrt(dx * dx + dy * dy)
-  if length <= 0 then return first end
-  local color = SCOUT_COLORS[slot.record.fac]
-  local step = ROUTE_DOT_GAP / length
-  local k = math.ceil(slot.t0 / step)
-  local t = k * step
-  local used = first
-  while t <= slot.t1 and used < ROUTE_MAX_DOTS do
-    if t * length >= ROUTE_ICON_CLEAR and (1 - t) * length >= ROUTE_ICON_CLEAR then
-      local dot = RouteTexture(dots, used + 1, frame, "ARTWORK")
-      if not dot then return used end
-      used = used + 1
-      if not dot.WarfrontPath then
-        -- The round white dot of the atlas, tinted below; a plain square without it.
-        local atlas = WF.UIAtlas
-        local piece = atlas and atlas.pieces["route.dot"]
-        if piece then
-          dot:SetTexture(atlas.pages[piece.p])
-          dot:SetTexCoord(piece.x / atlas.page, (piece.x + piece.w) / atlas.page, piece.y / atlas.page,
-            (piece.y + piece.h) / atlas.page)
-          dot.WarfrontPath = atlas.pages[piece.p]
-        else
-          dot:SetTexture(ROUTE_TEXTURE)
-          dot.WarfrontPath = ROUTE_TEXTURE
-        end
-      end
-      dot.WarfrontColor = color
-      dot.WarfrontRecord = slot.record
-      PaintDot(dot)
-      dot:ClearAllPoints()
-      dot:SetPoint("CENTER", frame, "TOPLEFT", slot.ax * width + t * dx, -(slot.ay * height + t * dy))
-      dot:Show()
-    end
-    k = k + 1
-    t = k * step
-  end
-  return used
-end
-
-local function HideDots(from)
-  local routes = Map.routes
-  local index = from
-  while index <= routes.dotCount do
-    HideObject(routes.dots[index])
-    index = index + 1
-  end
-  if from - 1 < routes.dotCount then routes.dotCount = from - 1 end
-end
-
--- Hides the slots from number first on and forgets their records.
-local function ReleaseSlots(first)
-  local slots = Map.routes.slots
-  local index = first
-  while index <= #slots do
-    HideObject(slots[index].icon)
-    slots[index].record = nil
-    slots[index].iconShown = false
-    index = index + 1
-  end
-end
-
-function Map:HideRoutes()
-  local routes = self.routes
-  HideDots(1)
-  ReleaseSlots(1)
-  HideObject(routes.frame)
-  routes.count = 0
-  routes.iconCount = 0
-  routes.layoutMap = nil
-end
-
--- The side of a zone or continent map facing the other continent: Kalimdor
--- lies west of the Eastern Kingdoms, so an Eastern Kingdoms map looks left and
--- a Kalimdor map right.
-local function SeaSide(code)
-  if code == "EK" then return 0 end
-  return 1
-end
-
--- The segment of a sea crossing shown on the displayed zone or continent map:
--- from the origin icon to that side during the first half of the trip, from
--- the side to the target icon during the second. Returns ax, ay, bx, by and
--- the trip shares where the segment starts and ends, or nil when the view
--- shows neither end. The world map shows the whole crossing as one line.
-local function SeaLeg(from, to, view)
-  if not from or not to then return nil end
-  local fromZone, toZone = ROUTE_ZONES[from.mapKey or ""], ROUTE_ZONES[to.mapKey or ""]
-  if not fromZone or not toZone or fromZone[5] == toZone[5] then return nil end
-  -- A zone map shows only its own end; zones overlap their neighbors, a
-  -- neighbor's POI is not drawn as an end.
-  local zoneView = not WORLD_CONTINENTS[view or ""]
-  local x, y
-  if not zoneView or from.mapKey == view then x, y = ViewPoint(from, view) end
-  if x then return x, y, SeaSide(fromZone[5]), y, 0, 0.5 end
-  if not zoneView or to.mapKey == view then x, y = ViewPoint(to, view) end
-  if x then return SeaSide(toZone[5]), y, x, y, 0.5, 1 end
-  return nil
-end
-
--- One travelling record (a scout or an army) placed in the next route slot
--- if its line crosses the displayed zone. Returns the new count and whether
--- the slot changed record.
-local function PlaceRoute(map, slots, count, r, path, mapKey, now, kind)
-  if count >= ROUTE_MAX or type(r) ~= "table" or not path or type(r.depart) ~= "number"
-      or type(r.dur) ~= "number" or r.dur <= 0 or r.depart + r.dur <= now then
-    return count, false
-  end
-  local from, to = map.areas[r.origin or ""], map.areas[r.target or ""]
-  local ax, ay = ViewPoint(from, mapKey)
-  local bx, by = ViewPoint(to, mapKey)
-  local s0, s1 = 0, 1
-  if not (ax and bx) then
-    -- Another continent: the first half of the trip leaves the origin zone
-    -- toward the sea, the second half enters the target zone from it.
-    ax, ay, bx, by, s0, s1 = SeaLeg(from, to, mapKey)
-  end
-  local t0, t1
-  if ax and bx then t0, t1 = ClipRoute(ax, ay, bx, by) end
-  if not t0 then return count, false end
-  count = count + 1
-  local slot = slots[count]
-  if not slot then
-    slot = {}
-    slots[count] = slot
-  end
-  local changed = false
-  if slot.record ~= r then
-    changed = true
-    slot.record = r
-  end
-  slot.path = path
-  slot.kind = kind
-  slot.ax, slot.ay, slot.bx, slot.by, slot.t0, slot.t1 = ax, ay, bx, by, t0, t1
-  slot.s0, slot.s1 = s0, s1
-  return count, changed
-end
-
--- Draws the scouts and armies travelling on the displayed zone (decisions
--- 0051, 0052). The dots are laid out again only when the routes, the map, the
--- canvas or the areas change; the icons move on every refresh. Returns the
--- number of routes drawn.
-function Map:RefreshRoutes(mapKey, width, height)
-  local routes = self.routes
-  local scout = WF.Scout
-  local attack = WF.Attack
-  local now = WF.Now and WF.Now() or 0
-  local scouts = scout and type(scout.records) == "table"
-  local armies = attack and type(attack.Marching) == "function"
-  if (not scouts and not armies) or type(now) ~= "number" then
-    self:HideRoutes()
-    return 0
-  end
-
-  local slots = routes.slots
-  local count = 0
-  local changed = routes.layoutMap ~= mapKey or routes.layoutWidth ~= width
-    or routes.layoutHeight ~= height or routes.layoutRevision ~= self.revision
-  local moved
-  local key, r
-  if scouts then
-    for key, r in pairs(scout.records) do
-      count, moved = PlaceRoute(self, slots, count, r, type(r) == "table" and SCOUT_ICONS[r.fac], mapKey, now, "scout")
-      if moved then changed = true end
-    end
-  end
-  if armies then
-    local list = attack:Marching(now)
-    for index = 1, #list do
-      r = list[index]
-      count, moved = PlaceRoute(self, slots, count, r, ARMY_ICONS[r.fac], mapKey, now, "army")
-      if moved then changed = true end
-    end
-  end
-  if count ~= routes.count then changed = true end
-  ReleaseSlots(count + 1)
-  routes.count = count
-  if count == 0 then
-    self:HideRoutes()
-    return 0
-  end
-
-  if not routes.frame then routes.frame = CreateGroup("WarfrontMapRoutes", 2) end
-  local frame = routes.frame
-  if not frame then return 0 end
-  local index
-  if changed then
-    routes.layoutMap, routes.layoutWidth, routes.layoutHeight = mapKey, width, height
-    routes.layoutRevision = self.revision
-    local used = 0
-    index = 1
-    while index <= count do
-      used = LayoutDots(frame, slots[index], used, width, height)
-      index = index + 1
-    end
-    HideDots(used + 1)
-    routes.dotCount = used
-  end
-
-  local icons = 0
-  index = 1
-  while index <= count do
-    local slot = slots[index]
-    local record = slot.record
-    -- Share of this segment covered (the whole trip on one continent).
-    local t = (Clamp((now - record.depart) / record.dur, 0, 1) - slot.s0) / (slot.s1 - slot.s0)
-    local icon = nil
-    if t >= slot.t0 and t <= slot.t1 then icon = RouteTexture(slot, "icon", frame, "OVERLAY") end
-    if icon then
-      local path = slot.path
-      if icon.WarfrontPath ~= path then
-        icon:SetTexture(path)
-        icon.WarfrontPath = path
-        icon:SetWidth(SCOUT_ICON_SIZE)
-        icon:SetHeight(SCOUT_ICON_SIZE)
-      end
-      slot.iconX = slot.ax + t * (slot.bx - slot.ax)
-      slot.iconY = slot.ay + t * (slot.by - slot.ay)
-      icon:ClearAllPoints()
-      icon:SetPoint("CENTER", frame, "TOPLEFT", slot.iconX * width, -slot.iconY * height)
-      icon:Show()
-      slot.iconShown = true
-      icons = icons + 1
-    else
-      HideObject(slot.icon)
-      slot.iconShown = false
-    end
-    index = index + 1
-  end
-  routes.iconCount = icons
-  local canvas = GetCanvas()
-  if canvas and type(frame.SetAllPoints) == "function" then frame:SetAllPoints(canvas) end
-  frame:Show()
-  return count
-end
-
-local function DrawRoutes(mapKey, width, height)
-  local ok, err = pcall(Map.RefreshRoutes, Map, mapKey, width, height)
-  if ok then return end
-  pcall(Map.HideRoutes, Map)
-  if WF.RecordError then WF.RecordError("map routes", err) end
-end
-
 -- Zone capture bars on the continent maps -----------------------------------
--- On a continent map, each zone holding controlled POIs (Outposts,
--- Settlements, Hunting Grounds) shows the Capture HUD bar at the middle of
--- the zone: same textures, Alliance blue from the left, Horde red from the
--- right, grey for the neutral rest, percents inside, faction badges on each
--- side. Shares are the number of POIs each faction holds, from the owner color
--- the zone map shows. Local display only: nothing is sent.
+-- On a continent map, the two zones of the Active Front show the Capture HUD
+-- bar at their middle. Zones secured behind either front show that faction's
+-- badge instead. The bar's shares are the number of POIs each faction holds,
+-- from the owner color the zone map shows. Local display only: nothing is sent.
 -- Fallback zone rectangles from the source client. On Forever the live
 -- C_Map.GetMapRectOnMap result below takes precedence.
 local CONTINENT_ZONES = {
@@ -1644,30 +1367,36 @@ local CONTINENT_ZONES = {
 Map.CONTINENT_ZONES = CONTINENT_ZONES
 local CONTINENT_KEYS = { azeroth = true, kalimdor = true }
 local ZONE_BAR_TEXTURE = "Interface\\Buttons\\WHITE8X8"
--- The HUD bar at 40 % of its 176 px width (map.bar.frame, the hud.bar.frame
--- sprite redrawn 70 px wide so the stroke keeps its weight) with the HUD's
--- 16 x 19 badges, scaled down as one frame.
+-- Secured route zones show their faction emblem, scaled down as one frame.
+-- Active Front zones show their capture share as the ring of their campaign
+-- node instead (RouteNodeRing*.tga), which replaced the horizontal bar.
 local ZONE_BAR_WIDTH = 70
 local ZONE_BAR_HEIGHT = 12
-local ZONE_BAR_INSET = 2
-local ZONE_BAR_INNER = ZONE_BAR_WIDTH - 2 * ZONE_BAR_INSET
 local ZONE_BAR_SCALE = 0.75
 local ZONE_BADGE_WIDTH, ZONE_BADGE_HEIGHT = 16, 19
-local ZONE_BAR_NEUTRAL = { 0.45, 0.45, 0.45 }
+-- 43 x ZONE_BAR_SCALE = 32 canvas units (48 until 2026-11-14, reduced by the user).
+local ZONE_OWNER_ICON_SIZE = 43
+local ZONE_FACTION_TEXTURES = {
+  ALLIANCE = "Interface\\AddOns\\Warfront\\media\\Textures\\UI\\Front\\FactionAlliance",
+  HORDE = "Interface\\AddOns\\Warfront\\media\\Textures\\UI\\Front\\FactionHorde",
+}
+local FRONT_OWNER_KEYS = { H = "HORDE", A = "ALLIANCE" }
 Map.zoneBars = { slots = {}, count = 0 }
+-- War Camp icons on the continent and world maps (Points of interest filter).
+Map.warCamps = { icons = {}, records = {}, count = 0 }
 
-local foreverZoneCenters = {}
+local foreverZoneRects = {}
 
-local function ForeverZoneCenter(mapKey)
+local function ForeverZoneRect(mapKey)
   if not C_Map or type(C_Map.GetMapChildrenInfo) ~= "function"
       or type(C_Map.GetMapRectOnMap) ~= "function" then return nil end
   local frame = GetGlobal("WorldMapFrame")
   if not frame or type(frame.GetMapID) ~= "function" then return nil end
   local ok, topMapID = pcall(frame.GetMapID, frame)
   if not ok or type(topMapID) ~= "number" then return nil end
-  foreverZoneCenters[topMapID] = foreverZoneCenters[topMapID] or {}
-  local cached = foreverZoneCenters[topMapID][mapKey]
-  if cached then return cached[1], cached[2] end
+  foreverZoneRects[topMapID] = foreverZoneRects[topMapID] or {}
+  local cached = foreverZoneRects[topMapID][mapKey]
+  if cached then return cached[1], cached[2], cached[3], cached[4] end
   local zoneID = FOREVER_ZONE_IDS[mapKey]
   if not zoneID then return nil end
   local children = C_Map.GetMapChildrenInfo(topMapID, nil, true)
@@ -1678,15 +1407,26 @@ local function ForeverZoneCenter(mapKey)
       local minX, maxX, minY, maxY = C_Map.GetMapRectOnMap(child.mapID, topMapID)
       if type(minX) == "number" and type(maxX) == "number"
           and type(minY) == "number" and type(maxY) == "number" then
-        local center = { (minX + maxX) / 2, (minY + maxY) / 2 }
-        foreverZoneCenters[topMapID][mapKey] = center
-        return center[1], center[2]
+        local rect = { minX, maxX, minY, maxY }
+        foreverZoneRects[topMapID][mapKey] = rect
+        return rect[1], rect[2], rect[3], rect[4]
       end
     end
     index = index + 1
   end
   return nil
 end
+
+local function ForeverZoneCenter(mapKey)
+  local minX, maxX, minY, maxY = ForeverZoneRect(mapKey)
+  if not minX then return nil end
+  return (minX + maxX) / 2, (minY + maxY) / 2
+end
+
+-- Assigned by the campaign-route renderer below. Front markers call it only
+-- after this file has loaded, so their bars and badges share the exact
+-- Settlement anchor used by the route instead of the middle of the zone.
+local CampaignPoint
 
 -- The displayed continent's key, or nil on a zone or the world map.
 local function CurrentContinentKey()
@@ -1721,17 +1461,34 @@ end
 -- (middle of the zone's rectangle) in units of the continent map.
 function Map:ZoneShares(continentKey)
   local list = {}
-  if not CONTINENT_KEYS[continentKey or ""] then return list end
+  -- The world map shows every continent: any zone counts, and the anchor is
+  -- set from the campaign point (FrontZones) for the zones on a route.
+  local isWorld = continentKey == "world" or continentKey == "stitched"
+  if not isWorld and not CONTINENT_KEYS[continentKey or ""] then return list end
   local zones = {}
   local index = 1
   for index = 1, #self.order do
     local area = self.areas[self.order[index]]
     local zone = area and area.enabled and CONTINENT_ZONES[area.mapKey or ""]
-    if zone and zone[1] == continentKey and Map.POI_TYPES[area.type]
-        and not Map.RESOURCE_TYPES[area.type] then
+    local foreverX, foreverY
+    local onContinent = zone and zone[1] == continentKey
+    if isWorld then
+      onContinent, foreverX, foreverY = area and area.enabled and area.mapKey and true or false, 0, 0
+    end
+    -- New catalog zones need no guessed fallback rectangle: C_Map locates them
+    -- directly on the continent currently displayed.
+    if not onContinent and not zone and area then
+      foreverX, foreverY = ForeverZoneCenter(area.mapKey)
+      onContinent = foreverX ~= nil
+    end
+    -- A capital never changes hands outside its siege: it adds nothing to a
+    -- share. War Camps feed the Front Network, never these front-zone shares
+    -- (decision 0123 § 8).
+    if onContinent and Map.POI_TYPES[area.type]
+        and not Map.RESOURCE_TYPES[area.type] and area.type ~= "CAPITAL" and area.type ~= "WAR_CAMP" then
       local entry = zones[area.mapKey]
       if not entry then
-        local foreverX, foreverY = ForeverZoneCenter(area.mapKey)
+        if not foreverX then foreverX, foreverY = ForeverZoneCenter(area.mapKey) end
         entry = {
           mapKey = area.mapKey, total = 0, alliance = 0, horde = 0,
           x = foreverX or zone[2] + zone[4] / 2,
@@ -1757,44 +1514,70 @@ function Map:ZoneShares(continentKey)
   return list
 end
 
--- Applies the part x0..x1 of an atlas piece, or the plain color when the
--- skin or the piece is missing. False when no atlas piece was used.
-local function ZoneBarPiece(texture, piece, color, x0, x1)
-  local skin = WF.Skin
-  if skin and type(skin.Apply) == "function" and skin:Apply(texture, piece, x0, x1) then
-    return true
+-- Keeps only route zones on this continent. The player's own target is the
+-- Active Front (both targets while the faction is unknown), plus the player's
+-- pressed Settlement; completed nodes behind the lines carry their side,
+-- except the other faction's target, which keeps its numbered node.
+function Map:FrontZones(continentKey)
+  local shares = self:ZoneShares(continentKey)
+  local front = WF.Front
+  if not front or type(front.HasRoutes) ~= "function" or not front:HasRoutes()
+      or type(front.Targets) ~= "function" then
+    return {}
   end
-  texture:SetTexture(ZONE_BAR_TEXTURE)
-  texture:SetTexCoord(0, 1, 0, 1)
-  if color then texture:SetVertexColor(color[1], color[2], color[3], color[4] or 1) end
-  return false
-end
-
-local function ZoneBarFillTexture(frame, layer, piece, color, fromRight)
-  local texture = frame:CreateTexture(nil, layer)
-  ZoneBarPiece(texture, piece, color)
-  texture:SetHeight(ZONE_BAR_HEIGHT - 2 * ZONE_BAR_INSET)
-  texture.fillPiece = piece
-  texture.fillColor = color
-  texture.fillFromRight = fromRight
-  if fromRight then
-    texture:SetPoint("RIGHT", frame, "RIGHT", -ZONE_BAR_INSET, 0)
-  else
-    texture:SetPoint("LEFT", frame, "LEFT", ZONE_BAR_INSET, 0)
+  local capture = WF.Capture
+  local playerSide = capture and type(capture.MyFaction) == "function" and capture:MyFaction()
+  local active, owners, anchors, targets = {}, {}, {}, {}
+  local routes = front.routes or {}
+  for r = 1, #routes do
+    local route = routes[r]
+    local forward, rear = front:Targets(route)
+    local advancing = FRONT_OWNER_KEYS[route.advancing]
+    local defending = route.advancing == "H" and "ALLIANCE" or "HORDE"
+    local mine = playerSide == route.advancing
+    local theirs = playerSide and not mine
+    -- Your own Settlement gets its bar back once the other side takes one of
+    -- its Outposts (decision 0111).
+    local threat, threatId = 0, nil
+    if playerSide and type(front.Threat) == "function" then threat, threatId = front:Threat(route, playerSide) end
+    local threatArea = threat >= 2 and threatId and self.areas[threatId]
+    if threatArea and threatArea.mapKey then active[threatArea.mapKey], owners[threatArea.mapKey] = true, nil end
+    for n = 1, #route.nodes do
+      local area = self.areas[route.nodes[n].id]
+      local mapKey = area and area.mapKey
+      if mapKey then
+        anchors[mapKey] = area
+        if (n == forward and not theirs) or (n == rear and not mine) then
+          active[mapKey], owners[mapKey] = true, nil
+        elseif n == forward or n == rear then
+          -- The other faction's target stays contestable: no emblem, its
+          -- numbered node keeps the holder's full ring (user, 2026-11-15).
+          targets[mapKey], owners[mapKey] = true, nil
+        elseif not active[mapKey] and not targets[mapKey] and n < forward then
+          owners[mapKey] = advancing
+        elseif not active[mapKey] and not targets[mapKey] and n > rear then
+          owners[mapKey] = defending
+        end
+      end
+    end
   end
-  return texture
-end
-
--- Percents inside the bar, like the HUD, outlined to stay readable on the map.
-local function ZoneBarText(frame, point, x)
-  local text = frame:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-  text:SetPoint(point, frame, point, x, 0.5)
-  if text.SetJustifyH then text:SetJustifyH(point) end
-  if text.GetFont and text.SetFont then
-    local path, size = text:GetFont()
-    if path and type(size) == "number" then text:SetFont(path, size, "OUTLINE") end
+  local list = {}
+  for index = 1, #shares do
+    local zone = shares[index]
+    local anchor = anchors[zone.mapKey]
+    if anchor and CampaignPoint then
+      local anchorX, anchorY = CampaignPoint(anchor, continentKey)
+      if anchorX then zone.x, zone.y = anchorX, anchorY end
+    end
+    if active[zone.mapKey] then
+      zone.activeFront = true
+      list[#list + 1] = zone
+    elseif owners[zone.mapKey] then
+      zone.ownerKey = owners[zone.mapKey]
+      list[#list + 1] = zone
+    end
   end
-  return text
+  return list
 end
 
 local function ZoneBarBadge(frame, piece, point, relative, x)
@@ -1807,16 +1590,30 @@ local function ZoneBarBadge(frame, piece, point, relative, x)
   return badge
 end
 
+local function ZoneFactionIcon(texture, ownerKey)
+  local path = ZONE_FACTION_TEXTURES[ownerKey]
+  if path then
+    texture:SetTexture(path)
+    texture:SetTexCoord(0, 1, 0, 1)
+    texture:SetVertexColor(1, 1, 1, 1)
+    return
+  end
+  local color = Map.COLORS[ownerKey] or Map.COLORS.NEUTRAL
+  texture:SetTexture(ZONE_BAR_TEXTURE)
+  texture:SetTexCoord(0, 1, 0, 1)
+  texture:SetVertexColor(color[1], color[2], color[3], 1)
+end
+
 local function ZoneBarSlot(bars, index)
   local slot = bars.slots[index]
   if slot then return slot end
-  if not bars.frame then bars.frame = CreateGroup("WarfrontMapZoneBars", 3) end
+  if not bars.frame then bars.frame = CreateGroup("WarfrontMapZoneBars", 3, true) end
   local group = bars.frame
   local create = GetGlobal("CreateFrame")
   if not group or type(create) ~= "function" then return nil end
   local ok = pcall(function()
-    -- An unscaled 1 px holder takes the map position; the scaled bar sits on
-    -- it with no offset, so the position never depends on the bar's scale.
+    -- An unscaled 1 px holder takes the map position; the scaled emblem sits
+    -- on it with no offset, so the position never depends on its scale.
     local holder = create("Frame", nil, group)
     holder:SetWidth(1)
     holder:SetHeight(1)
@@ -1827,52 +1624,16 @@ local function ZoneBarSlot(bars, index)
     frame:SetScale(ZONE_BAR_SCALE)
     frame:SetPoint("CENTER", holder, "CENTER", 0, 0)
     if type(frame.EnableMouse) == "function" then frame:EnableMouse(false) end
-    -- 1.12 has no texture sublevels: grey base, then the frame, then the fills.
-    local neutral = ZoneBarFillTexture(frame, "BACKGROUND", "fill.grey", ZONE_BAR_NEUTRAL)
-    neutral:SetWidth(ZONE_BAR_INNER)
-    local border = frame:CreateTexture(nil, "BORDER")
-    border:SetAllPoints(frame)
-    if not ZoneBarPiece(border, "map.bar.frame") then border:SetVertexColor(0, 0, 0, 0) end
     slot = {
-      holder = holder, frame = frame, border = border, neutral = neutral,
-      alliance = ZoneBarFillTexture(frame, "ARTWORK", "fill.blue", Map.COLORS.ALLIANCE),
-      horde = ZoneBarFillTexture(frame, "ARTWORK", "fill.red", Map.COLORS.HORDE, true),
-      left = ZoneBarText(frame, "LEFT", 7),
-      right = ZoneBarText(frame, "RIGHT", -7),
-      badgeA = ZoneBarBadge(frame, "badge.alliance", "RIGHT", "LEFT", -1),
-      badgeH = ZoneBarBadge(frame, "badge.horde", "LEFT", "RIGHT", 1),
+      holder = holder, frame = frame,
+      owner = ZoneBarBadge(frame, "badge.neutral", "CENTER", "CENTER", 0),
     }
+    slot.owner:SetWidth(ZONE_OWNER_ICON_SIZE)
+    slot.owner:SetHeight(ZONE_OWNER_ICON_SIZE)
   end)
   if not ok or not slot then return nil end
   bars.slots[index] = slot
   return slot
-end
-
--- Fill width for a share, cropping the atlas piece (as the HUD does) so the
--- gradient is not squeezed.
-local function ZoneBarFill(texture, share)
-  if share <= 0.001 then
-    HideObject(texture)
-    return
-  end
-  share = mathMin(1, share)
-  texture:SetWidth(mathMax(1, ZONE_BAR_INNER * share))
-  local skin = WF.Skin
-  local piece = skin and type(skin.Piece) == "function" and skin:Piece(texture.fillPiece)
-  if piece then
-    local shown = piece.w * share
-    if texture.fillFromRight then
-      ZoneBarPiece(texture, texture.fillPiece, texture.fillColor, piece.w - shown, piece.w)
-    else
-      ZoneBarPiece(texture, texture.fillPiece, texture.fillColor, 0, shown)
-    end
-  end
-  texture:Show()
-end
-
-local function ZoneBarPercent(share)
-  if share <= 0.001 then return "" end
-  return mathFloor(share * 100 + 0.5) .. "%"
 end
 
 local function HideZoneBarSlot(slot)
@@ -1890,28 +1651,26 @@ end
 
 function Map:RefreshZoneBars(continentKey, width, height)
   local bars = self.zoneBars
-  local zones = self:ZoneShares(continentKey)
+  local zones = self:FrontZones(continentKey)
   local canvas = GetCanvas()
   local used = 0
   local index = 1
   while index <= #zones do
     local zone = zones[index]
-    local slot = ZoneBarSlot(bars, used + 1)
-    if not slot then break end
-    used = used + 1
-    slot.mapKey = zone.mapKey
-    slot.x, slot.y = zone.x, zone.y
-    slot.allianceShare, slot.hordeShare = zone.allianceShare, zone.hordeShare
-    slot.holder:ClearAllPoints()
-    slot.holder:SetPoint("CENTER", bars.frame, "TOPLEFT", zone.x * width, -zone.y * height)
-    ZoneBarFill(slot.alliance, zone.allianceShare)
-    ZoneBarFill(slot.horde, zone.hordeShare)
-    slot.left:SetText(ZoneBarPercent(zone.allianceShare))
-    slot.right:SetText(ZoneBarPercent(zone.hordeShare))
-    if slot.badgeA.skinned then slot.badgeA:Show() else HideObject(slot.badgeA) end
-    if slot.badgeH.skinned then slot.badgeH:Show() else HideObject(slot.badgeH) end
-    slot.frame:Show()
-    slot.holder:Show()
+    -- Active Front zones: their campaign node's capture ring shows the share.
+    if not zone.activeFront then
+      local slot = ZoneBarSlot(bars, used + 1)
+      if not slot then break end
+      used = used + 1
+      slot.mapKey = zone.mapKey
+      slot.x, slot.y = zone.x, zone.y
+      slot.holder:ClearAllPoints()
+      slot.holder:SetPoint("CENTER", bars.frame, "TOPLEFT", zone.x * width, -zone.y * height)
+      ZoneFactionIcon(slot.owner, zone.ownerKey)
+      slot.owner:Show()
+      slot.frame:Show()
+      slot.holder:Show()
+    end
     index = index + 1
   end
   index = used + 1
@@ -1940,8 +1699,1183 @@ local function DrawZoneBars(continentKey, width, height)
   if WF.RecordError then WF.RecordError("map zone bars", err) end
 end
 
+-- Campaign route on continent maps -------------------------------------------
+-- The campaign is a static, high-contrast backbone. Travelling units keep the
+-- small gold dots and arrows, while the campaign uses one continuous outlined
+-- gold line curving through its large numbered nodes, with one chevron near
+-- the advancing front. Like Questie's patrol paths, each chord of the sampled
+-- curve is one texture stretched over a mitered quad with SetVertexOffset.
+(function()
+local CAMPAIGN_LINE_TEXTURE = "Interface\\AddOns\\Warfront\\media\\Textures\\UI\\Route\\RouteLine"
+-- Painted double chevron (tools/assets/ui/route/RouteChevron.png) as a grey
+-- copy, tinted with the colour of the faction moving: Alliance blue, Horde red.
+local CAMPAIGN_CHEVRON_TINT_TEXTURE = "Interface\\AddOns\\Warfront\\media\\Textures\\UI\\Route\\RouteChevronTint"
+-- Painted node (2026-11-14, sources in tools/assets/ui/route): all pieces share
+-- one 64 x 64 layout centred on the node (centre disc r 0-21, gold rim r 21-23,
+-- capture band r 23-29, outline r 29-31). The coloured rings are complete
+-- circles; only an arc of each is drawn (LayoutCampaignArc).
+local CAMPAIGN_RING_TRACK_TEXTURE = "Interface\\AddOns\\Warfront\\media\\Textures\\UI\\Route\\RouteNodeRingTrack"
+local CAMPAIGN_RING_ALLIANCE_TEXTURE = "Interface\\AddOns\\Warfront\\media\\Textures\\UI\\Route\\RouteNodeRingAlliance"
+local CAMPAIGN_RING_HORDE_TEXTURE = "Interface\\AddOns\\Warfront\\media\\Textures\\UI\\Route\\RouteNodeRingHorde"
+local CAMPAIGN_NODE_CENTER_TEXTURE = "Interface\\AddOns\\Warfront\\media\\Textures\\UI\\Route\\RouteNodeCenter"
+local CAMPAIGN_NODE_GLOW_TEXTURE = "Interface\\AddOns\\Warfront\\media\\Textures\\UI\\Route\\RouteNodeGlow"
+-- Node numbers 0-9, built by tools/build_route_digits.py (4 x 4 grid of cells
+-- in the node layout, each digit's ink centred).
+local CAMPAIGN_NODE_DIGITS_TEXTURE = "Interface\\AddOns\\Warfront\\media\\Textures\\UI\\Route\\RouteNodeDigits"
+-- The hover glow is painted for 1.5 x the node size.
+local CAMPAIGN_GLOW_SCALE = 1.5
+-- Arc wedges: at most this angle each, so their straight outer edge stays
+-- within a quarter texel of the circle.
+local CAMPAIGN_ARC_STEP = math.pi / 12
+-- Wedge radii in texels of the 64 x 64 layout: inside the gold rim, and just
+-- outside the band's antialiased edge once the chord is accounted for.
+local CAMPAIGN_ARC_INNER, CAMPAIGN_ARC_OUTER = 21, 31.5
+-- Locked nodes: disc and ring partly desaturated, then tinted warm so they
+-- read as a faded grey-beige on the parchment (user, 2026-11-14: full grey
+-- contrasted too much).
+local CAMPAIGN_LOCKED_DESATURATION = 0.6
+local CAMPAIGN_LOCKED_TINT = { 1, 0.95, 0.88 }
+local CAMPAIGN_NODE_SHADOW_TEXTURE = "Interface\\AddOns\\Warfront\\media\\Textures\\UI\\Route\\RouteNodeShadow"
+-- RouteLine.tga (built from the painted source in tools/assets/ui/route)
+-- holds the cross-section of the approved reference: short soft shadow,
+-- brown outline, shaded gold core. Canvas units: the world map canvas shows
+-- about twice as large on screen, so 4.5 units give the reference's 3 px core
+-- with under 2 px of shadow on each side.
+local CAMPAIGN_LINE_QUAD_WIDTH = 4.5
+-- Curves are sampled into chords about this long, 2 to 40 per segment.
+local CAMPAIGN_CURVE_STEP = 8
+local CAMPAIGN_CURVE_MAX_PIECES = 40
+local CAMPAIGN_ROUTE_MAX_PIECES = 600
+-- Miters longer than this many half widths (turns past 120 degrees) are cut.
+local CAMPAIGN_MITER_LIMIT = 2
+local CAMPAIGN_NODE_SIZE = 20
+local CAMPAIGN_ACTIVE_SIZE = 25
+local CAMPAIGN_NUMBER_SIZE = 18
+local CAMPAIGN_CHEVRON_SIZE = 14
+-- Defending faction emblem (UI/Front) on a capital node not yet attacked.
+-- Same size as a secured zone's emblem (both draw the whole 64 x 64 texture).
+local CAMPAIGN_CAPITAL_EMBLEM_SIZE = ZONE_OWNER_ICON_SIZE * ZONE_BAR_SCALE
+-- Arrow tint of the faction moving.
+local CAMPAIGN_ROUTE_COLORS = {
+  H = Map.COLORS.HORDE,
+  A = Map.COLORS.ALLIANCE,
+}
+-- Threat levels 2 (an Outpost lost) and 3 (siege) of decision 0111.
+local CAMPAIGN_THREAT_COLORS = { [2] = { 1.00, 0.50, 0.08 }, [3] = { 0.95, 0.16, 0.10 } }
+local CAMPAIGN_THREAT_RING_SIZE = 36
+-- Both factions' chevrons fully opaque (user, 2026-11-14, amends decision 0111).
+local CAMPAIGN_CHEVRON_ALPHA = 1
+-- Pixels before node 1 for the chevron of a target at node 1.
+local CAMPAIGN_CHEVRON_LEAD = 24
+-- Siege alert up and right of a besieged node (user, 2026-11-15: the catapult
+-- is kept): a 4 x 4 flipbook of 16 frames, stepped by Map:AnimateSieges.
+local CAMPAIGN_SIEGE_CATAPULT_TEXTURE = "Interface\\AddOns\\Warfront\\media\\Textures\\UI\\Front\\SiegeCatapultFlipbook"
+local CAMPAIGN_SIEGE_ICON_SIZE = 26
+local CAMPAIGN_SIEGE_FPS = 12
+local CAMPAIGN_SIEGE_FRAMES = 16
+
+Map.campaignRoutes = {
+  lines = {}, arrows = {},
+  nodeShadows = {}, glows = {}, tracks = {}, centers = {}, arcs = {},
+  labels = {}, digits = {}, capitalBadges = {}, records = {}, chevronHits = {},
+  siegeCatapults = {}, lockIcons = {},
+  lineCount = 0, arrowCount = 0, nodeCount = 0, segmentCount = 0,
+}
+
+CampaignPoint = function(area, continentKey)
+  if not area or not area.enabled then return nil end
+  local x, y = GetIconPosition(area)
+  if not x then return nil end
+  -- World map: through the continents' place on it (Map.WORLD_CONTINENTS).
+  if continentKey == "world" then
+    local viewPoint = Kit.ViewPoint
+    if not viewPoint then return nil end
+    return viewPoint(area, "world")
+  end
+  -- OpenMap's stitched world: through its projection onto the host map, as
+  -- the icons are placed.
+  if continentKey == "stitched" then
+    if not Map.stitchedAPI then return nil end
+    return ProjectAreaPoint(Map.stitchedAPI, Map.stitchedHostID, area, x, y)
+  end
+  local minX, maxX, minY, maxY = ForeverZoneRect(area.mapKey)
+  if minX then
+    return minX + x * (maxX - minX), minY + y * (maxY - minY)
+  end
+  local zone = CONTINENT_ZONES[area.mapKey or ""]
+  if not zone or zone[1] ~= continentKey then return nil end
+  return zone[2] + x * zone[4], zone[3] + y * zone[5]
+end
+
+-- Only the player's own target is active; both while the faction is unknown.
+local function CampaignNodeState(route, index, forward, rear, total, capital, playerSide)
+  if capital then return forward > total and "active" or "locked" end
+  local mine = playerSide == route.advancing
+  local theirs = playerSide and not mine
+  if (index == forward and not theirs) or (index == rear and not mine) then return "active" end
+  if index < forward then return route.advancing end
+  if index > rear then return route.advancing == "H" and "A" or "H" end
+  return "locked"
+end
+
+local function CampaignFileTexture(list, index, frame, layer, path)
+  local texture = Kit.RouteTexture(list, index, frame, layer)
+  if texture and texture.WarfrontPath ~= path then
+    texture:SetTexture(path)
+    texture:SetTexCoord(0, 1, 0, 1)
+    texture.WarfrontPath = path
+  end
+  return texture
+end
+
+local function CampaignLabel(list, index, frame)
+  local label = list[index]
+  if label then return label end
+  if type(frame.CreateFontString) ~= "function" then return nil end
+  local ok, created = pcall(frame.CreateFontString, frame, nil, "OVERLAY", "GameFontHighlightSmall")
+  if not ok or not created then return nil end
+  created:SetWidth(CAMPAIGN_NUMBER_SIZE)
+  created:SetHeight(CAMPAIGN_NUMBER_SIZE)
+  created:SetJustifyH("CENTER")
+  created:SetJustifyV("MIDDLE")
+  created:SetTextColor(0.10, 0.06, 0.02)
+  -- GameFontHighlightSmall inherits SystemFont_Shadow_Small: no shadow on the
+  -- dark number over the light medallion.
+  if created.SetShadowOffset then created:SetShadowOffset(0, 0) end
+  if created.SetShadowColor then created:SetShadowColor(0, 0, 0, 0) end
+  list[index] = created
+  return created
+end
+
+local function PlaceCampaignTexture(texture, frame, x, y, size)
+  if not texture then return end
+  texture:SetWidth(size)
+  texture:SetHeight(size)
+  texture:ClearAllPoints()
+  texture:SetPoint("CENTER", frame, "TOPLEFT", x, y)
+  texture:Show()
+end
+
+-- Stretches a texture over the quad sl, sr (start left/right) to el, er
+-- (end left/right), in canvas pixels with y down. The texture's rows run along
+-- the chord; anchors and vertex offsets have y up. Vertex indexes: 1 upper
+-- left, 2 lower left, 3 upper right, 4 lower right.
+local function DrawCampaignQuad(texture, frame, slx, sly, srx, sry, elx, ely, erx, ery)
+  local minX = math.min(slx, srx, elx, erx)
+  local maxX = math.max(slx, srx, elx, erx)
+  local minY = math.min(sly, sry, ely, ery)
+  local maxY = math.max(sly, sry, ely, ery)
+  texture:ClearAllPoints()
+  texture:SetPoint("TOPLEFT", frame, "TOPLEFT", minX, -minY)
+  texture:SetPoint("BOTTOMRIGHT", frame, "TOPLEFT", maxX, -maxY)
+  texture:SetVertexOffset(1, slx - minX, minY - sly)
+  texture:SetVertexOffset(3, elx - maxX, minY - ely)
+  texture:SetVertexOffset(2, srx - minX, maxY - sry)
+  texture:SetVertexOffset(4, erx - maxX, maxY - ery)
+  texture:Show()
+end
+
+-- A painted node piece on its own sublevel, filtered like the map canvas.
+local function CampaignNodeTexture(list, index, frame, layer, sublevel, path)
+  local texture = list[index]
+  if not texture then
+    if type(frame.CreateTexture) ~= "function" then return nil end
+    local ok, created = pcall(frame.CreateTexture, frame, nil, layer, nil, sublevel)
+    if not ok or not created then return nil end
+    if type(created.SetSnapToPixelGrid) == "function" then created:SetSnapToPixelGrid(false) end
+    if type(created.SetTexelSnappingBias) == "function" then created:SetTexelSnappingBias(0) end
+    texture, list[index] = created, created
+  end
+  if texture.WarfrontPath ~= path then
+    texture:SetTexture(path, "CLAMP", "CLAMP", "TRILINEAR")
+    texture.WarfrontPath = path
+  end
+  return texture
+end
+
+-- Draws the arc from angle from to angle to (radians, clockwise from the top)
+-- of a complete painted ring, centred on cx, cy (canvas pixels, y down) at
+-- size: wedge quads placed with SetVertexOffset, each sampling the ring image
+-- exactly where it lies (8-value SetTexCoord). Returns the textures used.
+local function LayoutCampaignArc(list, used, frame, path, cx, cy, size, from, to)
+  if to - from <= 0.001 then return used end
+  local steps = math.ceil((to - from) / CAMPAIGN_ARC_STEP)
+  local outer = size * CAMPAIGN_ARC_OUTER / 64 / math.cos((to - from) / steps / 2)
+  local inner = size * CAMPAIGN_ARC_INNER / 64
+  local function Corner(radius, angle)
+    local dx, dy = math.sin(angle) * radius, -math.cos(angle) * radius
+    return cx + dx, cy + dy, 0.5 + dx / size, 0.5 + dy / size
+  end
+  for step = 0, steps - 1 do
+    local texture = CampaignNodeTexture(list, used + 1, frame, "ARTWORK", 1, path)
+    if not texture or type(texture.SetVertexOffset) ~= "function" then return used end
+    used = used + 1
+    local a0 = from + (to - from) * step / steps
+    local a1 = from + (to - from) * (step + 1) / steps
+    local slx, sly, slu, slv = Corner(outer, a0)
+    local srx, sry, sru, srv = Corner(inner, a0)
+    local elx, ely, elu, elv = Corner(outer, a1)
+    local erx, ery, eru, erv = Corner(inner, a1)
+    texture:SetTexCoord(slu, slv, sru, srv, elu, elv, eru, erv)
+    DrawCampaignQuad(texture, frame, slx, sly, srx, sry, elx, ely, erx, ery)
+  end
+  return used
+end
+-- Shared with the Active Front drawer's siege countdown ring (main_window.lua).
+Map.LayoutRingArc = LayoutCampaignArc
+Map.RING_TEXTURES = {
+  track = CAMPAIGN_RING_TRACK_TEXTURE, A = CAMPAIGN_RING_ALLIANCE_TEXTURE, H = CAMPAIGN_RING_HORDE_TEXTURE,
+}
+
+-- Shares of the capture ring: live Alliance and Horde shares on an Active
+-- Front node, a full ring for a zone its faction secured, none otherwise.
+local function CampaignNodeShares(record)
+  if record.allianceShare then return record.allianceShare, record.hordeShare end
+  if record.state == "A" then return 1, 0 end
+  if record.state == "H" then return 0, 1 end
+  return 0, 0
+end
+
+local function GreyCampaignPiece(texture, grey)
+  if not texture then return end
+  if type(texture.SetDesaturation) == "function" then
+    texture:SetDesaturation(grey and CAMPAIGN_LOCKED_DESATURATION or 0)
+  elseif type(texture.SetDesaturated) == "function" then
+    texture:SetDesaturated(grey)
+  end
+  local tint = CAMPAIGN_LOCKED_TINT
+  if grey then
+    texture:SetVertexColor(tint[1], tint[2], tint[3], 1)
+  else
+    texture:SetVertexColor(1, 1, 1, 1)
+  end
+end
+
+-- The catapult flipbook up and right of a besieged node; it stays on its first
+-- frame until Map:AnimateSieges steps it.
+function Map.PaintSiegeIcons(routes, index, record, frame, x, y)
+  if not record.siege then
+    HideObject(routes.siegeCatapults[index])
+    return
+  end
+  local catapult = CampaignNodeTexture(routes.siegeCatapults, index, frame, "OVERLAY", 3, CAMPAIGN_SIEGE_CATAPULT_TEXTURE)
+  if not catapult then return end
+  local size = CAMPAIGN_SIEGE_ICON_SIZE
+  if not catapult.WarfrontFlip then catapult:SetTexCoord(0, 0.25, 0, 0.25) end
+  PlaceCampaignTexture(catapult, frame, x + CAMPAIGN_ACTIVE_SIZE / 2 + size / 2 - 4,
+    -(y - CAMPAIGN_ACTIVE_SIZE / 2 - size / 2 + 4), size)
+end
+
+-- The War Balance padlock (atlas piece icon.lock, 81 x 100) down and right of
+-- a locked node, overlapping its rim (user, 2026-11-16).
+function Map.PaintLockIcon(routes, index, record, frame, x, y, nodeSize)
+  local list = routes.lockIcons
+  if record.state ~= "locked" then
+    HideObject(list[index])
+    return
+  end
+  local icon = list[index]
+  if not icon then
+    local skin = WF.Skin
+    if not skin or type(skin.GreyLock) ~= "function" then return end
+    -- Grey like the locked node it marks, lightened (user, 2026-11-16).
+    icon = skin:GreyLock(frame, 10, 12)
+    if not icon then return end
+    list[index] = icon
+  end
+  icon:ClearAllPoints()
+  icon:SetPoint("CENTER", frame, "TOPLEFT", x + nodeSize / 2 - 2, -(y + nodeSize / 2 - 2))
+  icon:Show()
+end
+
+local function PaintCampaignNode(routes, index, record)
+  if not record then return end
+  local frame = routes.frame
+  local shadow = CampaignFileTexture(routes.nodeShadows, index, frame, "BORDER", CAMPAIGN_NODE_SHADOW_TEXTURE)
+  local glow = CampaignNodeTexture(routes.glows, index, frame, "BORDER", 1, CAMPAIGN_NODE_GLOW_TEXTURE)
+  local track = CampaignNodeTexture(routes.tracks, index, frame, "ARTWORK", 0, CAMPAIGN_RING_TRACK_TEXTURE)
+  local center = CampaignNodeTexture(routes.centers, index, frame, "ARTWORK", 2, CAMPAIGN_NODE_CENTER_TEXTURE)
+  local label = CampaignLabel(routes.labels, index, frame)
+  local active = record.state == "active"
+  -- A faction emblem stands alone: no disc, ring or number under it. Secured
+  -- zones get theirs from the zone markers; a capital not yet attacked shows
+  -- its defender's emblem (UI/Front) here.
+  local capitalEmblem = record.capital and not active
+  if record.emblem or capitalEmblem then
+    HideObject(shadow)
+    HideObject(glow)
+    HideObject(track)
+    HideObject(center)
+    local arcs = routes.arcs[index] or {}
+    for arc = 1, #arcs do HideObject(arcs[arc]) end
+    HideObject(routes.digits[index])
+    HideObject(label)
+    HideObject(routes.siegeCatapults[index])
+    HideObject(routes.lockIcons[index])
+    local badge = routes.capitalBadges[index]
+    if capitalEmblem then
+      local path = ZONE_FACTION_TEXTURES[record.owner == "H" and "HORDE" or "ALLIANCE"]
+      badge = CampaignNodeTexture(routes.capitalBadges, index, frame, "OVERLAY", 2, path)
+      if badge then
+        badge:SetTexCoord(0, 1, 0, 1)
+        badge:SetVertexColor(1, 1, 1, 1)
+      end
+      PlaceCampaignTexture(badge, frame, record.cx, -record.cy, CAMPAIGN_CAPITAL_EMBLEM_SIZE)
+    else
+      HideObject(badge)
+    end
+    return
+  end
+  -- Your pressed Settlement (decision 0111): an alert ring, red once besieged.
+  local ring = record.threat and record.threat >= 2 and CAMPAIGN_THREAT_COLORS[record.threat]
+  local hovered = record == Map.hoverCampaignFront
+  local nodeSize = (active or ring) and CAMPAIGN_ACTIVE_SIZE or CAMPAIGN_NODE_SIZE
+  local ringSize = CAMPAIGN_THREAT_RING_SIZE
+  if hovered then nodeSize, ringSize = nodeSize + 4, ringSize + 4 end
+  local x, y = record.cx, record.cy
+  -- The painted pieces carry their own outline: the shadow texture only draws
+  -- the alert ring, no extra dark halo that would thicken the node's border.
+  if ring and shadow then
+    shadow:SetVertexColor(ring[1], ring[2], ring[3], 1)
+    PlaceCampaignTexture(shadow, frame, x, -y, ringSize)
+  else
+    HideObject(shadow)
+  end
+  PlaceCampaignTexture(track, frame, x, -y, nodeSize)
+  PlaceCampaignTexture(center, frame, x, -y, nodeSize)
+  -- A locked front is faded to grey-beige (user, 2026-11-14).
+  local locked = record.state == "locked"
+  GreyCampaignPiece(center, locked)
+  GreyCampaignPiece(track, locked)
+  if hovered then
+    PlaceCampaignTexture(glow, frame, x, -y, nodeSize * CAMPAIGN_GLOW_SCALE)
+  else
+    HideObject(glow)
+  end
+
+  -- Capture ring: Alliance clockwise from the top, Horde anticlockwise from
+  -- the top, the rest left as the empty track.
+  local arcs = routes.arcs[index] or {}
+  routes.arcs[index] = arcs
+  local alliance, horde = CampaignNodeShares(record)
+  local full = 2 * math.pi
+  local used = LayoutCampaignArc(arcs, 0, frame, CAMPAIGN_RING_ALLIANCE_TEXTURE, x, y, nodeSize,
+    0, full * math.min(1, alliance))
+  used = LayoutCampaignArc(arcs, used, frame, CAMPAIGN_RING_HORDE_TEXTURE, x, y, nodeSize,
+    full * (1 - math.min(1, horde)), full)
+  for arc = used + 1, #arcs do HideObject(arcs[arc]) end
+
+  HideObject(routes.capitalBadges[index])
+  Map.PaintSiegeIcons(routes, index, record, frame, x, y)
+  Map.PaintLockIcon(routes, index, record, frame, x, y, nodeSize)
+
+  -- Numbers 1-9 are drawn from RouteNodeDigits (each digit's ink centred in
+  -- the node layout), placed and sized exactly like the disc, so they always
+  -- sit in its middle; a font string's glyph box cannot guarantee that.
+  local value = not record.capital and record.index
+  local digit = value and value <= 9
+    and CampaignNodeTexture(routes.digits, index, frame, "OVERLAY", 1, CAMPAIGN_NODE_DIGITS_TEXTURE)
+  if digit then
+    local column, row = value % 4, mathFloor(value / 4)
+    digit:SetTexCoord(column / 4, (column + 1) / 4, row / 4, (row + 1) / 4)
+    digit:SetVertexColor(0.10, 0.06, 0.02, 1)
+    PlaceCampaignTexture(digit, frame, x, -y, nodeSize)
+    HideObject(label)
+    return
+  end
+  HideObject(routes.digits[index])
+  if not label then return end
+  if not value then
+    HideObject(label)
+    return
+  end
+  label:ClearAllPoints()
+  label:SetPoint("CENTER", frame, "TOPLEFT", x, -y)
+  label:SetText(tostring(value))
+  label:Show()
+end
+
+function Map:RefreshCampaignNodes()
+  local routes = Map.campaignRoutes
+  for index = 1, routes.nodeCount do PaintCampaignNode(routes, index, routes.records[index]) end
+end
+
+local function RotateCampaignTexture(texture, angle)
+  if texture and type(texture.SetRotation) == "function" and math.atan2 then texture:SetRotation(angle) end
+end
+
+-- Line pieces: under every node and chevron (BACKGROUND), one textured pass
+-- carrying the halo, outline and shaded core. Pixel snapping off, as Questie
+-- does, so the stretched vertices do not jitter.
+local function CampaignLineTexture(list, index, frame, sublevel)
+  local texture = list[index]
+  if texture then return texture end
+  if type(frame.CreateTexture) ~= "function" then return nil end
+  local ok, created = pcall(frame.CreateTexture, frame, nil, "BACKGROUND", nil, sublevel)
+  if not ok or not created or type(created.SetVertexOffset) ~= "function" then return nil end
+  if type(created.SetSnapToPixelGrid) == "function" then created:SetSnapToPixelGrid(false) end
+  if type(created.SetTexelSnappingBias) == "function" then created:SetTexelSnappingBias(0) end
+  -- 16 rows for a line about 18 screen px wide, filtered like the map canvas
+  -- itself (Blizzard_MapCanvasDetailLayer uses "TRILINEAR"): no aliasing.
+  created:SetTexture(CAMPAIGN_LINE_TEXTURE, "CLAMP", "CLAMP", "TRILINEAR")
+  created:SetTexCoord(0, 1, 0, 1)
+  list[index] = created
+  return created
+end
+
+local function CampaignUnit(x, y)
+  local length = math.sqrt(x * x + y * y)
+  if length <= 0 then return 0, 0, 0 end
+  return x / length, y / length, length
+end
+
+-- Tangent directions of a run of points: the bisector of the chords at each
+-- inner node, and the mirror of the next tangent across the chord at the ends,
+-- so a run bends evenly through its nodes and its end segments bow naturally.
+local function CampaignTangents(run)
+  local count, tx, ty = #run, {}, {}
+  for index = 2, count - 1 do
+    local ix, iy = CampaignUnit(run[index].px - run[index - 1].px, run[index].py - run[index - 1].py)
+    local ox, oy = CampaignUnit(run[index + 1].px - run[index].px, run[index + 1].py - run[index].py)
+    local x, y, length = CampaignUnit(ix + ox, iy + oy)
+    if length <= 0 then x, y = ox, oy end
+    tx[index], ty[index] = x, y
+  end
+  local function Mirror(chordX, chordY, nextX, nextY)
+    local ux, uy = CampaignUnit(chordX, chordY)
+    if not nextX then return ux, uy end
+    local dot = ux * nextX + uy * nextY
+    return 2 * dot * ux - nextX, 2 * dot * uy - nextY
+  end
+  tx[1], ty[1] = Mirror(run[2].px - run[1].px, run[2].py - run[1].py, tx[2], ty[2])
+  tx[count], ty[count] = Mirror(run[count].px - run[count - 1].px, run[count].py - run[count - 1].py,
+    tx[count - 1], ty[count - 1])
+  return tx, ty
+end
+
+-- Route layout begin ---------------------------------------------------------
+-- Each segment is one cubic Bezier between its two nodes (the join hides under
+-- the node disc or emblem). A route that doubles back (Eastern Kingdoms: south,
+-- north, then south again) makes the smooth through-curve cross itself and run
+-- over other nodes, so each segment picks its bend: the Hermite through-curve
+-- (shared tangents, the default look) or a bow of h0 / h1 chord lengths to the
+-- left of the chord at its first / second control point, at most
+-- LAYOUT_MAX_BOW (user, 2026-11-14: wider arcs read as detours). A hook moves
+-- one control point past its node (LAYOUT_HOOK_ALONG) so the segment can wrap
+-- around a node next to its end (user, 2026-11-14: Kalimdor 2 -> 3 runs west
+-- of node 4 instead of crossing 4 -> 5); its length cost keeps it rare.
+-- The layout cost is a sum of per-segment terms (extra length, leaving the
+-- map, running over or near another node) and per-pair terms (crossings,
+-- running along another line). A branch and bound over every segment's grid
+-- bends, longest segments first, finds the cheapest layout; a fine local pass
+-- then polishes each bend. Positions are fixed for a map size, so the result
+-- is cached.
+local LAYOUT_STEPS = 10
+local LAYOUT_CLEAR = 25      -- canvas units kept from other nodes' centres
+local LAYOUT_OVER = 13       -- closer than this, the line runs over the node
+local LAYOUT_GAP = 10        -- canvas units kept from other lines
+local LAYOUT_JOIN = 15       -- crossings this close to a shared node are joins
+local LAYOUT_JOIN_GAP = 25   -- no line-gap cost this close to a shared node
+local LAYOUT_SLACK = 1.06    -- length allowed before the length cost starts
+local LAYOUT_EDGE = 12       -- canvas units kept inside the map's edges
+local LAYOUT_GRID = { -0.5, -0.25, 0, 0.25, 0.5 }
+local LAYOUT_HOOK_OTHER = { -0.25, 0, 0.25 }
+local LAYOUT_FINE = { 0.125, 0.0625 }
+local LAYOUT_MAX_BOW = 0.5
+local LAYOUT_HOOK_ALONG = -1 / 3
+local LAYOUT_HOOK = { -0.875, -0.75, -0.625, 0.625, 0.75, 0.875 }
+local LAYOUT_MAX_HOOK = 0.875
+local LAYOUT_POLISH = 8
+local layoutCache, layoutCacheSize = {}, 0
+
+-- Control points of segment k for bend (h0, h1), or the Hermite through-curve
+-- when h0 is nil: a.px, a.py, c1x, c1y, c2x, c2y, b.px, b.py. s0 / s1 place
+-- the control points along the chord (default a third in from each node).
+local function LayoutControls(run, k, h0, h1, tx, ty, s0, s1)
+  local a, b = run[k], run[k + 1]
+  local cx, cy = b.px - a.px, b.py - a.py
+  local length = math.sqrt(cx * cx + cy * cy)
+  if not h0 or length <= 0 then
+    return a.px, a.py, a.px + tx[k] * length / 3, a.py + ty[k] * length / 3,
+      b.px - tx[k + 1] * length / 3, b.py - ty[k + 1] * length / 3, b.px, b.py
+  end
+  local nx, ny = -cy, cx -- left normal (y down), one chord long
+  s0, s1 = s0 or 1 / 3, s1 or 1 / 3
+  return a.px, a.py, a.px + cx * s0 + nx * h0, a.py + cy * s0 + ny * h0,
+    b.px - cx * s1 + nx * h1, b.py - cy * s1 + ny * h1, b.px, b.py
+end
+
+-- Samples a Bezier into a line record: xs, ys (steps + 1 points) and its box.
+local function LayoutLine(ax, ay, c1x, c1y, c2x, c2y, bx, by, steps)
+  local xs, ys = {}, {}
+  local minX, minY, maxX, maxY = math.huge, math.huge, -math.huge, -math.huge
+  for i = 0, steps do
+    local t = i / steps
+    local u = 1 - t
+    local w0, w1, w2, w3 = u * u * u, 3 * u * u * t, 3 * u * t * t, t * t * t
+    local x = w0 * ax + w1 * c1x + w2 * c2x + w3 * bx
+    local y = w0 * ay + w1 * c1y + w2 * c2y + w3 * by
+    xs[i + 1], ys[i + 1] = x, y
+    if x < minX then minX = x end
+    if x > maxX then maxX = x end
+    if y < minY then minY = y end
+    if y > maxY then maxY = y end
+  end
+  return { xs = xs, ys = ys, minX = minX, minY = minY, maxX = maxX, maxY = maxY }
+end
+
+local function LayoutCrosses(x1, y1, x2, y2, x3, y3, x4, y4)
+  local d1x, d1y, d2x, d2y = x2 - x1, y2 - y1, x4 - x3, y4 - y3
+  local den = d1x * d2y - d1y * d2x
+  if den == 0 then return false end
+  local s = ((x3 - x1) * d2y - (y3 - y1) * d2x) / den
+  local t = ((x3 - x1) * d1y - (y3 - y1) * d1x) / den
+  return s > 0 and s < 1 and t > 0 and t < 1
+end
+
+-- Crossings of line with other, ignoring those within LAYOUT_JOIN of their
+-- shared node (nil when the segments are not neighbours).
+local function LayoutCrossCount(line, other, shared)
+  local xs, ys, oxs, oys = line.xs, line.ys, other.xs, other.ys
+  local count = 0
+  for i = 1, #xs - 1 do
+    local x1, y1, x2, y2 = xs[i], ys[i], xs[i + 1], ys[i + 1]
+    local nearJoin = false
+    if shared then
+      local dx, dy = x1 - shared.px, y1 - shared.py
+      nearJoin = dx * dx + dy * dy < LAYOUT_JOIN * LAYOUT_JOIN
+    end
+    if not nearJoin then
+      local loX, hiX = mathMin(x1, x2), mathMax(x1, x2)
+      local loY, hiY = mathMin(y1, y2), mathMax(y1, y2)
+      for q = 1, #oxs - 1 do
+        local x3, y3, x4, y4 = oxs[q], oys[q], oxs[q + 1], oys[q + 1]
+        if mathMax(x3, x4) >= loX and mathMin(x3, x4) <= hiX and mathMax(y3, y4) >= loY
+            and mathMin(y3, y4) <= hiY and LayoutCrosses(x1, y1, x2, y2, x3, y3, x4, y4) then
+          count = count + 1
+        end
+      end
+    end
+  end
+  return count
+end
+
+local function LayoutPointToLine(px, py, line)
+  local xs, ys, best = line.xs, line.ys, math.huge
+  for q = 1, #xs - 1 do
+    local ax, ay = xs[q], ys[q]
+    local dx, dy = xs[q + 1] - ax, ys[q + 1] - ay
+    local l2 = dx * dx + dy * dy
+    local t = 0
+    if l2 > 0 then t = mathMax(0, mathMin(1, ((px - ax) * dx + (py - ay) * dy) / l2)) end
+    local ex, ey = px - ax - t * dx, py - ay - t * dy
+    local d2 = ex * ex + ey * ey
+    if d2 < best then best = d2 end
+  end
+  return math.sqrt(best)
+end
+
+-- Per-segment cost of segment k drawn as line.
+local function LayoutUnary(run, k, line, bent, width, height)
+  local a, b = run[k], run[k + 1]
+  local xs, ys = line.xs, line.ys
+  local n = #xs
+  local cx, cy = b.px - a.px, b.py - a.py
+  local chord = math.sqrt(cx * cx + cy * cy)
+  if chord <= 0 then return 0 end
+  local length = 0
+  for i = 1, n - 1 do
+    local dx, dy = xs[i + 1] - xs[i], ys[i + 1] - ys[i]
+    length = length + math.sqrt(dx * dx + dy * dy)
+  end
+  local cost = 1000 * mathMax(0, length / chord - LAYOUT_SLACK)
+  if bent then cost = cost + 3 end
+  if line.minX < LAYOUT_EDGE or line.minY < LAYOUT_EDGE
+      or line.maxX > width - LAYOUT_EDGE or line.maxY > height - LAYOUT_EDGE then
+    for i = 1, n do
+      local x, y = xs[i], ys[i]
+      if x < LAYOUT_EDGE or y < LAYOUT_EDGE or x > width - LAYOUT_EDGE or y > height - LAYOUT_EDGE then
+        cost = cost + 300
+      end
+    end
+  end
+  for j = 1, #run do
+    if j ~= k and j ~= k + 1 then
+      local nx, ny = run[j].px, run[j].py
+      if nx >= line.minX - LAYOUT_CLEAR and nx <= line.maxX + LAYOUT_CLEAR
+          and ny >= line.minY - LAYOUT_CLEAR and ny <= line.maxY + LAYOUT_CLEAR then
+        local d = LayoutPointToLine(nx, ny, line)
+        -- Running over a node reads worse than a crossing.
+        if d < LAYOUT_OVER then
+          cost = cost + 3000
+        elseif d < LAYOUT_CLEAR then
+          local f = (LAYOUT_CLEAR - d) / (LAYOUT_CLEAR - LAYOUT_OVER)
+          cost = cost + 100 * f * f
+        end
+      end
+    end
+  end
+  return cost
+end
+
+-- Cost segment k (line) pays against segment m (other): crossings, and its
+-- samples running within LAYOUT_GAP of other.
+local function LayoutPairOneWay(run, k, line, m, other)
+  if other.maxX + LAYOUT_GAP < line.minX or other.minX - LAYOUT_GAP > line.maxX
+      or other.maxY + LAYOUT_GAP < line.minY or other.minY - LAYOUT_GAP > line.maxY then
+    return 0
+  end
+  local shared = (m == k - 1 and run[k]) or (m == k + 1 and run[k + 1]) or nil
+  local cost = 1000 * LayoutCrossCount(line, other, shared)
+  local xs, ys = line.xs, line.ys
+  for i = 2, #xs - 1 do
+    local px, py = xs[i], ys[i]
+    local skip = false
+    if shared then
+      local dx, dy = px - shared.px, py - shared.py
+      skip = dx * dx + dy * dy < LAYOUT_JOIN_GAP * LAYOUT_JOIN_GAP
+    end
+    if not skip and px >= other.minX - LAYOUT_GAP and px <= other.maxX + LAYOUT_GAP
+        and py >= other.minY - LAYOUT_GAP and py <= other.maxY + LAYOUT_GAP then
+      local d = LayoutPointToLine(px, py, other)
+      if d < LAYOUT_GAP then
+        local f = (LAYOUT_GAP - d) / LAYOUT_GAP
+        cost = cost + 40 * f * f
+      end
+    end
+  end
+  return cost
+end
+
+-- Bend choices of every segment of run: false for the through-curve, or
+-- { h0, h1 [, s0, s1] }.
+local function LayoutRun(run, tx, ty, width, height)
+  local count = #run - 1
+  local function Line(k, bend)
+    local ax, ay, c1x, c1y, c2x, c2y, bx, by =
+      LayoutControls(run, k, bend and bend[1], bend and bend[2], tx, ty, bend and bend[3],
+        bend and bend[4])
+    return LayoutLine(ax, ay, c1x, c1y, c2x, c2y, bx, by, LAYOUT_STEPS)
+  end
+  local bends = { false }
+  for i = 1, #LAYOUT_GRID do
+    for j = 1, #LAYOUT_GRID do bends[#bends + 1] = { LAYOUT_GRID[i], LAYOUT_GRID[j] } end
+  end
+  for i = 1, #LAYOUT_HOOK_OTHER do
+    for j = 1, #LAYOUT_HOOK do
+      bends[#bends + 1] = { LAYOUT_HOOK_OTHER[i], LAYOUT_HOOK[j], 1 / 3, LAYOUT_HOOK_ALONG }
+      bends[#bends + 1] = { LAYOUT_HOOK[j], LAYOUT_HOOK_OTHER[i], LAYOUT_HOOK_ALONG, 1 / 3 }
+    end
+  end
+  local lines, unary, minUnary = {}, {}, {}
+  for k = 1, count do
+    lines[k], unary[k], minUnary[k] = {}, {}, math.huge
+    for c = 1, #bends do
+      lines[k][c] = Line(k, bends[c])
+      unary[k][c] = LayoutUnary(run, k, lines[k][c], bends[c] and true, width, height)
+      if unary[k][c] < minUnary[k] then minUnary[k] = unary[k][c] end
+    end
+  end
+  -- Pair costs, computed on demand: pairs[k][m][(c - 1) * #bends + d].
+  local pairs = {}
+  local function Pair(k, c, m, d)
+    local key = (c - 1) * #bends + d
+    local row = pairs[k * 64 + m]
+    if not row then row = {}; pairs[k * 64 + m] = row end
+    local value = row[key]
+    if not value then
+      value = LayoutPairOneWay(run, k, lines[k][c], m, lines[m][d])
+        + LayoutPairOneWay(run, m, lines[m][d], k, lines[k][c])
+      row[key] = value
+    end
+    return value
+  end
+  -- Longest segments first: they decide the layout and prune the most.
+  local order = {}
+  for k = 1, count do order[k] = k end
+  local function Chord(k)
+    local dx, dy = run[k + 1].px - run[k].px, run[k + 1].py - run[k].py
+    return dx * dx + dy * dy
+  end
+  table.sort(order, function(a, b) return Chord(a) > Chord(b) end)
+  local rest = {}
+  rest[count + 1] = 0
+  for depth = count, 1, -1 do rest[depth] = rest[depth + 1] + minUnary[order[depth]] end
+  local assign, best, bestCost = {}, {}, 0
+  -- Start bound: every segment on its through-curve.
+  for depth = 1, count do
+    local k = order[depth]
+    bestCost = bestCost + unary[k][1]
+    for e = 1, depth - 1 do bestCost = bestCost + Pair(k, 1, order[e], 1) end
+    best[k] = 1
+  end
+  local function Search(depth, partial)
+    if depth > count then
+      bestCost = partial
+      for k = 1, count do best[k] = assign[k] end
+      return
+    end
+    local k = order[depth]
+    local options = {}
+    for c = 1, #bends do
+      local value = unary[k][c]
+      if partial + value + rest[depth + 1] < bestCost then
+        for e = 1, depth - 1 do
+          local m = order[e]
+          value = value + Pair(k, c, m, assign[m])
+          if partial + value + rest[depth + 1] >= bestCost then break end
+        end
+        if partial + value + rest[depth + 1] < bestCost then options[#options + 1] = { c, value } end
+      end
+    end
+    table.sort(options, function(a, b) return a[2] < b[2] end)
+    for i = 1, #options do
+      local option = options[i]
+      if partial + option[2] + rest[depth + 1] < bestCost then
+        assign[k] = option[1]
+        Search(depth + 1, partial + option[2])
+      end
+    end
+  end
+  Search(1, 0)
+  -- Polish: move each bend by LAYOUT_FINE steps while the layout gets cheaper.
+  local choice, current = {}, {}
+  for k = 1, count do choice[k], current[k] = bends[best[k]], lines[k][best[k]] end
+  local function Cost(k, line, bend)
+    local cost = LayoutUnary(run, k, line, bend and true, width, height)
+    for m = 1, count do
+      if m ~= k then
+        cost = cost + LayoutPairOneWay(run, k, line, m, current[m])
+          + LayoutPairOneWay(run, m, current[m], k, line)
+      end
+    end
+    return cost
+  end
+  for f = 1, #LAYOUT_FINE do
+    local step = LAYOUT_FINE[f]
+    for _ = 1, LAYOUT_POLISH do
+      local moved = false
+      for k = 1, count do
+        local bend = choice[k]
+        if bend then
+          local pick, pickLine, pickCost = bend, current[k], Cost(k, current[k], bend)
+          local max0 = bend[3] and bend[3] < 0 and LAYOUT_MAX_HOOK or LAYOUT_MAX_BOW
+          local max1 = bend[4] and bend[4] < 0 and LAYOUT_MAX_HOOK or LAYOUT_MAX_BOW
+          for di = -1, 1 do
+            for dj = -1, 1 do
+              local h0, h1 = bend[1] + di * step, bend[2] + dj * step
+              if (di ~= 0 or dj ~= 0) and mathAbs(h0) <= max0 + 1e-6
+                  and mathAbs(h1) <= max1 + 1e-6 then
+                local candidate = { h0, h1, bend[3], bend[4] }
+                local line = Line(k, candidate)
+                local cost = Cost(k, line, candidate)
+                if cost < pickCost - 1e-6 then pick, pickLine, pickCost = candidate, line, cost end
+              end
+            end
+          end
+          if pick ~= bend then moved = true end
+          choice[k], current[k] = pick, pickLine
+        end
+      end
+      if not moved then break end
+    end
+  end
+  return choice
+end
+
+-- Bezier controls of every segment of run, cached by node positions and map size.
+local function CampaignRunLayout(run, width, height)
+  local tx, ty = CampaignTangents(run)
+  local parts = {}
+  for i = 1, #run do
+    parts[#parts + 1] = mathFloor(run[i].px * 2 + 0.5) .. ":" .. mathFloor(run[i].py * 2 + 0.5)
+  end
+  parts[#parts + 1] = mathFloor(width + 0.5) .. "x" .. mathFloor(height + 0.5)
+  local key = table.concat(parts, ",")
+  local choice = layoutCache[key]
+  if not choice then
+    choice = #run > 2 and LayoutRun(run, tx, ty, width, height) or {}
+    if layoutCacheSize >= 16 then layoutCache, layoutCacheSize = {}, 0 end
+    layoutCache[key], layoutCacheSize = choice, layoutCacheSize + 1
+  end
+  local controls = {}
+  for k = 1, #run - 1 do
+    local bend = choice[k]
+    controls[k] = { LayoutControls(run, k, bend and bend[1], bend and bend[2], tx, ty,
+      bend and bend[3], bend and bend[4]) }
+  end
+  return controls
+end
+-- Route layout end -----------------------------------------------------------
+
+-- Samples a run into one polyline of its segments' Bezier curves (see the
+-- route layout above). segments[k] is the polyline index where segment k
+-- (run[k] to run[k + 1]) starts; segments[#run] is the last point.
+local function SampleCampaignRun(run, width, height)
+  local controls = CampaignRunLayout(run, width, height)
+  local points, segments = { { x = run[1].px, y = run[1].py } }, {}
+  for index = 1, #run - 1 do
+    local c = controls[index]
+    segments[index] = #points
+    -- Control polygon length: an upper bound of the curve's length.
+    local hull = 0
+    for p = 1, 5, 2 do
+      local dx, dy = c[p + 2] - c[p], c[p + 3] - c[p + 1]
+      hull = hull + math.sqrt(dx * dx + dy * dy)
+    end
+    local pieces = math.max(2, math.min(CAMPAIGN_CURVE_MAX_PIECES, math.ceil(hull / CAMPAIGN_CURVE_STEP)))
+    for piece = 1, pieces do
+      local t = piece / pieces
+      local u = 1 - t
+      local w0, w1, w2, w3 = u * u * u, 3 * u * u * t, 3 * u * t * t, t * t * t
+      points[#points + 1] = {
+        x = w0 * c[1] + w1 * c[3] + w2 * c[5] + w3 * c[7],
+        y = w0 * c[2] + w1 * c[4] + w2 * c[6] + w3 * c[8],
+      }
+    end
+  end
+  segments[#run] = #points
+  return points, segments
+end
+
+-- Left and right outline corners of the polyline at point index, half pixels
+-- to each side: a miter on the bisector of the two chords, or the chord's own
+-- normal at an end. Left is the side of the normal (-dy, dx).
+local function CampaignCorner(points, index, half)
+  local p = points[index]
+  local ax, ay, bx, by = 0, 0, 0, 0
+  if index > 1 then ax, ay = CampaignUnit(p.x - points[index - 1].x, p.y - points[index - 1].y) end
+  if index < #points then bx, by = CampaignUnit(points[index + 1].x - p.x, points[index + 1].y - p.y) end
+  local unitX, unitY, length = CampaignUnit(-(ay + by), ax + bx)
+  if length <= 0 then unitX, unitY = -by, bx end
+  local scale = half
+  if index > 1 and index < #points and length > 0 then
+    -- The miter grows by 1 / cos(turn / 2), cut at the limit.
+    local cosHalf = unitX * -ay + unitY * ax
+    scale = half / math.max(cosHalf, 1 / CAMPAIGN_MITER_LIMIT)
+  end
+  return p.x + unitX * scale, p.y + unitY * scale, p.x - unitX * scale, p.y - unitY * scale
+end
+
+-- Draws chords first..last of a sampled run at one width, untinted, after the
+-- used textures of list; flip turns the texture's rows over so its pale edge
+-- changes side. Returns the new count.
+local function DrawCampaignChords(list, used, frame, sublevel, points, first, last, half, flip)
+  local slx, sly, srx, sry = CampaignCorner(points, first, half)
+  for index = first + 1, last do
+    local elx, ely, erx, ery = CampaignCorner(points, index, half)
+    if used >= CAMPAIGN_ROUTE_MAX_PIECES then return used end
+    local texture = CampaignLineTexture(list, used + 1, frame, sublevel)
+    if not texture then return used end
+    used = used + 1
+    texture:SetVertexColor(1, 1, 1, 1)
+    if flip then texture:SetTexCoord(0, 1, 1, 0) else texture:SetTexCoord(0, 1, 0, 1) end
+    DrawCampaignQuad(texture, frame, slx, sly, srx, sry, elx, ely, erx, ery)
+    slx, sly, srx, sry = elx, ely, erx, ery
+  end
+  return used
+end
+
+-- The point at share t of the arc from points[first] to points[last], and the
+-- direction there.
+local function CampaignArcPoint(points, first, last, t)
+  local total = 0
+  for index = first + 1, last do
+    local _, _, length = CampaignUnit(points[index].x - points[index - 1].x, points[index].y - points[index - 1].y)
+    total = total + length
+  end
+  local goal = t * total
+  for index = first + 1, last do
+    local a, b = points[index - 1], points[index]
+    local ux, uy, length = CampaignUnit(b.x - a.x, b.y - a.y)
+    if goal <= length or index == last then
+      return a.x + ux * goal, a.y + uy * goal, ux, uy
+    end
+    goal = goal - length
+  end
+  return points[first].x, points[first].y, 1, 0
+end
+
+-- chevrons: nil or a list of { reverse, lead, own, color, alpha }; a reverse chevron
+-- points from the segment's end to its start; a lead one sits before the
+-- start, along the curve's first direction, pointing at it.
+local function LayoutCampaignChevrons(routes, frame, points, first, last, chevrons, arrowUsed)
+  for index = 1, chevrons and #chevrons or 0 do
+    local spec = chevrons[index]
+    local arrow = CampaignNodeTexture(routes.arrows, arrowUsed + 1, frame, "OVERLAY", 0,
+      CAMPAIGN_CHEVRON_TINT_TEXTURE)
+    if arrow then
+      arrowUsed = arrowUsed + 1
+      local x, y, dx, dy
+      if spec.lead then
+        x, y, dx, dy = CampaignArcPoint(points, first, last, 0)
+        x, y = x - dx * CAMPAIGN_CHEVRON_LEAD, y - dy * CAMPAIGN_CHEVRON_LEAD
+      else
+        x, y, dx, dy = CampaignArcPoint(points, first, last, spec.reverse and 0.38 or 0.62)
+      end
+      local angle = math.atan2 and math.atan2(-dy, dx) or 0
+      local color = spec.color
+      arrow:SetVertexColor(color[1], color[2], color[3], spec.alpha)
+      PlaceCampaignTexture(arrow, frame, x, -y, CAMPAIGN_CHEVRON_SIZE)
+      RotateCampaignTexture(arrow, spec.reverse and angle + math.pi or angle)
+      -- Hover point (canvas pixels) for the chevron tooltip.
+      local hits = routes.chevronHits
+      hits[#hits + 1] = { x = x, y = y, side = spec.side, color = color,
+        target = spec.target, key = spec.key }
+    end
+  end
+  return arrowUsed
+end
+
+-- Draws every run of consecutive projected nodes of one route (points[1] to
+-- points[total + 1], gaps where a node has no position): the textured line
+-- of each segment, then its chevrons. Returns the counts used.
+local function LayoutCampaignRoute(routes, frame, points, total, chevrons, width, height,
+    lineUsed, arrowUsed, segmentUsed)
+  local index = 1
+  while index <= total + 1 do
+    local run, firstIndex = {}, index
+    while index <= total + 1 and points[index] do
+      local record = points[index]
+      record.px, record.py = record.x * width, record.y * height
+      run[#run + 1] = record
+      index = index + 1
+    end
+    if #run >= 2 then
+      local polyline, segments = SampleCampaignRun(run, width, height)
+      -- The texture's top rows (pale edge) lie on the left of the drawing
+      -- direction. One choice per run, so the pale edge never jumps sides:
+      -- it faces the upper left, as on the reference, for the run's overall
+      -- direction (y down: left normal (-dy, dx) against (-1, -1)).
+      local runX = run[#run].px - run[1].px
+      local runY = run[#run].py - run[1].py
+      local flip = runY - runX < 0
+      for k = 1, #run - 1 do
+        local first, last = segments[k], segments[k + 1]
+        lineUsed = DrawCampaignChords(routes.lines, lineUsed, frame, 0, polyline, first, last,
+          CAMPAIGN_LINE_QUAD_WIDTH / 2, flip)
+        arrowUsed = LayoutCampaignChevrons(routes, frame, polyline, first, last,
+          chevrons[firstIndex + k - 1], arrowUsed)
+        segmentUsed = segmentUsed + 1
+      end
+    end
+    if index == firstIndex then index = index + 1 end
+  end
+  return lineUsed, arrowUsed, segmentUsed
+end
+
+-- Digits, locks, capital badges and siege icons exist only for some nodes:
+-- their lists have holes, where # can stop early and leave pieces of another
+-- view on screen (2026-11-16: world-map numbers and locks stayed on the
+-- continent map). pairs reaches every entry.
+local function HideCampaignList(list, first)
+  for index, object in pairs(list) do
+    if type(index) == "number" and index >= first then HideObject(object) end
+  end
+end
+
+function Map:HideCampaignRoutes()
+  local routes = self.campaignRoutes
+  HideCampaignList(routes.lines, 1)
+  HideCampaignList(routes.arrows, 1)
+  HideCampaignList(routes.nodeShadows, 1)
+  HideCampaignList(routes.glows, 1)
+  HideCampaignList(routes.tracks, 1)
+  HideCampaignList(routes.centers, 1)
+  for _, arcs in pairs(routes.arcs) do HideCampaignList(arcs, 1) end
+  HideCampaignList(routes.labels, 1)
+  HideCampaignList(routes.digits, 1)
+  HideCampaignList(routes.capitalBadges, 1)
+  HideCampaignList(routes.siegeCatapults, 1)
+  HideCampaignList(routes.lockIcons, 1)
+  HideObject(routes.frame)
+  routes.lineCount, routes.arrowCount, routes.nodeCount, routes.segmentCount = 0, 0, 0, 0
+  routes.records = {}
+  routes.chevronHits = {}
+  if (self.hoverCampaignFront or self.hoverCampaignChevron) and type(self.ClearHover) == "function" then
+    self:ClearHover()
+  end
+end
+
+-- WarfrontDev only (/wfd siege, through MainWindow:SetSimulatedSiege): fake
+-- siege windows by route id, shaped like WF.Front's, drawn with the real ones
+-- on the next refresh; nil clears them. Never saved nor sent.
+function Map:SetSimulatedSiege(windows)
+  self.simSiege = type(windows) == "table" and windows or nil
+end
+
+-- The siege window running on this node of the route now (real or simulated),
+-- or nil.
+function Map:SiegeRunning(route, id)
+  local front = WF.Front
+  if not route or not front or type(front.Window) ~= "function" then return nil end
+  local rec = (self.simSiege and self.simSiege[route.id]) or front:Window(route.id)
+  if rec and rec.seen and rec.node == id and front:Remaining(rec) > 0 then return rec end
+  return nil
+end
+
+-- Steps the siege flipbooks (columns then rows of the 4 x 4 sheet) at a
+-- fixed rate; called every tick while the map is open.
+function Map:AnimateSieges()
+  local routes = self.campaignRoutes
+  local getTime = GetGlobal("GetTime")
+  local clock = type(getTime) == "function" and getTime() or (self.ticks or 0) / 60
+  local step = mathFloor(clock * CAMPAIGN_SIEGE_FPS) % CAMPAIGN_SIEGE_FRAMES
+  if step == self.siegeStep then return end
+  self.siegeStep = step
+  local column, row = step % 4, mathFloor(step / 4)
+  local list = routes.siegeCatapults
+  for index = 1, #list do
+    local texture = list[index]
+    if texture and texture:IsShown() then
+      texture.WarfrontFlip = true
+      texture:SetTexCoord(column / 4, (column + 1) / 4, row / 4, (row + 1) / 4)
+    end
+  end
+end
+
+function Map:RefreshCampaignRoutes(continentKey, width, height)
+  local front = WF.Front
+  if not front or type(front.HasRoutes) ~= "function" or not front:HasRoutes()
+      or type(front.Targets) ~= "function" then
+    self:HideCampaignRoutes()
+    return 0
+  end
+  local routes = self.campaignRoutes
+  if not routes.frame then routes.frame = CreateGroup("WarfrontMapCampaignRoutes", 1, true) end
+  local frame = routes.frame
+  if not frame then return 0 end
+  local lineUsed, arrowUsed, nodeUsed, segmentUsed = 0, 0, 0, 0
+  local capture = WF.Capture
+  local playerSide = capture and type(capture.MyFaction) == "function" and capture:MyFaction()
+  -- Live capture shares of the Active Front zones, shown by their node's ring.
+  -- Secured zones show their faction emblem on the node's spot instead.
+  local fronts, emblems = {}, {}
+  local zones = self:FrontZones(continentKey)
+  for index = 1, #zones do
+    if zones[index].activeFront then fronts[zones[index].mapKey] = zones[index] end
+    if zones[index].ownerKey then emblems[zones[index].mapKey] = true end
+  end
+  routes.records = {}
+  routes.chevronHits = {}
+  for routeIndex = 1, #(front.routes or {}) do
+    local route = front.routes[routeIndex]
+    local total = #route.nodes
+    local forward, rear = front:Targets(route)
+    local points = {}
+    for index = 1, total do
+      local area = self.areas[route.nodes[index].id]
+      local x, y = CampaignPoint(area, continentKey)
+      if x then
+        points[index] = {
+          x = x, y = y, id = area.id, area = area, route = route, index = index,
+          forward = forward, rear = rear,
+          state = CampaignNodeState(route, index, forward, rear, total, false, playerSide),
+        }
+      end
+    end
+    local capital = self.areas[route.endpoint or ""]
+    local capitalX, capitalY = CampaignPoint(capital, continentKey)
+    if capitalX then
+      points[total + 1] = {
+        x = capitalX, y = capitalY, id = capital.id, area = capital, route = route,
+        index = total + 1, forward = forward, rear = rear, capital = true,
+        owner = route.advancing == "H" and "A" or "H",
+        state = CampaignNodeState(route, total + 1, forward, rear, total, true, playerSide),
+      }
+    end
+    -- Decision 0111: each faction's chevron points at its own target in that
+    -- faction's colour (Alliance blue, Horde red), the other faction's dimmed;
+    -- your pressed Settlement carries its threat level.
+    local threat, threatId, lost, links = 0, nil, 0, 0
+    if playerSide and type(front.Threat) == "function" then
+      threat, threatId, lost, links = front:Threat(route, playerSide)
+    end
+    for index = 1, total + 1 do
+      local record = points[index]
+      if record and threatId and record.id == threatId then
+        record.threat, record.lost, record.links = threat, lost, links
+      end
+    end
+    local chevrons = {}
+    local function AddChevron(segment, reverse, side, targetIndex)
+      -- Target at node 1: no segment before it, so the chevron leads in from
+      -- outside the route on the first segment.
+      local lead = segment == 0 and not reverse
+      if lead then segment = 1 end
+      if segment < 1 or segment > total then return end
+      local own = not playerSide or side == playerSide
+      local list = chevrons[segment] or {}
+      chevrons[segment] = list
+      local node = route.nodes[targetIndex]
+      list[#list + 1] = {
+        reverse = reverse, lead = lead, own = own, side = side,
+        color = CAMPAIGN_ROUTE_COLORS[side],
+        alpha = CAMPAIGN_CHEVRON_ALPHA,
+        target = targetIndex > total and capital or node and self.areas[node.id],
+        key = tostring(route.endpoint or routeIndex) .. ":" .. side,
+      }
+    end
+    AddChevron(forward - 1, false, route.advancing, forward)
+    AddChevron(rear, true, route.advancing == "H" and "A" or "H", rear)
+    lineUsed, arrowUsed, segmentUsed = LayoutCampaignRoute(routes, frame, points, total,
+      chevrons, width, height, lineUsed, arrowUsed, segmentUsed)
+    for index = 1, total + 1 do
+      local record = points[index]
+      if record then
+        nodeUsed = nodeUsed + 1
+        routes.records[nodeUsed] = record
+        record.cx, record.cy = record.x * width, record.y * height
+        local zone = not record.capital and fronts[record.area.mapKey or ""]
+        if zone then record.allianceShare, record.hordeShare = zone.allianceShare, zone.hordeShare end
+        record.emblem = not record.capital and emblems[record.area.mapKey or ""] or nil
+        record.siege = self:SiegeRunning(route, record.id)
+        -- Every periodic refresh rebuilds the records: the hovered node passes
+        -- to its new record, or it would shrink, lose its tooltip and be
+        -- hovered again on each refresh, pulsing endlessly.
+        local hovered = self.hoverCampaignFront
+        if hovered and hovered ~= record and hovered.id == record.id and hovered.index == record.index
+            and hovered.route and hovered.route.endpoint == route.endpoint then
+          self.hoverCampaignFront = record
+        end
+        PaintCampaignNode(routes, nodeUsed, record)
+      end
+    end
+  end
+  HideCampaignList(routes.lines, lineUsed + 1)
+  HideCampaignList(routes.arrows, arrowUsed + 1)
+  HideCampaignList(routes.nodeShadows, nodeUsed + 1)
+  HideCampaignList(routes.glows, nodeUsed + 1)
+  HideCampaignList(routes.tracks, nodeUsed + 1)
+  HideCampaignList(routes.centers, nodeUsed + 1)
+  for index, arcs in pairs(routes.arcs) do
+    if index > nodeUsed then HideCampaignList(arcs, 1) end
+  end
+  HideCampaignList(routes.labels, nodeUsed + 1)
+  HideCampaignList(routes.digits, nodeUsed + 1)
+  HideCampaignList(routes.capitalBadges, nodeUsed + 1)
+  HideCampaignList(routes.siegeCatapults, nodeUsed + 1)
+  HideCampaignList(routes.lockIcons, nodeUsed + 1)
+  routes.lineCount, routes.arrowCount = lineUsed, arrowUsed
+  routes.nodeCount, routes.segmentCount = nodeUsed, segmentUsed
+  local canvas = GetCanvas()
+  if canvas and type(frame.SetAllPoints) == "function" then frame:SetAllPoints(canvas) end
+  if nodeUsed > 0 then frame:Show() else HideObject(frame) end
+  return segmentUsed
+end
+
+function Map:DrawCampaignRoutes(continentKey, width, height)
+  local ok, err = pcall(Map.RefreshCampaignRoutes, Map, continentKey, width, height)
+  if ok then return end
+  pcall(Map.HideCampaignRoutes, Map)
+  if WF.RecordError then WF.RecordError("campaign map routes", err) end
+end
+end)()
+
 function Map:HideAll()
+  self:HideWarCamps()
   self:HideZoneBars()
+  self:HideCampaignRoutes()
   self:HideRoutes()
   self:ClearHover()
   for index = 1, #self.order do
@@ -1951,16 +2885,6 @@ function Map:HideAll()
   self.visibleCount = 0
   self.visiblePatches = 0
   self.visibleIcons = 0
-end
-
--- Hides every group before the client hides the map, so its recursive hide
--- never walks our regions (crash 007A2452, docs/decisions/0021). The next
--- Refresh rebuilds the visible state.
-function Map:SuspendForClose()
-  self:HideAll()
-  HideObject(self.toggle)
-  self.dirty = true
-  self.lastSignature = nil
 end
 
 local function ReapplyVisibleGroups()
@@ -2005,7 +2929,7 @@ local function LevelFrame(frame, base)
   if not frame or not frame.wfLevelOffset or type(frame.SetFrameLevel) ~= "function" then
     return true
   end
-  local want = base + frame.wfLevelOffset
+  local want = GroupLevel(frame, base)
   local ok, level = pcall(frame.GetFrameLevel, frame)
   if ok and level == want then return true end
   return pcall(frame.SetFrameLevel, frame, want)
@@ -2017,7 +2941,9 @@ local function ApplyBaseLevel(canvas)
   local base = BaseLevel(canvas)
   if not base or base == Map.appliedBase then return end
   local done = LevelFrame(Map.routes and Map.routes.frame, base)
+  done = LevelFrame(Map.campaignRoutes and Map.campaignRoutes.frame, base) and done
   done = LevelFrame(Map.zoneBars and Map.zoneBars.frame, base) and done
+  done = LevelFrame(Map.warCamps and Map.warCamps.frame, base) and done
   for _, entry in pairs(Map.groups) do
     done = LevelFrame(entry.frame, base) and done
   end
@@ -2027,10 +2953,102 @@ local function ApplyBaseLevel(canvas)
   if done then Map.appliedBase = base end
 end
 
+-- The player's own capital area is never drawn (user, 2026-11-14): only the
+-- enemy capitals show. Nil while the faction is unknown: every capital shows.
+local OWN_CAPITAL_FACTIONS = { A = "ALLIANCE", H = "HORDE" }
+local function OwnCapitalFaction()
+  local capture = WF.Capture
+  local mine = capture and type(capture.MyFaction) == "function" and capture:MyFaction()
+  return mine and OWN_CAPITAL_FACTIONS[mine] or nil
+end
+Map.OwnCapitalFaction = OwnCapitalFaction
+
+-- True for the player's own capital, hidden on the map and the minimap.
+function Map.IsOwnCapital(area, ownCapital)
+  return ownCapital ~= nil and area.type == "CAPITAL"
+    and Map.CAPITAL_FACTIONS[area.mapKey] == ownCapital
+end
+
+-- Campaign routes and zone markers on OpenMap's stitched world (Campaign
+-- routes filter); hides them on every other view or when the filter is off.
+function Map:HideWarCamps()
+  local camps = self.warCamps
+  for index = 1, #camps.icons do HideObject(camps.icons[index]) end
+  HideObject(camps.frame)
+  camps.count, camps.records = 0, {}
+  if self.hoverCamp then self:ClearHover() end
+end
+
+-- One icon per enabled War Camp the view shows, placed like the campaign
+-- nodes (continent key, "world"); records feed the hover.
+function Map:RefreshWarCamps(continentKey, width, height)
+  local camps = self.warCamps
+  if not camps.frame then camps.frame = CreateGroup("WarfrontMapWarCamps", 1, true) end
+  local frame = camps.frame
+  if not frame then return end
+  local used = 0
+  camps.records = {}
+  for index = 1, #self.order do
+    local area = self.areas[self.order[index]]
+    if area and area.enabled and area.type == "WAR_CAMP" then
+      local x, y = CampaignPoint(area, continentKey)
+      local path, left, right, top, bottom, pw, ph
+      if x then path, left, right, top, bottom, pw, ph = Map.GetIcon(area.type, area.colorKey, area.iconColumn) end
+      if path then
+        used = used + 1
+        local icon = camps.icons[used]
+        if not icon then
+          icon = frame:CreateTexture(nil, "OVERLAY")
+          camps.icons[used] = icon
+        end
+        icon:SetTexture(path)
+        icon:SetTexCoord(left, right, top, bottom)
+        -- 20 % smaller than on zone maps, still under the route nodes (user,
+        -- 2026-11-16: 40 % was too small).
+        local iconWidth, iconHeight = Map.FitIcon(IconSize(area.type) * 0.8, pw, ph)
+        icon:SetWidth(iconWidth * Map.iconZoom)
+        icon:SetHeight(iconHeight * Map.iconZoom)
+        icon:ClearAllPoints()
+        icon:SetPoint("CENTER", frame, "TOPLEFT", x * width, -y * height)
+        icon:Show()
+        camps.records[used] = { id = area.id, x = x, y = y }
+      end
+    end
+  end
+  for index = used + 1, #camps.icons do HideObject(camps.icons[index]) end
+  camps.count = used
+  local canvas = GetCanvas()
+  if canvas and type(frame.SetAllPoints) == "function" then frame:SetAllPoints(canvas) end
+  if used > 0 then frame:Show() else HideObject(frame) end
+end
+
+function Map:DrawWarCamps(show, continentKey, width, height)
+  if not show then
+    if self.warCamps.count > 0 then self:HideWarCamps() end
+    return
+  end
+  local ok, err = pcall(Map.RefreshWarCamps, Map, continentKey, width, height)
+  if ok then return end
+  pcall(Map.HideWarCamps, Map)
+  if WF.RecordError then WF.RecordError("map war camps", err) end
+end
+
+function Map:DrawStitchedCampaign(show, width, height)
+  if self.warCamps.count > 0 then self:HideWarCamps() end
+  if show then
+    self:DrawCampaignRoutes("stitched", width, height)
+    DrawZoneBars("stitched", width, height)
+    return
+  end
+  if self.zoneBars.count > 0 then self:HideZoneBars() end
+  if self.campaignRoutes.nodeCount > 0 then self:HideCampaignRoutes() end
+end
+
 function Map:Refresh(force)
   self.refreshes = (self.refreshes or 0) + 1
   local canvas = GetCanvas()
   ApplyBaseLevel(canvas)
+  self:ApplyIconZoom()
   local mapName = GetCurrentMapFile()
   local mapKey = CanonicalMapName(mapName)
   local width, height = GetCanvasSize(canvas)
@@ -2045,30 +3063,65 @@ function Map:Refresh(force)
   probe.stitched, probe.stitchedHostID = stitchedAPI and true or false, stitchedHostID
   probe.stitchedMask = stitchedMask
   probe.branch = "off"
-  if not stitchedAPI and continentKey and self.enabled and not self:Hidden() and not self:Locked()
-      and canvas and width then
+  local showCampaign, showUnits = not self:RoutesHidden(), not self:UnitsHidden()
+  -- War Camps belong to the Points of interest filter.
+  local showCamps = not self:Hidden()
+  if not stitchedAPI and continentKey and self.enabled and (showCampaign or showUnits or showCamps)
+      and not self:Locked() and canvas and width then
     probe.branch = "continent"
-    -- Continent map: the zone bars and the routes; the zone groups hide once.
+    -- Continent map: campaign route and zone markers (Campaign routes filter),
+    -- travelling units (Scouts and armies filter, checked in DrawRoutes).
     if self.lastSignature ~= "continent" or self.lastSignatureKey ~= continentKey then
       self:HideAll()
       self.lastSignature, self.lastSignatureKey = "continent", continentKey
       self.currentMap = continentKey
     end
-    DrawZoneBars(continentKey, width, height)
-    DrawRoutes(continentKey, width, height)
+    if showCampaign then
+      self:DrawCampaignRoutes(continentKey, width, height)
+      DrawZoneBars(continentKey, width, height)
+    else
+      if self.campaignRoutes.nodeCount > 0 then self:HideCampaignRoutes() end
+      if self.zoneBars.count > 0 then self:HideZoneBars() end
+    end
+    self:DrawWarCamps(showCamps, continentKey, width, height)
+    Kit.DrawRoutes(continentKey, width, height)
     return true
   end
   if not stitchedAPI and not mapKey and not continentKey
-      and self.enabled and not self:Hidden() and not self:Locked()
+      and self.enabled and (showCampaign or showUnits or showCamps) and not self:Locked()
       and canvas and width and IsWorldMap() then
     probe.branch = "world"
-    -- World map: only the routes between the continents.
+    -- World map: the campaign routes of both continents (Campaign routes
+    -- filter) and the travelling units' routes between them.
     if self.lastSignature ~= "world" then
       self:HideAll()
       self.lastSignature = "world"
       self.currentMap = "world"
     end
-    DrawRoutes("world", width, height)
+    if showCampaign then
+      self:DrawCampaignRoutes("world", width, height)
+      DrawZoneBars("world", width, height)
+    else
+      if self.campaignRoutes.nodeCount > 0 then self:HideCampaignRoutes() end
+      if self.zoneBars.count > 0 then self:HideZoneBars() end
+    end
+    self:DrawWarCamps(showCamps, "world", width, height)
+    Kit.DrawRoutes("world", width, height)
+    return true
+  end
+  -- Zone or OpenMap view with Points of interest unchecked: only the
+  -- travelling scouts and armies.
+  if self:Hidden() and (showUnits or (stitchedAPI and showCampaign)) and self.enabled
+      and not self:Locked() and canvas and width and (stitchedAPI or mapKey) then
+    probe.branch = "units"
+    local unitsKey = stitchedAPI and stitchedHostID or mapKey
+    if self.lastSignature ~= "units" or self.lastSignatureKey ~= unitsKey then
+      self:HideAll()
+      self.lastSignature, self.lastSignatureKey = "units", unitsKey
+      self.currentMap = stitchedAPI and "OpenMap" or mapName
+    end
+    self:DrawStitchedCampaign(stitchedAPI and showCampaign, width, height)
+    Kit.DrawRoutes(mapKey or continentKey or "world", width, height)
     return true
   end
   if not self.enabled or self:Hidden() or self:Locked() or not Contours or not canvas
@@ -2077,19 +3130,22 @@ function Map:Refresh(force)
     self.lastSignature = nil
     return false
   end
-  if self.zoneBars.count > 0 then self:HideZoneBars() end
+  self:DrawStitchedCampaign(stitchedAPI and showCampaign, width, height)
   local signature = stitchedAPI and "stitched" or "zone"
   local signatureKey = stitchedAPI and stitchedHostID or mapKey
   local routeMapKey = mapKey or continentKey or "world"
   probe.branch = signature
 
+  local ownCapital = OwnCapitalFaction()
+
   -- Compare the layout inputs field by field: no new string every refresh.
   local same = self.lastSignature == signature and self.lastSignatureKey == signatureKey
     and self.lastWidth == width and self.lastHeight == height
     and self.lastRevision == self.revision and self.lastStitchedMask == stitchedMask
+    and self.lastOwnCapital == ownCapital
   if not force and not self.dirty and same then
     ReapplyVisibleGroups()
-    DrawRoutes(routeMapKey, width, height)
+    Kit.DrawRoutes(routeMapKey, width, height)
     RecordCounts(self)
     return true
   end
@@ -2098,6 +3154,7 @@ function Map:Refresh(force)
   self.lastSignature, self.lastSignatureKey = signature, signatureKey
   self.lastWidth, self.lastHeight, self.lastRevision = width, height, self.revision
   self.lastStitchedMask = stitchedMask
+  self.lastOwnCapital = ownCapital
   self.currentMap = stitchedAPI and "OpenMap" or mapName
   self:ClearHover()
   self.visibleCount = 0
@@ -2111,7 +3168,8 @@ function Map:Refresh(force)
     local id = self.order[index]
     local area = self.areas[id]
     local entry = self.groups[id]
-    local matches = area and area.enabled and (
+    local matches = area and area.enabled
+      and not Map.IsOwnCapital(area, ownCapital) and (
       stitchedAPI and StitchedZoneVisible(stitchedMask, area.mapKey)
       or not stitchedAPI and area.mapKey == mapKey)
     if matches then
@@ -2146,7 +3204,7 @@ function Map:Refresh(force)
       HideEntry(entry)
     end
   end
-  DrawRoutes(routeMapKey, width, height)
+  Kit.DrawRoutes(routeMapKey, width, height)
   probe.matched = matched
   RecordCounts(self)
   return true
@@ -2167,6 +3225,8 @@ function Map:GetStatus()
   return {
     enabled = self.enabled,
     hidden = self:Hidden(),
+    routesHidden = self:RoutesHidden(),
+    unitsHidden = self:UnitsHidden(),
     locked = self:Locked(),
     registered = #self.order,
     map = self.currentMap,
@@ -2179,6 +3239,9 @@ function Map:GetStatus()
     routes = self.routes.count,
     routeDots = self.routes.dotCount,
     zoneBars = self.zoneBars.count,
+    campaignSegments = self.campaignRoutes.segmentCount,
+    campaignNodes = self.campaignRoutes.nodeCount,
+    warCamps = self.warCamps.count,
     probe = self.probe,
     ticks = self.ticks or 0,
     openTicks = self.openTicks or 0,
@@ -2195,908 +3258,68 @@ function Map:GetStatus()
 end
 
 Map.TYPE_NAMES = {
+  WAR_CAMP = "War Camp",
   OUTPOST = "Outpost",
   SETTLEMENT = "Settlement",
-  HUNTING_GROUNDS = "Hunting Grounds",
   FOREST = "Forest",
   GOLD_MINE = "Gold Mine",
   FARM = "Farm",
+  CAPITAL = "Capital",
 }
 
 Map.TYPE_HINTS = {
+  WAR_CAMP = "Stay inside to capture it. Held War Camps speed your faction's scouts, armies and captures on this continent; recruit here while your faction holds it.",
   OUTPOST = "Stay inside the zone to capture it.",
   SETTLEMENT = "Capturable once every associated objective is controlled.",
-  HUNTING_GROUNDS = "Kill the required creatures to capture it.",
   FOREST = "Harvest wood.",
   GOLD_MINE = "Harvest gold.",
   FARM = "Produce agricultural resources.",
+  CAPITAL = "Its faction recruits here and sends armies and scouts from here.",
 }
 
-local OWNER_CODES = { HORDE = "H", ALLIANCE = "A" }
-local FACTION_LABELS = {
-  H = { "Horde", 0.90, 0.25, 0.20 },
-  A = { "Alliance", 0.25, 0.55, 1.00 },
-  N = { "Neutral", 0.70, 0.70, 0.70 },
-}
-
-local function CursorOnCanvas(canvas, width, height)
-  local getCursor = GetGlobal("GetCursorPosition")
-  if type(getCursor) ~= "function" or type(canvas.GetEffectiveScale) ~= "function"
-      or type(canvas.GetLeft) ~= "function" or type(canvas.GetTop) ~= "function" then
-    return nil
-  end
-  local ok, cursorX, cursorY, scale, left, top = pcall(function()
-    local x, y = getCursor()
-    return x, y, canvas:GetEffectiveScale(), canvas:GetLeft(), canvas:GetTop()
-  end)
-  if not ok or type(cursorX) ~= "number" or type(cursorY) ~= "number"
-      or type(scale) ~= "number" or scale <= 0
-      or type(left) ~= "number" or type(top) ~= "number" then
-    return nil
-  end
-  local x = ((cursorX / scale) - left) / width * 100
-  local y = (top - (cursorY / scale)) / height * 100
-  if x < 0 or x > 100 or y < 0 or y > 100 then return nil end
-  return x, y
-end
-
-local function ShowHoverPatches(entry, area, width, height, stitchedAPI, hostID)
-  if not entry.records then return end
-  entry.hoverTextures = entry.hoverTextures or {}
-  local total = #entry.records
-  local index = 1
-  while index <= total do
-    if not entry.hoverTextures[index] then entry.hoverTextures[index] = CreatePatch(entry) end
-    if not PlacePatch(entry, entry.hoverTextures[index], entry.records[index],
-        width, height, area.color, HOVER_ALPHA, area, stitchedAPI, hostID) then
-      HideObject(entry.hoverTextures[index])
-    end
-    index = index + 1
-  end
-  while index <= #entry.hoverTextures do
-    HideObject(entry.hoverTextures[index])
-    index = index + 1
-  end
-end
-
-local function FormatDuration(seconds)
-  seconds = math.ceil(seconds)
-  if seconds < 60 then return seconds .. "s" end
-  return strFormat("%dm %02ds", mathFloor(seconds / 60), (seconds % 60))
-end
-
-local function AddFactionLine(tooltip, left, code, suffix)
-  local label = FACTION_LABELS[code] or FACTION_LABELS.N
-  tooltip:AddDoubleLine(left, label[1] .. (suffix or ""), 0.8, 0.8, 0.8,
-    label[2], label[3], label[4])
-end
-
--- Forever's world map is a UIParent window (Blizzard_WorldMap.xml) with no
--- WorldMapTooltip, so GameTooltip stays visible over it.
-local function MapTooltip()
-  local tooltip = GetGlobal("GameTooltip")
-  if tooltip and type(tooltip.SetOwner) == "function" then return tooltip, "GameTooltip" end
-  return nil, "none"
-end
-
--- Route tooltip: offset from the cursor and font size reduction. Declared before
--- the functions below, which would otherwise read them as nil globals.
-local ROUTE_TOOLTIP_OFFSET = 15
-local ROUTE_TOOLTIP_FONT_DELTA = 3
-
--- The route tooltip uses smaller fonts on the shared map tooltip; every other tooltip
--- gets the original fonts back first.
-local function HideTooltipIcons(tooltip)
-  local pool = tooltip.WarfrontIcons
-  if not pool then return end
-  local index = 1
-  while index <= #pool do
-    pool[index].icon:Hide()
-    pool[index].count:Hide()
-    index = index + 1
-  end
-end
-
-local function RestoreTooltipFonts(tooltip)
-  HideTooltipIcons(tooltip)
-  local saved = tooltip.WarfrontFonts
-  if not saved then return end
-  tooltip.WarfrontFonts = nil
-  for index = 1, #saved do
-    local entry = saved[index]
-    pcall(entry[1].SetFont, entry[1], entry[2], entry[3], entry[4])
-  end
-end
-
--- Shrinks every line by ROUTE_TOOLTIP_FONT_DELTA; the caller shows the tooltip
--- afterwards so its size and background are computed with the new fonts.
-local function ShrinkTooltipFonts(tooltip)
-  local name = tooltip:GetName()
-  if not name then return end
-  local saved = {}
-  local lines = tooltip:NumLines()
-  local index = 1
-  while index <= lines do
-    local side = 1
-    while side <= 2 do
-      local text = GetGlobal(name .. (side == 1 and "TextLeft" or "TextRight") .. index)
-      if text and type(text.GetFont) == "function" then
-        local path, size, flags = text:GetFont()
-        if path and type(size) == "number" then
-          saved[#saved + 1] = { text, path, size, flags }
-          text:SetFont(path, size - ROUTE_TOOLTIP_FONT_DELTA, flags)
-        end
-      end
-      side = side + 1
-    end
-    index = index + 1
-  end
-  tooltip.WarfrontFonts = saved
-end
-
--- The shared tooltip keeps the changed fonts and icons of an area tooltip until the
--- next map tooltip: put them back when it hides, so no other tooltip inherits them.
-local function HookTooltipHide(tooltip)
-  if tooltip.WarfrontHideHook or type(tooltip.GetScript) ~= "function" then return end
-  tooltip.WarfrontHideHook = true
-  local previous = tooltip:GetScript("OnHide")
-  tooltip:SetScript("OnHide", function(self, ...)
-    RestoreTooltipFonts(self)
-    if previous then previous(self, ...) end
-  end)
-end
-
--- Area tooltip rows: 1.12 has no inline pictures, so a tall blank line reserves the
--- room of a row of unit icons and DrawTooltipRows lays them over it after Show.
-local TOOLTIP_ICON_SIZE = 24
-local TOOLTIP_ICON_GAP = 8
-local TOOLTIP_HINT_SIZE_DELTA = 2
-local TOOLTIP_GAP_FONT_SIZE = 5
-
--- Changes the font size of one left line; RestoreTooltipFonts puts it back.
-local function RestyleLine(tooltip, index, size, shrink)
-  local name = tooltip:GetName()
-  local text = name and GetGlobal(name .. "TextLeft" .. index)
-  if not text or type(text.GetFont) ~= "function" then return end
-  local path, current, flags = text:GetFont()
-  if not path or type(current) ~= "number" then return end
-  tooltip.WarfrontFonts = tooltip.WarfrontFonts or {}
-  tooltip.WarfrontFonts[#tooltip.WarfrontFonts + 1] = { text, path, current, flags }
-  text:SetFont(path, size or (current - shrink), flags)
-end
-
--- Reserves a line for `units` ({ key, count, faded }) and queues it for drawing.
-local function AddUnitRow(tooltip, rows, units, faction)
-  if #units == 0 then return end
-  tooltip:AddLine(" ")
-  local line = tooltip:NumLines()
-  RestyleLine(tooltip, line, TOOLTIP_ICON_SIZE)
-  rows[#rows + 1] = { line = line, units = units, faction = faction }
-end
-
-local function DrawTooltipRows(tooltip, rows)
-  local window = WF.MainWindow
-  local name = tooltip:GetName()
-  if not name or not window or not window.UnitIcon then return end
-  tooltip.WarfrontIcons = tooltip.WarfrontIcons or {}
-  local pool = tooltip.WarfrontIcons
-  local used = 0
-  local widest = 0
-  for rowIndex = 1, #rows do
-    local row = rows[rowIndex]
-    local line = GetGlobal(name .. "TextLeft" .. row.line)
-    local unitIndex = 1
-    while line and unitIndex <= #row.units do
-      local unit = row.units[unitIndex]
-      used = used + 1
-      local slot = pool[used]
-      if not slot then
-        slot = {
-          icon = tooltip:CreateTexture(nil, "ARTWORK"),
-          count = tooltip:CreateFontString(nil, "OVERLAY", "NumberFontNormal"),
-        }
-        slot.icon:SetWidth(TOOLTIP_ICON_SIZE)
-        slot.icon:SetHeight(TOOLTIP_ICON_SIZE)
-        pool[used] = slot
-      end
-      local x = (unitIndex - 1) * (TOOLTIP_ICON_SIZE + TOOLTIP_ICON_GAP)
-      window.UnitIcon(slot.icon, unit.key, row.faction)
-      slot.icon:SetAlpha(unit.faded and 0.4 or 1)
-      slot.icon:ClearAllPoints()
-      slot.icon:SetPoint("LEFT", line, "LEFT", x, 0)
-      slot.icon:Show()
-      slot.count:SetText(tostring(unit.count))
-      slot.count:ClearAllPoints()
-      slot.count:SetPoint("BOTTOMRIGHT", slot.icon, "BOTTOMRIGHT", 1, 0)
-      slot.count:Show()
-      if x + TOOLTIP_ICON_SIZE > widest then widest = x + TOOLTIP_ICON_SIZE end
-      unitIndex = unitIndex + 1
-    end
-  end
-  -- Tooltip text insets are 10 px on each side.
-  if widest > 0 and tooltip:GetWidth() < widest + 20 then tooltip:SetWidth(widest + 20) end
-end
-
-local function ShowAreaTooltip(canvas, area)
-  local tooltip = MapTooltip()
-  if not tooltip then return nil end
-  RestoreTooltipFonts(tooltip)
-  HookTooltipHide(tooltip)
-  local typeName = Map.TYPE_NAMES[area.type] or area.type
-  local info = WF.Capture and WF.Capture.TooltipInfo and WF.Capture:TooltipInfo(area.id)
-  local rows = {}
-  local ok = pcall(function()
-    tooltip:SetOwner(canvas, "ANCHOR_CURSOR")
-    tooltip:ClearLines()
-    -- A locked siege is a badge at the top right; its reason stays below.
-    local _, _, lockReason = string.find((info and info.detail) or "", "^Siege locked: (.*)$")
-    if lockReason then
-      tooltip:AddDoubleLine(area.label or typeName, "Siege locked", 1, 0.82, 0, 1, 0.35, 0.3)
-    else
-      tooltip:AddLine(area.label or typeName, 1, 0.82, 0)
-    end
-    if area.label then tooltip:AddLine(typeName, 1, 1, 1) end
-    -- Capturable areas follow the owner registry; others keep their drawn color.
-    if not Map.RESOURCE_TYPES[area.type] then
-      AddFactionLine(tooltip, "Confirmed owner", info and info.owner or OWNER_CODES[area.colorKey or ""] or "N")
-    end
-    if info and info.hint then
-      AddFactionLine(tooltip, "Unconfirmed owner", info.hint.owner, " (" .. info.hint.count .. " player(s), "
-        .. FormatDuration(info.hint.age) .. " ago)")
-      -- Decision 0046: an optional recommendation, never a requirement.
-      if not info.cloud and WF.Companion and WF.Companion.ShownHint and WF.Companion:ShownHint() then
-        tooltip:AddLine("Optional: the Warfront Companion adds the cloud's last known owner.", 0.6, 0.6, 0.6, 1)
-      end
-    end
-    -- Cloud owner (decision 0060): shown only, never an owner for gameplay.
-    if info and info.cloud and WF.Capture then
-      local label, code, detail = WF.Capture.CloudLine(info.cloud)
-      if code then
-        AddFactionLine(tooltip, label, code, detail and (" (" .. detail .. ")") or nil)
-      else
-        tooltip:AddDoubleLine(label, detail, 0.8, 0.8, 0.8, 0.8, 0.8, 0.8)
-      end
-    end
-    if info and info.challenger then
-      AddFactionLine(tooltip, "Capture", info.challenger, " " .. info.percent .. "%")
-    end
-    if info and info.status then
-      local status = info.status
-      if info.remaining then status = status .. " (" .. FormatDuration(info.remaining) .. ")" end
-      tooltip:AddLine(status, 1, 1, 1)
-    end
-    -- Outpost capture time or Settlement siege prerequisites (decision 0053).
-    if lockReason then
-      tooltip:AddLine(lockReason, 0.8, 0.8, 0.8)
-    elseif info and info.detail then
-      tooltip:AddLine(info.detail, 0.8, 0.8, 0.8)
-    end
-    if info and (info.nH or 0) + (info.nA or 0) > 0 then
-      tooltip:AddDoubleLine("Players inside", "|cffe64033" .. info.nH .. " Horde|r  |cff408cff"
-        .. info.nA .. " Alliance|r", 0.8, 0.8, 0.8, 1, 1, 1)
-    end
-    if info and info.here then tooltip:AddLine("You are here", 0.3, 1, 0.3) end
-    -- Resource POIs: their shared stock, never an owner (decision 0048).
-    local stock = WF.Stock and WF.Stock.TooltipInfo and WF.Stock:TooltipInfo(area.id)
-    if stock then
-      tooltip:AddDoubleLine(stock.name .. " stock", stock.level .. " / " .. stock.capacity, 0.8, 0.8, 0.8, 1, 1, 1)
-      tooltip:AddLine(stock.status, 1, 1, 1)
-      if stock.here then tooltip:AddLine("You are here", 0.3, 1, 0.3) end
-    end
-    -- Scouting (decision 0050): the enemy sees a scout coming, never its sender.
-    local scout = WF.Scout and WF.Scout.TooltipInfo and WF.Scout:TooltipInfo(area.id)
-    if scout then
-      if scout.discovered then
-        tooltip:AddDoubleLine("Discovered", FormatDuration(scout.discovered) .. " left", 0.8, 0.8, 0.8, 0.3, 1, 0.3)
-        local view = scout.garrison
-        local units = {}
-        for index = 1, #WF.Garrison.UNIT_ORDER do
-          local key = WF.Garrison.UNIT_ORDER[index]
-          units[#units + 1] = { key = key, count = view and view[key] or "?", faded = not view or view[key] == 0 }
-        end
-        tooltip:AddDoubleLine("Garrison", view and ("seen " .. FormatDuration(scout.seen) .. " ago") or "unknown",
-          0.8, 0.8, 0.8, 0.8, 0.8, 0.8)
-        local side = view and (view.owner == "H" or view.owner == "A") and view.owner
-          or WF.Capture and WF.Capture:MyFaction()
-        AddUnitRow(tooltip, rows, units, side)
-      end
-      if scout.allied then
-        tooltip:AddDoubleLine("Allied scout", "arrives in " .. FormatDuration(scout.allied), 0.8, 0.8, 0.8, 1, 1, 1)
-      end
-      if scout.enemy then
-        tooltip:AddDoubleLine("Enemy scout", "arrives in " .. FormatDuration(scout.enemy), 0.8, 0.8, 0.8, 1, 0.4, 0.4)
-      end
-      if scout.exposed then
-        tooltip:AddDoubleLine("Scouted by the enemy", FormatDuration(scout.exposed) .. " left", 0.8, 0.8, 0.8, 1, 0.4, 0.4)
-      end
-    end
-    -- Armies (decision 0052): the exact composition only for one's own faction.
-    local attack = WF.Attack and WF.Attack.TooltipInfo and WF.Attack:TooltipInfo(area.id)
-    if attack then
-      if attack.allied then
-        tooltip:AddDoubleLine("Allied army", "arrives in " .. FormatDuration(attack.allied.left), 0.8, 0.8, 0.8, 1, 1, 1)
-        local units = {}
-        for index = 1, #WF.Attack.UNIT_ORDER do
-          local key = WF.Attack.UNIT_ORDER[index]
-          local count = attack.allied.counts[key]
-          if count > 0 then units[#units + 1] = { key = key, count = count } end
-        end
-        AddUnitRow(tooltip, rows, units, WF.Capture and WF.Capture:MyFaction())
-      end
-      if attack.enemy then
-        tooltip:AddDoubleLine("Enemy army", "arrives in " .. FormatDuration(attack.enemy), 0.8, 0.8, 0.8, 1, 0.4, 0.4)
-      end
-      if attack.pending then tooltip:AddLine("Battle waiting to be resolved", 1, 0.8, 0.3) end
-      if attack.locked then
-        tooltip:AddDoubleLine("Reinforcements locked", FormatDuration(attack.locked) .. " left", 0.8, 0.8, 0.8, 1, 0.8, 0.3)
-      end
-    end
-    local hint = Map.TYPE_HINTS[area.type]
-    local mobs = #(area.requiredMobIds or {})
-    if mobs > 0 then
-      tooltip:AddLine("Required creatures: " .. mobs, 1, 1, 1)
-    end
-    -- The hint is the quietest line: a gap above it, smaller and dimmer than the rest.
-    if hint then
-      tooltip:AddLine(" ")
-      RestyleLine(tooltip, tooltip:NumLines(), TOOLTIP_GAP_FONT_SIZE)
-      tooltip:AddLine(hint, 0.6, 0.6, 0.6, 1)
-      RestyleLine(tooltip, tooltip:NumLines(), nil, TOOLTIP_HINT_SIZE_DELTA)
-    end
-    tooltip:Show()
-    DrawTooltipRows(tooltip, rows)
-  end)
-  return ok and tooltip or nil
-end
-
--- Tooltip of a scout or army icon: route and time left for everyone; the sender and
--- the composition only when the order belongs to the player's faction.
-local function ShowRouteTooltip(canvas, slot)
-  local tooltip = MapTooltip()
-  if not tooltip then return nil end
-  local module = slot.kind == "army" and WF.Attack or WF.Scout
-  local now = WF.Now and WF.Now()
-  if not module or type(module.RouteInfo) ~= "function" or type(now) ~= "number" then return nil end
-  local info = module:RouteInfo(slot.record, now)
-  if not info then return nil end
-  RestoreTooltipFonts(tooltip)
-  local ok, tooltipError = pcall(function()
-    -- ANCHOR_CURSOR ignores offsets on this client: anchor by hand, up and right of the cursor.
-    tooltip:SetOwner(canvas, "ANCHOR_NONE")
-    local getCursor = GetGlobal("GetCursorPosition")
-    local parent = GetGlobal("UIParent")
-    local cx, cy = nil, nil
-    if type(getCursor) == "function" then cx, cy = getCursor() end
-    local scale = tooltip:GetEffectiveScale()
-    tooltip:ClearAllPoints()
-    if cx and cy and parent and scale and scale > 0 then
-      tooltip:SetPoint("BOTTOMLEFT", parent, "BOTTOMLEFT", cx / scale + ROUTE_TOOLTIP_OFFSET, cy / scale + ROUTE_TOOLTIP_OFFSET)
-    else
-      tooltip:SetPoint("BOTTOMLEFT", canvas, "CENTER", ROUTE_TOOLTIP_OFFSET, ROUTE_TOOLTIP_OFFSET)
-    end
-    tooltip:ClearLines()
-    local name = slot.kind == "army" and "army" or "scout"
-    if info.allied then
-      tooltip:AddLine("Allied " .. name, 0.3, 1, 0.3)
-    else
-      tooltip:AddLine("Enemy " .. name, 1, 0.4, 0.4)
-    end
-    if info.owner then tooltip:AddDoubleLine("Sent by", info.owner, 0.8, 0.8, 0.8, 1, 1, 1) end
-    tooltip:AddDoubleLine("From", info.from, 0.8, 0.8, 0.8, 1, 1, 1)
-    tooltip:AddDoubleLine("To", info.to, 0.8, 0.8, 0.8, 1, 1, 1)
-    tooltip:AddDoubleLine("Arrives in", FormatDuration(mathMax(info.left, 0)), 0.8, 0.8, 0.8, 1, 1, 1)
-    if info.army then tooltip:AddLine(info.army, 1, 1, 1) end
-    ShrinkTooltipFonts(tooltip)
-    tooltip:Show()
-  end)
-  if not ok and WF.RecordError then WF.RecordError("map route tooltip", tooltipError) end
-  return ok and tooltip or nil
-end
-
--- The route slot whose icon is under the cursor (x, y in percent of the canvas).
--- Half-size, in canvas pixels, of the hover square of a scout or army icon: wider
--- than the 20 px icon because it moves. The icon already hovered keeps its tooltip
--- a little further out, so the tooltip does not flicker at the edge.
-local ROUTE_HIT_HALF = 15
-local ROUTE_KEEP_HALF = 22
-
-function Map:FindRouteAt(x, y, width, height)
-  local routes = self.routes
-  local best, bestDistance = nil, nil
-  local index = 1
-  while index <= routes.count do
-    local slot = routes.slots[index]
-    if slot and slot.iconShown and slot.record and slot.iconX then
-      local dx = mathAbs(x / 100 - slot.iconX) * width
-      local dy = mathAbs(y / 100 - slot.iconY) * height
-      local held = slot.record == self.hoverRoute
-      if held and dx <= ROUTE_KEEP_HALF and dy <= ROUTE_KEEP_HALF then return slot end
-      if dx <= ROUTE_HIT_HALF and dy <= ROUTE_HIT_HALF then
-        -- Overlapping icons: the one nearest the cursor wins.
-        local distance = dx * dx + dy * dy
-        if not bestDistance or distance < bestDistance then best, bestDistance = slot, distance end
-      end
-    end
-    index = index + 1
-  end
-  return best
-end
-
-function Map:ClearHover()
-  local id = self.hoverId
-  self.hoverId = nil
-  local hadRoute = self.hoverRoute
-  self.hoverRoute = nil
-  self.routeSecond = nil
-  if hadRoute then RefreshRouteDots() end
-  self.cursorX = nil
-  self.cursorY = nil
-  local entry = id and self.groups[id]
-  if entry then HideHoverPatches(entry) end
-  local tooltip = self.tooltipShown
-  if tooltip then
-    self.tooltipShown = nil
-    if type(tooltip.Hide) == "function" then pcall(tooltip.Hide, tooltip) end
-    RestoreTooltipFonts(tooltip)
-  end
-end
-
-local function AreaMatchesView(self, area, mapKey)
-  if self.stitchedAPI then return StitchedZoneVisible(self.stitchedMask, area.mapKey) end
-  return area.mapKey == mapKey
-end
-
-local function AreaContainsCanvasPoint(self, area, x, y)
-  if not self.stitchedAPI then return Contours.AreaContainsPoint(area, x, y) end
-  local sourceID = FOREVER_ZONE_IDS[area.mapKey]
-  local sourceX, sourceY = TransformMapPoint(
-    self.stitchedAPI, self.stitchedHostID, sourceID, x / 100, y / 100)
-  if not sourceX or not sourceY then return false end
-  return Contours.AreaContainsPoint(area, sourceX * 100, sourceY * 100)
-end
-
-function Map:FindAreaAt(x, y, width, height)
-  local mapKey = CanonicalMapName(self.currentMap)
-  local index
-  -- Icons draw above every area and may overhang their own zone (the bounding-box
-  -- middle can fall outside a concave one), so the cursor on an icon picks it first.
-  if width and height then
-    index = #self.order
-    while index >= 1 do
-      local id = self.order[index]
-      local area = self.areas[id]
-      local entry = self.groups[id]
-      if area and entry and entry.active and entry.iconShown
-          and AreaMatchesView(self, area, mapKey) then
-        local reach = IconSize(area.type) * ICON_HIT_RATIO
-        local reachX = reach / width * 100
-        local reachY = reach / height * 100
-        local iconX, iconY = GetIconPosition(area)
-        iconX, iconY = ProjectAreaPoint(
-          self.stitchedAPI, self.stitchedHostID, area, iconX, iconY)
-        if iconX and mathAbs(x - iconX * 100) <= reachX
-            and mathAbs(y - iconY * 100) <= reachY then
-          return id
-        end
-      end
-      index = index - 1
-    end
-  end
-  index = #self.order
-  -- Later areas draw above earlier ones, so test them first.
-  while index >= 1 do
-    local id = self.order[index]
-    local area = self.areas[id]
-    local entry = self.groups[id]
-    if area and entry and entry.active and entry.records
-        and AreaMatchesView(self, area, mapKey)
-        and AreaContainsCanvasPoint(self, area, x, y) then
-      return id
-    end
-    index = index - 1
+-- Canonical key of the zone the player stands in, as area.mapKey, or nil. A map
+-- the addon does not name (a sub-map) stands for the first named parent.
+function Map:PlayerZoneKey()
+  local cmap = GetGlobal("C_Map")
+  local keys = WF.Compat and WF.Compat.MAP_KEYS
+  if type(cmap) ~= "table" or type(cmap.GetBestMapForUnit) ~= "function" or type(keys) ~= "table" then return nil end
+  local current = cmap.GetBestMapForUnit("player")
+  local safety = 0
+  while type(current) == "number" and safety < 8 do
+    local name = keys[current]
+    if type(name) == "string" then return CanonicalMapName(name) end
+    local info = type(cmap.GetMapInfo) == "function" and cmap.GetMapInfo(current) or nil
+    current = info and info.parentMapID
+    safety = safety + 1
   end
   return nil
 end
 
--- True when the mouse is over the map itself: the canvas, or a frame that holds it
--- (WorldMapDetailFrame, WorldMapFrame). WorldFrame (the 3D world, reported over
--- parts of the open map) and Blizzard's landmark buttons (WorldMapFramePOI<n>,
--- 32x32, they only rename the area label) count as the map: measured on OctoWoW,
--- they swallowed most of the hover over EFST01, EFGM04 and EFFA09. Unit dots
--- (WorldMapPlayer, party, raid) share WorldMapTooltip and still block the hover,
--- as do unrelated frames above the map.
-local function MapHasFocus(canvas, focus)
-  if focus == canvas then return true end
-  if not focus then return false end
-  if focus == GetGlobal("WorldFrame") then return true end
-  if type(focus.GetName) == "function" then
-    local nameOk, name = pcall(focus.GetName, focus)
-    if nameOk and type(name) == "string" and string.find(name, "^WorldMapFramePOI%d+$") then
-      return true
-    end
-  end
-  local node = canvas
-  local depth = 0
-  while node and depth < 10 do
-    if type(node.GetParent) ~= "function" then return false end
-    local ok, parent = pcall(node.GetParent, node)
-    if not ok then return false end
-    if parent == focus then return true end
-    node = parent
-    depth = depth + 1
-  end
-  return false
-end
-
-local function FrameLabel(frame)
-  if not frame then return "none" end
-  if type(frame.GetName) == "function" then
-    local ok, name = pcall(frame.GetName, frame)
-    if ok and name then return tostring(name) end
-  end
-  return "unnamed"
-end
-
--- Taken when a tooltip opens, for /wf map hover (chat cannot be typed with the map open).
-local function TooltipProbe(tooltip)
-  local _, name = MapTooltip()
-  if not tooltip then return "tooltip=" .. name .. " not shown" end
-  local function Ask(frame, method)
-    if not frame or type(frame[method]) ~= "function" then return "n/a" end
-    local ok, value = pcall(frame[method], frame)
-    return ok and tostring(value) or "error"
-  end
-  local parent = nil
-  if type(tooltip.GetParent) == "function" then
-    local ok, frame = pcall(tooltip.GetParent, tooltip)
-    if ok then parent = frame end
-  end
-  return "tooltip=" .. name .. " parent=" .. FrameLabel(parent)
-    .. " visible=" .. Ask(tooltip, "IsVisible") .. " lines=" .. Ask(tooltip, "NumLines")
-    .. " strata=" .. Ask(tooltip, "GetFrameStrata")
-    .. " UIParent.visible=" .. Ask(GetGlobal("UIParent"), "IsVisible")
-end
-
-function Map:UpdateHover()
-  local canvas = GetCanvas()
-  local width, height = GetCanvasSize(canvas)
-  local canvasShown = true
-  if canvas and type(canvas.IsVisible) == "function" then
-    local shownOk, shown = pcall(canvas.IsVisible, canvas)
-    canvasShown = not shownOk or shown and true or false
-  end
-  if not width or not canvasShown then
-    if self.hoverId then self:ClearHover() end
-    return
-  end
-
-  local getFocus = MouseFocusGetter()
-  local focus = nil
-  local focusOk = false
-  if type(getFocus) == "function" then focusOk, focus = pcall(getFocus) end
-  local x, y = CursorOnCanvas(canvas, width, height)
-  -- This client can report no focused frame over the open map, so only a frame that
-  -- is reported and unrelated to the map (a button, a window) blocks the hover.
-  local overMap = not focus or MapHasFocus(canvas, focus)
-  -- Keep the raw sample; Map:HoverDebug builds the text only when asked.
-  local sample = self.hoverSample
-  if not sample then
-    sample = {}
-    self.hoverSample = sample
-  end
-  sample.focus, sample.getFocus, sample.focusOk, sample.overMap = focus, type(getFocus), focusOk, overMap
-  sample.x, sample.y, sample.visible, sample.map, sample.hover =
-    x, y, self.visibleCount, self.currentMap, self.hoverId
-
-  -- A scout or army icon under the cursor takes the hover before any area.
-  local slot = self.enabled and overMap and x and height and self:FindRouteAt(x, y, width, height)
-  if slot then
-    local second = mathFloor(WF.Now and WF.Now() or 0)
-    if self.hoverRoute ~= slot.record then self:ClearHover() end
-    if self.hoverRoute ~= slot.record or self.routeSecond ~= second then
-      self.hoverRoute, self.routeSecond = slot.record, second
-      RefreshRouteDots()
-      self.tooltipShown = ShowRouteTooltip(canvas, slot)
-    end
-    return
-  end
-  if self.hoverRoute then self:ClearHover() end
-
-  if not self.enabled or not Contours or not overMap or not x
-      or self.visibleCount == 0 or not self.currentMap then
-    if self.hoverId then self:ClearHover() end
-    return
-  end
-  if self.cursorX == x and self.cursorY == y then return end
-
-  local id = self:FindAreaAt(x, y, width, height)
-  if id == self.hoverId then
-    self.cursorX, self.cursorY = x, y
-    return
-  end
-
-  self:ClearHover()
-  self.cursorX, self.cursorY = x, y
-  if not id then return end
-
-  local area = self.areas[id]
-  local entry = self.groups[id]
-  self.hoverId = id
-  ShowHoverPatches(entry, area, width, height, self.stitchedAPI, self.stitchedHostID)
-  self.tooltipShown = ShowAreaTooltip(canvas, area)
-  self.tooltipDebug = id .. " " .. TooltipProbe(self.tooltipShown)
-end
-
--- The last hover sample as text, for the debug command; nil before any sample.
-function Map:HoverDebug()
-  local sample = self.hoverSample
-  if not sample then return nil end
-  return "focus=" .. FrameLabel(sample.focus) .. " getFocus=" .. sample.getFocus
-    .. " focusOk=" .. tostring(sample.focusOk) .. " overMap=" .. tostring(sample.overMap)
-    .. " cursor=" .. (sample.x and string.format("%.1f,%.1f", sample.x, sample.y) or "off-canvas")
-    .. " visible=" .. tostring(sample.visible) .. " map=" .. tostring(sample.map)
-    .. " hover=" .. tostring(sample.hover)
-end
-
--- Hover probe (/wf map hover probe | report | probe off). While on, each hover
--- sample with the cursor inside a drawn shape is counted for that area, and a
--- sample whose hover differs from the shape under the cursor keeps its reason.
--- Bounded, and saved in WarfrontDB.hoverProbe so /reload makes it readable.
-local HOVER_PROBE_SAMPLES = 150
-
-local function ShapeAreaAt(self, x, y)
-  local mapKey = CanonicalMapName(self.currentMap)
-  local index = #self.order
-  while index >= 1 do
-    local id = self.order[index]
-    local area = self.areas[id]
-    if area and area.enabled and AreaMatchesView(self, area, mapKey)
-        and AreaContainsCanvasPoint(self, area, x, y) then
-      return id
-    end
-    index = index - 1
-  end
-  return nil
-end
-
-local function ProbeFocusLabel(focus)
-  local label = FrameLabel(focus)
-  if focus and label == "unnamed" and type(focus.GetParent) == "function" then
-    local ok, parent = pcall(focus.GetParent, focus)
-    if ok and parent then label = "unnamed<" .. FrameLabel(parent) end
-  end
-  return label
-end
-
-local function Round2(value)
-  return mathFloor(value * 100 + 0.5) / 100
-end
-
-function Map:SetHoverProbe(enabled)
-  if not enabled then
-    self.hoverProbe = nil
-    return
-  end
-  local probe = { areas = {}, samples = {}, dropped = 0 }
-  self.hoverProbe = probe
-  local db = WF.Storage and WF.Storage.GetDB and WF.Storage:GetDB()
-  if type(db) == "table" then db.hoverProbe = probe end
-end
-
-local function HoverMissReason(self, canvas, focus, shapeId, x, y, width, height)
-  local hoverId = self.hoverId
-  if focus and not MapHasFocus(canvas, focus) then return "focus:" .. ProbeFocusLabel(focus) end
-  if not shapeId then return "outsideShape:" .. tostring(hoverId) end
-  local entry = self.groups[shapeId]
-  if not entry then return "noEntry" end
-  if not entry.active then return "inactive" end
-  if not entry.records then return entry.pending and "building" or "noRecords" end
-  local found = self:FindAreaAt(x, y, width, height)
-  if hoverId and found == hoverId then return "icon:" .. hoverId end
-  if found == shapeId then return "notApplied:" .. tostring(hoverId) end
-  return "found:" .. tostring(found) .. ":" .. tostring(hoverId)
-end
-
-function Map:ProbeHover()
-  local probe = self.hoverProbe
-  local canvas = GetCanvas()
-  local width, height = GetCanvasSize(canvas)
-  if not probe or not width or not self.currentMap or not Contours then return end
-  local x, y = CursorOnCanvas(canvas, width, height)
-  if not x then return end
-  local shapeId = ShapeAreaAt(self, x, y)
-  local hoverId = self.hoverId
-  if not shapeId and not hoverId then return end
-
-  local key = shapeId or hoverId
-  local stats = probe.areas[key]
-  if not stats then
-    stats = { inside = 0, hovered = 0, missed = 0, reasons = {} }
-    probe.areas[key] = stats
-  end
-  if shapeId then stats.inside = stats.inside + 1 end
-  if shapeId == hoverId then
-    stats.hovered = stats.hovered + 1
-    return
-  end
-
-  local getFocus = MouseFocusGetter()
-  local focus = nil
-  if type(getFocus) == "function" then
-    local ok, frame = pcall(getFocus)
-    if ok then focus = frame end
-  end
-  local reason = HoverMissReason(self, canvas, focus, shapeId, x, y, width, height)
-  stats.missed = stats.missed + 1
-  stats.reasons[reason] = (stats.reasons[reason] or 0) + 1
-
-  -- One sample per reason and cursor spot, so a still cursor fills nothing.
-  if probe.lastReason == reason and probe.lastArea == key
-      and mathAbs(probe.lastX - x) < 0.5 and mathAbs(probe.lastY - y) < 0.5 then
-    return
-  end
-  probe.lastReason, probe.lastArea, probe.lastX, probe.lastY = reason, key, x, y
-  if #probe.samples >= HOVER_PROBE_SAMPLES then
-    probe.dropped = probe.dropped + 1
-    return
-  end
-  table.insert(probe.samples, {
-    area = key, reason = reason, x = Round2(x), y = Round2(y),
-    focus = ProbeFocusLabel(focus), map = self.currentMap,
-    width = Round2(width), height = Round2(height),
-  })
-end
-
--- Chat lines for /wf map hover report: per area, cursor samples inside its
--- shape, how many showed its hover, and the most frequent miss reasons.
-function Map:HoverProbeReport()
-  local probe = self.hoverProbe
-  if not probe then return { "hover probe is off (/wf map hover probe)" } end
-  local lines = {}
-  for id, stats in pairs(probe.areas) do
-    local reasons = {}
-    for reason, count in pairs(stats.reasons) do
-      reasons[#reasons + 1] = { reason, count }
-    end
-    table.sort(reasons, function(a, b) return a[2] > b[2] end)
-    local text = id .. " inside=" .. stats.inside .. " hovered=" .. stats.hovered
-      .. " missed=" .. stats.missed
-    local index = 1
-    while index <= 3 and reasons[index] do
-      text = text .. " " .. reasons[index][1] .. "=" .. reasons[index][2]
-      index = index + 1
-    end
-    lines[#lines + 1] = text
-  end
-  table.sort(lines)
-  if #lines == 0 then
-    lines[#lines + 1] = "no sample inside an area yet (open the map, move the cursor)"
-  end
-  table.insert(lines, "samples kept=" .. #probe.samples .. " dropped=" .. probe.dropped
-    .. " (/reload saves them)")
-  return lines
-end
-
--- A hidden frame gets no OnUpdate: hiding the driver stops Map:Tick.
-function Map:WakeDriver()
-  local driver = self.driver
-  if driver and type(driver.Show) == "function" then pcall(driver.Show, driver) end
-end
-
-function Map:SleepDriver()
-  local driver = self.driver
-  if driver and type(driver.Hide) == "function" then pcall(driver.Hide, driver) end
-end
-
-local function CanvasVisible()
-  local canvas = GetCanvas()
-  if not canvas then return false end
-  if type(canvas.IsVisible) ~= "function" then return true end
-  local ok, visible = pcall(canvas.IsVisible, canvas)
-  return not ok or visible and true or false
-end
-
-function Map:Tick()
-  self.ticks = (self.ticks or 0) + 1
-  self:StepBuildQueue()
-  -- A closed map needs no hover or refresh (the OnHide hook already hid
-  -- everything); one last hover pass clears its tooltip, and the first tick
-  -- after reopening refreshes at once.
-  if not CanvasVisible() then
-    if self.canvasWasVisible then
-      self.canvasWasVisible = false
-      local hoverOk, hoverError = pcall(self.UpdateHover, self)
-      if not hoverOk and WF.RecordError then WF.RecordError("map hover", hoverError) end
-    end
-    -- Nothing left to do while closed: stop the per-frame driver. The map's
-    -- OnShow hook and QueueBuild wake it (only once that hook is in place).
-    if self.wakeHooked and self:BuildCount() == 0 then self:SleepDriver() end
-    return
-  end
-  self.openTicks = (self.openTicks or 0) + 1
-  if not self.canvasWasVisible then
-    self.canvasWasVisible = true
-    self.lastRefreshAt, self.fallbackTicks = nil, 15
-  end
-  local now = WF.Now and WF.Now() or 0
-  if type(now) == "number" and now > 0
-      and (not self.lastHoverAt or now - self.lastHoverAt >= HOVER_INTERVAL) then
-    self.lastHoverAt = now
-    local hoverOk, hoverError = pcall(self.UpdateHover, self)
-    if not hoverOk and WF.RecordError then WF.RecordError("map hover", hoverError) end
-    if self.hoverProbe then
-      local probeOk, probeError = pcall(self.ProbeHover, self)
-      if not probeOk and WF.RecordError then WF.RecordError("map hover probe", probeError) end
-    end
-  end
-  if type(now) == "number" and now > 0 then
-    if not self.lastRefreshAt or now - self.lastRefreshAt >= REFRESH_INTERVAL then
-      self.lastRefreshAt = now
-      self:Refresh()
-    end
-  else
-    self.fallbackTicks = (self.fallbackTicks or 0) + 1
-    if self.fallbackTicks >= 15 then
-      self.fallbackTicks = 0
-      self:Refresh()
-    end
-  end
-end
-
--- Diagnostic squares for the area-patch texture, built like a real area group.
--- Each square isolates one suspect, left to right:
--- 1 white WHITE8X8 (control), 2 profile fill, 3 the same fill with mirrored u
--- (every real patch has u1 > u2), 4 the fill stacked from 48 strips 0.83 units
--- tall (the real patch height), 5 the whole profile strip (border gradient).
-local PROBE_SIZE = 40
-local PROBE_STRIPS = 48
-
-function Map:ShowProbe(enabled)
-  if self.probe then
-    HideObject(self.probe)
-    self.probe = nil
-  end
-  if not enabled then return true, "probe removed" end
-
-  local canvas = GetCanvas()
-  local create = GetGlobal("CreateFrame")
-  if not canvas or type(create) ~= "function" then return false, "no WorldMapButton" end
-  local ok, frame = pcall(create, "Frame", nil, canvas)
-  if not ok or not frame then return false, "CreateFrame failed" end
-  frame:SetAllPoints(canvas)
-  frame:EnableMouse(false)
-  frame:SetFrameLevel(canvas:GetFrameLevel() + 1)
-  self.probe = frame
-
-  local results = {}
-  local function Square(index, path, u1, u2, v1, v2, top, height)
-    local texture = frame:CreateTexture(nil, "ARTWORK")
-    local loaded = texture:SetTexture(path)
-    texture:SetTexCoord(u1, u2, v1, v2)
-    texture:SetVertexColor(1, 0.2, 0.8, 1)
-    texture:SetPoint("TOPLEFT", frame, "TOPLEFT",
-      40 + (index - 1) * (PROBE_SIZE + 12), -(40 + top))
-    texture:SetWidth(PROBE_SIZE)
-    texture:SetHeight(height)
-    texture:Show()
-    return loaded
-  end
-
-  results[1] = Square(1, "Interface\\Buttons\\WHITE8X8", 0, 1, 0, 1, 0, PROBE_SIZE)
-  results[2] = Square(2, PROFILE_TEXTURE, 0.95, 0.99, 0.25, 0.75, 0, PROBE_SIZE)
-  results[3] = Square(3, PROFILE_TEXTURE, 0.99, 0.95, 0.25, 0.75, 0, PROBE_SIZE)
-  local strip = PROBE_SIZE / PROBE_STRIPS
-  local index = 1
-  while index <= PROBE_STRIPS do
-    results[4] = Square(4, PROFILE_TEXTURE, 0.95, 0.99, 0.25, 0.75,
-      (index - 1) * strip, strip)
-    index = index + 1
-  end
-  results[5] = Square(5, PROFILE_TEXTURE, 0, 1, 0, 1, 0, PROBE_SIZE)
-  frame:Show()
-  return true, "SetTexture white=" .. tostring(results[1])
-    .. " profile=" .. tostring(results[2])
-end
+-- Helpers for modules/map_routes.lua and modules/map_hover.lua.
+Kit.CanonicalMapName = CanonicalMapName
+Kit.Clamp = Clamp
+Kit.Contours = Contours
+Kit.CreateGroup = CreateGroup
+Kit.CreatePatch = CreatePatch
+Kit.FOREVER_ZONE_IDS = FOREVER_ZONE_IDS
+Kit.GetCanvas = GetCanvas
+Kit.GetCanvasSize = GetCanvasSize
+Kit.GetGlobal = GetGlobal
+Kit.GetIconPosition = GetIconPosition
+Kit.HOVER_ALPHA = HOVER_ALPHA
+Kit.HOVER_INTERVAL = HOVER_INTERVAL
+Kit.HideHoverPatches = HideHoverPatches
+Kit.HideObject = HideObject
+Kit.ICON_HIT_RATIO = ICON_HIT_RATIO
+Kit.IconSize = IconSize
+Kit.MouseFocusGetter = MouseFocusGetter
+Kit.POI_ICON_SIZE = POI_ICON_SIZE
+Kit.PROFILE_TEXTURE = PROFILE_TEXTURE
+Kit.PlacePatch = PlacePatch
+Kit.ProjectAreaPoint = ProjectAreaPoint
+Kit.REFRESH_INTERVAL = REFRESH_INTERVAL
+Kit.StitchedZoneVisible = StitchedZoneVisible
+Kit.TransformMapPoint = TransformMapPoint
 
 local staticData = WF.POIData or {}
 local ok, err = Map:RegisterAreas(staticData)
@@ -3119,51 +3342,89 @@ if type(create) == "function" then
   end
 end
 
-local function SuspendSafely()
-  local suspendOk, suspendError = pcall(Map.SuspendForClose, Map)
-  if not suspendOk and WF.RecordError then WF.RecordError("map close", suspendError) end
-end
-
 local mapFrame = GetGlobal("WorldMapFrame")
-if mapFrame and type(mapFrame.GetScript) == "function"
-    and type(mapFrame.SetScript) == "function" then
-  local previousOnHide = mapFrame:GetScript("OnHide")
-  mapFrame:SetScript("OnHide", function(self, ...)
-    SuspendSafely()
-    if previousOnHide then previousOnHide(self, ...) end
-  end)
-end
 -- Opening the map wakes the driver that Map:Tick put to sleep.
 if mapFrame and type(mapFrame.HookScript) == "function" then
   Map.wakeHooked = pcall(mapFrame.HookScript, mapFrame, "OnShow", function()
     Map:WakeDriver()
-    -- Diagnostics for /wf map: what the driver and canvas look like on open.
+    -- Diagnostics for /wfd map: what the driver and canvas look like on open.
     Map.mapShows = (Map.mapShows or 0) + 1
     local driver = Map.driver
     local ok, visible = false, nil
     if driver and type(driver.IsVisible) == "function" then ok, visible = pcall(driver.IsVisible, driver) end
     Map.showDriverVisible = ok and visible and true or false
-    Map.showCanvasVisible = CanvasVisible()
+    Map.showCanvasVisible = Kit.CanvasVisible()
   end) and true or nil
 end
-
--- Forever tags the map dropdown so addons can safely append their own filters.
-local function IsMapFilterChecked()
-  return not Map:Hidden()
+-- Each zoom step (animated or not) refits POI icons and labels at once.
+local hookSecure = GetGlobal("hooksecurefunc")
+if mapFrame and type(hookSecure) == "function"
+    and type(mapFrame.OnCanvasScaleChanged) == "function" then
+  pcall(hookSecure, mapFrame, "OnCanvasScaleChanged", function()
+    local zoomOk, zoomError = pcall(Map.ApplyIconZoom, Map)
+    if not zoomOk and WF.RecordError then WF.RecordError("map icon zoom", zoomError) end
+  end)
 end
 
-local function ToggleMapFilter()
-  local ok, err = pcall(Map.SetHidden, Map, not Map:Hidden())
+-- Forever tags the map dropdown so addons can safely append their own filters:
+-- a "Warfront" category with one checkbox per layer, each with a tooltip
+-- like the client's own filters.
+local MAP_FILTERS = {
+  {
+    text = "Points of interest",
+    tooltip = "Show Outposts, Settlements, War Camps and resources on the map and minimap.",
+    get = "Hidden", set = "SetHidden",
+  },
+  {
+    text = "Scouts and armies",
+    tooltip = "Show scouts and armies on their way, with their path.",
+    get = "UnitsHidden", set = "SetUnitsHidden",
+  },
+  {
+    text = "Campaign routes",
+    tooltip = "Show the front line and captured zones on continent maps.",
+    get = "RoutesHidden", set = "SetRoutesHidden",
+  },
+}
+
+local function IsMapFilterChecked(filter)
+  return not Map[filter.get](Map)
+end
+
+local function ToggleMapFilter(filter)
+  local ok, err = pcall(Map[filter.set], Map, not Map[filter.get](Map))
   if not ok and WF.RecordError then WF.RecordError("map filter", err) end
+end
+
+local function AddMapFilter(rootDescription, filter)
+  local checkbox = rootDescription:CreateCheckbox(WF.L(filter.text), IsMapFilterChecked, ToggleMapFilter, filter)
+  if not checkbox or type(checkbox.SetOnEnter) ~= "function" then return end
+  checkbox:SetOnEnter(function(button)
+    local tooltip = GetGlobal("GameTooltip")
+    if not tooltip then return end
+    tooltip:ClearAllPoints()
+    tooltip:SetPoint("RIGHT", button, "LEFT", -3, 0)
+    tooltip:SetOwner(button, "ANCHOR_PRESERVE")
+    tooltip:SetText(WF.L(filter.text), 1, 1, 1)
+    tooltip:AddLine(WF.L(filter.tooltip), 1, 0.82, 0, true)
+    tooltip:Show()
+  end)
+  if type(checkbox.SetOnLeave) == "function" then
+    checkbox:SetOnLeave(function()
+      local tooltip = GetGlobal("GameTooltip")
+      if tooltip then tooltip:Hide() end
+    end)
+  end
 end
 
 local function RegisterMapFilter()
   local menu = GetGlobal("Menu")
   if type(menu) ~= "table" or type(menu.ModifyMenu) ~= "function" then return end
   local ok, handle = pcall(menu.ModifyMenu, "MENU_WORLD_MAP_TRACKING", function(_, rootDescription)
-    if rootDescription and type(rootDescription.CreateCheckbox) == "function" then
-      rootDescription:CreateCheckbox("Warfront", IsMapFilterChecked, ToggleMapFilter)
-    end
+    if not rootDescription or type(rootDescription.CreateCheckbox) ~= "function" then return end
+    if type(rootDescription.CreateDivider) == "function" then rootDescription:CreateDivider() end
+    if type(rootDescription.CreateTitle) == "function" then rootDescription:CreateTitle("Warfront") end
+    for index = 1, #MAP_FILTERS do AddMapFilter(rootDescription, MAP_FILTERS[index]) end
   end)
   if ok then
     Map.filterMenuHandle = handle

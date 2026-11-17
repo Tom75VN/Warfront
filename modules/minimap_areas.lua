@@ -36,8 +36,22 @@ local BAND = 2
 local EDGE_INSET = 1
 local MAX_PATCHES = 1500
 -- Lighter than the world map so the terrain and blips stay readable.
-local ALPHA = 0.6
-local ICON_SIZE = 23
+local DEFAULT_ALPHA = 0.6
+local BASE_ICON_SIZE = 23
+
+function MinimapAreas:Opacity()
+  return WF.Preferences and WF.Preferences:Get("minimapAreaOpacity") or DEFAULT_ALPHA
+end
+
+function MinimapAreas:IconSize()
+  local scale = WF.Preferences and WF.Preferences:Get("minimapIconScale") or 1
+  return BASE_ICON_SIZE * scale
+end
+
+function MinimapAreas:ApplyPreferences()
+  self.sinceLayout = REFRESH_INTERVAL
+  for _, texture in ipairs(self.patches) do texture.WarfrontOpacity = nil end
+end
 
 local function WorldMapShown()
   local frame = WorldMapFrame
@@ -85,6 +99,28 @@ end
 
 local function Hide(object)
   if object and type(object.Hide) == "function" then object:Hide() end
+end
+
+-- Zone size in yards (width, height). Forever's C_Map.GetMapWorldSize covers
+-- every catalog zone (knowledge base, Map: mapbounds); the four fixed
+-- Map.ROUTE_ZONES rectangles are the fallback. Successes are cached.
+local zoneYards = {}
+local function ZoneYards(mapKey)
+  local cached = zoneYards[mapKey]
+  if cached then return cached[1], cached[2] end
+  local ids = Map.Kit and Map.Kit.FOREVER_ZONE_IDS
+  local zoneID = ids and ids[mapKey]
+  local cmap = C_Map
+  if zoneID and type(cmap) == "table" and type(cmap.GetMapWorldSize) == "function" then
+    local ok, width, height = pcall(cmap.GetMapWorldSize, zoneID)
+    if ok and type(width) == "number" and type(height) == "number" and width > 0 and height > 0 then
+      zoneYards[mapKey] = { width, height }
+      return width, height
+    end
+  end
+  local zone = Map.ROUTE_ZONES and Map.ROUTE_ZONES[mapKey]
+  if zone then return zone[1] - zone[2], zone[3] - zone[4] end
+  return nil
 end
 
 function MinimapAreas:Create()
@@ -135,9 +171,11 @@ local function Draw(self, left, top, right, bottom, u1, u2, color)
   self.used = self.used + 1
   local texture = Patch(self, self.used)
   texture:SetTexCoord(u1, u2, 0.25, 0.75)
-  if texture.WarfrontColor ~= color then
-    texture:SetVertexColor(color[1], color[2], color[3], ALPHA)
+  local opacity = self:Opacity()
+  if texture.WarfrontColor ~= color or texture.WarfrontOpacity ~= opacity then
+    texture:SetVertexColor(color[1], color[2], color[3], opacity)
     texture.WarfrontColor = color
+    texture.WarfrontOpacity = opacity
   end
   texture:ClearAllPoints()
   texture:SetPoint("TOPLEFT", self.frame, "CENTER", left, -top)
@@ -189,18 +227,17 @@ end
 local function PlaceIcon(self, area, view)
   local x, y = Map.IconPosition(area)
   if not x then return end
+  local size = self:IconSize()
   local dx, dy = (x - view.x) * view.width, (y - view.y) * view.height
-  local reach = view.radius - ICON_SIZE / 2
+  local reach = view.radius - size / 2
   if view.square then
-    if mathAbs(dx) > view.halfWidth - ICON_SIZE / 2 or mathAbs(dy) > view.halfHeight - ICON_SIZE / 2 then return end
+    if mathAbs(dx) > view.halfWidth - size / 2 or mathAbs(dy) > view.halfHeight - size / 2 then return end
   elseif reach <= 0 or dx * dx + dy * dy > reach * reach then return end
   self.iconsUsed = self.iconsUsed + 1
   local index = self.iconsUsed
   local icon = self.icons[index]
   if not icon then
     icon = self.frame:CreateTexture(nil, "OVERLAY")
-    icon:SetWidth(ICON_SIZE)
-    icon:SetHeight(ICON_SIZE)
     self.icons[index] = icon
   end
   local keys = self.iconKeys[index]
@@ -218,10 +255,17 @@ local function PlaceIcon(self, area, view)
     end
     icon:SetTexture(path)
     icon:SetTexCoord(left, right, top, bottom)
-    local width, height = Map.FitIcon(ICON_SIZE, w, h)
+    local width, height = Map.FitIcon(size, w, h)
     icon:SetWidth(width)
     icon:SetHeight(height)
     keys.type, keys.color, keys.column, keys.level = area.type, area.colorKey, area.iconColumn, level
+  end
+  if keys.size ~= size then
+    local _, _, _, _, _, width, height = Map.GetIcon(area.type, area.colorKey, area.iconColumn, level)
+    local iconWidth, iconHeight = Map.FitIcon(size, width, height)
+    icon:SetWidth(iconWidth)
+    icon:SetHeight(iconHeight)
+    keys.size = size
   end
   icon:ClearAllPoints()
   icon:SetPoint("CENTER", self.frame, "CENTER", dx, -dy)
@@ -274,9 +318,10 @@ function MinimapAreas:Layout(view)
   self.used, self.iconsUsed = 0, 0
   self.pending = false
   local mapKey, order = view.mapKey, Map.order
+  local ownCapital = Map.OwnCapitalFaction()
   for index = 1, #order do
     local area = Map.areas[order[index]]
-    if area and area.enabled and area.mapKey == mapKey then
+    if area and area.enabled and area.mapKey == mapKey and not Map.IsOwnCapital(area, ownCapital) then
       local records = Map:GetAreaRecords(area)
       if records and Overlaps(Bounds(records), view) then
         local color = area.color or Map.COLORS.NEUTRAL
@@ -320,7 +365,8 @@ function MinimapAreas:Tick(elapsed)
     self.mapFile = mapFile
     self.fileKey = Map.CanonicalMapName(mapFile)
   end
-  local zone = self.fileKey and Map.ROUTE_ZONES[self.fileKey]
+  local zoneWidth, zoneHeight
+  if self.fileKey then zoneWidth, zoneHeight = ZoneYards(self.fileKey) end
   local zoom = type(minimap.GetZoom) == "function" and minimap:GetZoom() or 0
   if self.indoorDirty or zoom ~= self.zoom then
     self.indoor = ReadIndoor(zoom)
@@ -333,14 +379,14 @@ function MinimapAreas:Tick(elapsed)
   end
   yards = yards or (self.indoor and INDOOR_YARDS or OUTDOOR_YARDS)[zoom + 1]
   local size, height = minimap:GetWidth(), minimap:GetHeight()
-  if not zone or not yards or type(size) ~= "number" or size <= 0 or type(height) ~= "number" or height <= 0 then
+  if not zoneWidth or not yards or type(size) ~= "number" or size <= 0 or type(height) ~= "number" or height <= 0 then
     self:Clear()
     return
   end
   local square = SquareMinimap()
 
   local scale = size / yards
-  local width, mapHeight = (zone[1] - zone[2]) * scale, (zone[3] - zone[4]) * scale
+  local width, mapHeight = zoneWidth * scale, zoneHeight * scale
   local moved = self.lastX and mathMax(mathAbs(x - self.lastX) * width,
     mathAbs(y - self.lastY) * mapHeight) or MOVE_PIXELS
   if self.mapKey == self.fileKey and zoom == self.zoom and yards == self.yards

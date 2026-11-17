@@ -26,12 +26,22 @@ local COLORS = {
   GOOD = "4dff4d", BAD = "ff5959", DIM = "999999", GOLD = "ffd100",
 }
 local RESOURCE_NAMES = { gold = "Gold", wood = "Wood", food = "Food" }
+
+function Window:ApplyScale()
+  if self.frame and type(self.frame.SetScale) == "function" then
+    local factor = WF.Preferences and WF.Preferences:ScaleFactor() or 1
+    self.frame:SetScale(factor)
+  end
+end
 local SOURCE_LABELS = {
   LOCAL = "confirmed",
   PEER = "reported",
   STATIC = "not captured yet",
 }
-local TERRITORY_TYPES = { OUTPOST = true, HUNTING_GROUNDS = true, SETTLEMENT = true }
+-- The held counts are strategic territory only; War Camps are listed but feed
+-- the Front Network line instead (decision 0123 § 8).
+local BALANCE_TYPES = { OUTPOST = true, SETTLEMENT = true }
+local TERRITORY_TYPES = { OUTPOST = true, SETTLEMENT = true, WAR_CAMP = true }
 
 Window.ROWS = ROWS
 
@@ -111,7 +121,7 @@ function Window.ResourceRows(now)
     Row(rows, "  " .. AreaTitle(hud.area), hud.resource.level .. " / " .. hud.resource.capacity)
     if hud.status == "IN" then
       Row(rows, "  " .. Paint("GOOD", "Gathering " .. stock.GATHER_AMOUNT .. " " .. hud.resource.resource
-        .. " every " .. stock.GATHER_TICK .. "s"))
+        .. " every " .. stock.GATHER_TICK .. "s" .. (hud.plunder and " (+30% enemy land)" or "")))
     else
       Row(rows, "  " .. Paint("BAD", "Not gathering: " .. tostring(hud.reason or "checking")))
     end
@@ -159,7 +169,8 @@ function Window.ArmyRows(now)
   for index = 1, #army.ORDER do
     local key = army.ORDER[index]
     local unit = army.UNITS[key]
-    local stats = unit.scout and "scout, never fights" or ("ATK " .. unit.atk .. " DEF " .. unit.def)
+    local stats = unit.scout and "scout, never fights"
+      or ("ATK " .. unit.atk .. " DEF " .. unit.def .. ", " .. (army:CounterText(key) or ""))
     Row(rows, "  " .. army:Name(key) .. " x" .. reserve[key],
       unit.gold .. " gold " .. unit.wood .. " wood " .. unit.food .. " food",
       { { label = "+1", fn = Window.Recruit, a = key, b = 1 }, { label = "+5", fn = Window.Recruit, a = key, b = 5 } })
@@ -178,17 +189,19 @@ function Window.TerritoryRows(now)
     return rows
   end
   local counts = { H = 0, A = 0, N = 0 }
-  local list = {}
+  local here, others = {}, {}
+  local zone = map.PlayerZoneKey and map:PlayerZoneKey() or nil
   local index = 1
   for index = 1, #map.order do
     local id = map.order[index]
     local area = map.areas[id]
     if area and area.enabled and TERRITORY_TYPES[area.type] then
+      local list = area.mapKey == zone and here or others
       local owner, _, source = capture:GetOwner(id)
       local info = capture:TooltipInfo(id, now)
       local label = "not capturable yet"
       if capture:Capturable(id) then
-        counts[owner] = (counts[owner] or 0) + 1
+        if BALANCE_TYPES[area.type] then counts[owner] = (counts[owner] or 0) + 1 end
         label = SOURCE_LABELS[source] or tostring(source)
       end
       Row(list, "  " .. AreaTitle(area), FactionText(owner) .. " " .. Paint("DIM", label))
@@ -212,11 +225,34 @@ function Window.TerritoryRows(now)
   end
   Row(rows, "  " .. FactionText("H") .. " " .. counts.H .. "    " .. FactionText("A") .. " " .. counts.A
     .. "    " .. FactionText("N") .. " " .. counts.N)
+  -- Front Network of the player's faction (decision 0123 § 8, amended
+  -- 2026-11-15): one compact line per continent, from the accepted owners only.
+  local network = WF.FrontNetwork
+  local mine = WF.Capture and WF.Capture:MyFaction()
+  if network and (mine == "H" or mine == "A") then
+    for _, continent in ipairs(network.CONTINENTS) do
+      local total = network:Total(continent)
+      local text
+      if total == 0 then
+        text = Paint("DIM", "No War Camps")
+      else
+        local _, held, travel, capture = network:Get(continent, mine)
+        text = FactionText(mine) .. " " .. held .. "/" .. total
+          .. Paint("DIM", " (-" .. travel .. "% travel, -" .. capture .. "% capture)")
+      end
+      Row(rows, "  Front Network - " .. network.CONTINENT_NAMES[continent], text)
+    end
+  end
   Row(rows, "  " .. Paint("DIM", "Confirmed: you saw it. Other news may arrive late."))
-  Header(rows, "Points of interest")
-  index = 1
-  for index = 1, #list do
-    rows[#rows + 1] = list[index]
+  if #here > 0 then
+    Header(rows, "Current zone")
+    for index = 1, #here do
+      rows[#rows + 1] = here[index]
+    end
+  end
+  Header(rows, "Other zones")
+  for index = 1, #others do
+    rows[#rows + 1] = others[index]
   end
   Window.SyncRows(rows, now)
   return rows
@@ -227,9 +263,16 @@ end
 function Window.SyncRows(rows, now)
   Header(rows, "Synchronization")
   local catchup = WF.Catchup
-  local joinedAt = catchup and catchup.joinedAt
-  Row(rows, "  War news", joinedAt and Paint("GOOD", "live for " .. Duration(now - joinedAt))
-    or Paint("BAD", "connecting; the map may be out of date"))
+  local state, age = "waiting", nil
+  if catchup and catchup.NewsState then state, age = catchup:NewsState(now) end
+  if state == "live" then
+    Row(rows, "  War news", Paint("GOOD", "live, last news " .. Duration(age) .. " ago"))
+  elseif state == "quiet" then
+    Row(rows, "  War news", Paint("GOLD", age and ("connected, last news " .. Duration(age) .. " ago")
+      or "connected, no news yet"))
+  else
+    Row(rows, "  War news", Paint("BAD", "Waiting for other players to sync"))
+  end
   if WF.Capture and not WF.Capture:CanTalk() then
     Row(rows, "  " .. Paint("BAD", "You cannot take part: " .. tostring(WF.Capture.LockReason and WF.Capture:LockReason()
       or WF.Capture.LEVEL_REASON)))
@@ -237,6 +280,14 @@ function Window.SyncRows(rows, now)
   local pending = 0
   for code in pairs(catchup and catchup.pending or {}) do pending = pending + 1 end
   Row(rows, "  Map news", pending > 0 and Paint("GOLD", "updating") or "up to date")
+  -- Activity meter (modules/traffic.lua): averages over its last minute.
+  local traffic = WF.Traffic
+  if traffic then
+    Window.trafficIn, Window.trafficOut = Window.trafficIn or {}, Window.trafficOut or {}
+    local totalIn, totalOut = traffic:Fill(Window.trafficIn, Window.trafficOut, now)
+    Row(rows, "  Active players", traffic:ActivePlayers(now) .. Paint("DIM", ", received "
+      .. traffic.Rate(totalIn / traffic.WINDOW) .. ", sent " .. traffic.Rate(totalOut / traffic.WINDOW)))
+  end
   local queue = WF.SendQueue
   if queue then
     local dropped = queue.dropped or 0
@@ -301,8 +352,11 @@ function Window.GarrisonRows(now)
   Header(rows, AreaTitle(view.area))
   local confirm = Window.confirm
   if confirm and confirm.id == view.id then
+    local preview = garrison:CapturePreview(confirm.kind, confirm.count, confirm.id)
+    local timing = preview and (" Capture time +" .. Duration(preview.added) .. " ("
+      .. Duration(preview.before) .. " to " .. Duration(preview.after) .. ").") or ""
     Row(rows, "  " .. Paint("GOLD", "Give " .. confirm.count .. " " .. garrison:Name(confirm.kind, view.owner)
-      .. "? It can never be taken back."), nil,
+      .. "?" .. timing .. " Irreversible."), nil,
       { { label = "Yes", fn = Window.Pledge }, { label = "No", fn = Window.CancelPledge } })
   end
   local pending = garrison:Pending()
@@ -314,6 +368,7 @@ function Window.GarrisonRows(now)
   if view.settlement then Row(rows, "  Level", view.level .. " / 3") end
   Row(rows, "  Garrison", view.used .. " / " .. view.capacity .. " Unit Size"
     .. (view.used >= view.capacity and Paint("BAD", " full") or ""))
+  Row(rows, "  Capture time", view.captureDuration and Duration(view.captureDuration) or Paint("DIM", "unknown"))
   Row(rows, "  Defense", tostring(view.defense))
   -- Armies on their way and the post-combat lock (modules/attack.lua).
   local attack = WF.Attack
@@ -326,6 +381,10 @@ function Window.GarrisonRows(now)
   end
   if threat and threat.pending then Row(rows, "  " .. Paint("BAD", "A battle here is waiting to be resolved")) end
   local frozen = attack and attack:Freeze(view.id, now)
+  -- Attackers inside a Settlement under siege block units too (decision 0082).
+  if not frozen and WF.Garrison and WF.Garrison.SiegePressure and view.owner then
+    frozen = WF.Garrison:SiegePressure(view.id, view.owner, now)
+  end
   Row(rows, "  Reinforcements", frozen and Paint("BAD", "blocked") or Paint("GOOD", "open"))
   if frozen then Row(rows, "    " .. Paint("BAD", frozen)) end
   local closed = garrison:Closed(view.area, now)
@@ -404,7 +463,7 @@ local function BuilderRows(rows, now, faction, reserve)
   Row(rows, "  Assault Capacity", capacity .. " Unit Size")
   Row(rows, "    " .. Paint("DIM", "From " .. attack.ASSAULT.min .. " to " .. attack.ASSAULT.max
     .. ", it grows with the Settlements your faction holds"))
-  local origin, why = WF.Army:Place()
+  local origin, why = WF.Army:DeparturePlace()
   Row(rows, "  Leave from: " .. (origin and AreaTitle(origin) or Paint("BAD", why)))
   local target = Window.target and attack:Target(Window.target)
   Row(rows, "  Target: " .. (target and AreaTitle(target) or Paint("DIM", "pick a discovered target below")))
@@ -417,7 +476,7 @@ local function BuilderRows(rows, now, faction, reserve)
   end
   local size = attack.Size(army)
   Row(rows, "  Army size", size .. " / " .. capacity .. " Unit Size" .. (size > capacity and Paint("BAD", " too large") or ""))
-  local duration = origin and target and WF.Scout:Travel(origin, target)
+  local duration = origin and target and (WF.Scout:DepartureTravel(origin, target, faction))
   if duration then Row(rows, "  Travel time", Duration(duration)) end
   if Window.launch then
     Row(rows, "  " .. Paint("GOLD", "Send " .. attack.Composition(army, faction) .. "? The units never come back."), nil,
@@ -495,13 +554,26 @@ end
 
 local function SiegeRows(rows, now, faction)
   local map, capture = WF.Map, WF.Capture
+  -- The Active Fronts (decision 0098): where each continent stands.
+  local front = WF.Front and WF.Front:HasRoutes() and WF.Front or nil
+  if front then
+    Header(rows, "Fronts")
+    local lines = front:Lines(now)
+    for index = 1, #lines do Row(rows, "  " .. lines[index]) end
+  end
   Header(rows, "Settlement sieges")
   local count = 0
   for index = 1, #map.order do
     local id = map.order[index]
     local area = map.areas[id]
     local owner = capture:GetOwner(id)
-    if area and area.enabled and area.type == "SETTLEMENT" and owner ~= faction then
+    local open = area and area.enabled and area.type == "SETTLEMENT"
+    if open and front then
+      open = front:CanBesiege(id, faction, now)
+    elseif open then
+      open = owner ~= faction
+    end
+    if open then
       count = count + 1
       Row(rows, "  " .. AreaTitle(area), FactionText(owner))
       local list = capture:SiegeChecklist(id, faction, now)
@@ -513,7 +585,10 @@ local function SiegeRows(rows, now, faction)
         .. " players of your faction standing inside start the siege"))
     end
   end
-  if count == 0 then Row(rows, "  " .. Paint("DIM", "Your faction holds every Settlement")) end
+  if count == 0 then
+    Row(rows, "  " .. Paint("DIM", front and "No Settlement is open to your faction on the fronts"
+      or "Your faction holds every Settlement"))
+  end
 end
 
 -- Orders, attack builder, scouting, threats and Settlement prerequisites
@@ -532,6 +607,89 @@ function Window.WarRows(now)
   TargetRows(rows, now, faction)
   ThreatRows(rows, now, faction)
   SiegeRows(rows, now, faction)
+  return rows
+end
+
+-- Scoreboard (decisions 0104, 0105, 0109): the rows of WF.Scoreboard as text.
+Window.rank = { period = "current", who = "players", board = 1, sorts = {} }
+
+function Window:SetRank(field, value)
+  local rank = self.rank
+  if field == "board" then
+    local count = #WF.Scoreboard.BOARD_ORDER
+    rank.board = (rank.board + value - 1) % count + 1
+  elseif field == "sort" then
+    local key = WF.Scoreboard.BOARD_ORDER[rank.board]
+    rank.sorts[key] = value
+  else
+    rank[field] = value
+  end
+  self.offset = 0
+  self:Refresh()
+end
+
+local function RankLine(item, view, who)
+  local scoreboard = WF.Scoreboard
+  local name = scoreboard.NameText(item, who)
+  if item.own then name = name .. Paint("GOLD", " (you)") end
+  if item.share then name = name .. Paint("DIM", " your part: " .. scoreboard.Format({ v = item.share }, "v")) end
+  if item.plus and item.plus > 0 then
+    name = name .. Paint("GOOD", " +" .. scoreboard.Format({ v = item.plus }, "v") .. " this campaign")
+  end
+  local values = {}
+  for index = 1, #view.board.columns do
+    local key = view.board.columns[index].key
+    local text = item.blank and "-" or scoreboard.Format(item.columns, key)
+    if key == view.rankKey then text = Paint("GOLD", text) end
+    values[#values + 1] = text
+  end
+  local rank = item.rank and (tostring(item.rank) .. ". ") or "    "
+  return "  " .. (item.own and Paint("GOLD", rank) or rank) .. name, table.concat(values, "   ")
+end
+
+function Window.RankRows(now)
+  local rows = {}
+  local scoreboard = WF.Scoreboard
+  if not scoreboard then return rows end
+  local rank = Window.rank
+  local boardKey = scoreboard.BOARD_ORDER[rank.board]
+  local view = scoreboard:View(rank.period, rank.who, boardKey, rank.sorts[boardKey])
+  local board = view.board
+  Row(rows, Paint("GOLD", rank.period == "history" and "History" or "Current campaign"), nil,
+    { { label = "Now", fn = Window.SetRank, a = "period", b = "current" },
+      { label = "All", fn = Window.SetRank, a = "period", b = "history" } })
+  Row(rows, rank.who == "guilds" and "Guilds" or "Players", nil,
+    { { label = "Plyr", fn = Window.SetRank, a = "who", b = "players" },
+      { label = "Guild", fn = Window.SetRank, a = "who", b = "guilds" } })
+  Row(rows, board.title, nil,
+    { { label = "<", fn = Window.SetRank, a = "board", b = -1 }, { label = ">", fn = Window.SetRank, a = "board", b = 1 } })
+  if board.sorts.points then
+    local other = view.sortKey == "points" and "confirmed" or "points"
+    Row(rows, "  Sorted by " .. (view.sortKey == "points" and "Points" or "Confirmed"), nil,
+      { { label = "Sort", fn = Window.SetRank, a = "sort", b = other } })
+  end
+  local labels = {}
+  for index = 1, #board.columns do labels[#labels + 1] = board.columns[index].label end
+  Row(rows, Paint("GOLD", "  # " .. (rank.who == "guilds" and "Guild" or "Player")), Paint("GOLD", table.concat(labels, " / ")))
+  if #view.rows == 0 and view.empty then Row(rows, "  " .. Paint("DIM", "No ranking received yet.")) end
+  for index = 1, #view.rows do
+    local left, right = RankLine(view.rows[index], view, rank.who)
+    Row(rows, left, right)
+  end
+  if view.own then
+    if view.outside then
+      Row(rows, "  " .. Paint("DIM", "Outside the top 100 - " .. scoreboard.Format({ v = view.gap }, "v")
+        .. " more to reach the top 100"))
+    end
+    local left, right = RankLine(view.own, view, rank.who)
+    Row(rows, left, right)
+  end
+  Row(rows, "  " .. Paint("DIM", board.subtitle))
+  local updated = scoreboard.UpdatedText(view.updated)
+  if updated then Row(rows, "  " .. Paint("DIM", updated)) end
+  -- Decision 0110 § 6: the Companion hint, highlighted.
+  local hint = scoreboard.CompanionHint and scoreboard.CompanionHint()
+  if hint then Row(rows, "  " .. Paint("GOLD", hint)) end
   return rows
 end
 
@@ -640,12 +798,14 @@ function Window.GuideRows(now)
     .. " of its resource every " .. stock.GATHER_TICK .. "s.")
   Row(rows, "  " .. Paint("DIM", "Each place has one stock shared by everyone; it empties and slowly refills."))
   Header(rows, "2. Recruit")
-  Row(rows, "  Inside an Outpost or Settlement your faction holds, spend resources on units (Army tab).")
+  Row(rows, "  Inside your capital, or a Settlement or War Camp your faction holds, spend resources on units (Army tab).")
   Row(rows, "  " .. Paint("DIM", "Your reserve holds " .. army.RESERVE_CAPACITY
     .. " Unit Size; every cost, food included, is paid once at recruitment."))
   Header(rows, "3. Capture")
-  Row(rows, "  Stay inside an enemy or neutral Outpost with your PvP flag on until the bar is full.")
-  Row(rows, "  " .. Paint("DIM", "A strong garrison slows the capture. Hunting Grounds fill as you kill their creatures."))
+  Row(rows, "  Stay inside an enemy or neutral Outpost or War Camp with your PvP flag on until the bar is full.")
+  Row(rows, "  " .. Paint("DIM", "A strong garrison slows the capture. A War Camp always takes 3 minutes."))
+  Row(rows, "  " .. Paint("DIM", "War Camps your faction holds on a continent speed its scouts, armies and"
+    .. " Outpost and Settlement captures there (Front Network, Territory tab)."))
   Header(rows, "4. Garrison")
   Row(rows, "  Give units to an Outpost or Settlement of your faction (Garrison tab): they defend it.")
   Row(rows, "  " .. Paint("DIM", "A gift never comes back. Settlements also take gold and wood to reach levels 2 and 3."))
@@ -658,9 +818,9 @@ function Window.GuideRows(now)
   Row(rows, "  " .. Paint("DIM", "They travel, fight once on arrival and never come back."))
   Row(rows, "  " .. Paint("DIM", "Killing defenders locks the reinforcements of that place for a while."))
   Header(rows, "7. Conquer a Settlement")
-  Row(rows, "  Hold every Outpost and Hunting Grounds of its zone, empty its garrison and scout it.")
-  Row(rows, "  " .. Paint("DIM", "Then " .. capture.SIEGE_ATTACKERS .. " players stand inside for "
-    .. math.floor(capture.SETTLEMENT_DURATION / 60) .. " minutes. The War tab shows what is missing."))
+  Row(rows, "  Hold every Outpost of its zone and scout it; its garrison never blocks the attempt.")
+  Row(rows, "  " .. Paint("DIM", "Then " .. capture.SIEGE_ATTACKERS
+    .. " players stand inside. The garrison changes the capture time; the War tab shows what is missing."))
   Header(rows, "A living world")
   Row(rows, "  The war moves as players play: captures, armies and stocks change all the time.")
   Row(rows, "  " .. Paint("DIM", "Some news can arrive late. The Territory tab shows how fresh it is."))
@@ -672,9 +832,18 @@ end
 
 function Window:AskPledge(kind, count)
   local area = WF.Presence and WF.Presence.current
+  local garrison = WF.Garrison
+  local valid, reason = garrison and garrison:Check(kind, count)
+  if not area or not valid then
+    self.confirm = nil
+    self:SetStatus("Pledge refused: " .. tostring(reason or "you are not inside a garrison"), "BAD")
+    self:Refresh()
+    return false
+  end
   self.confirm = area and { id = area.id, kind = kind, count = count } or nil
   self:SetStatus(nil)
   self:Refresh()
+  return true
 end
 
 function Window:CancelPledge()
@@ -740,7 +909,7 @@ function Window:BuildTabs()
   while index <= #self.order do
     local button = create("Button", NAME .. "Tab" .. index, frame, "UIPanelButtonTemplate")
     button:SetHeight(22)
-    button:SetText(self.tabs[self.order[index]].title)
+    button:SetText(WF.L(self.tabs[self.order[index]].title))
     button.tabKey = self.order[index]
     button:SetScript("OnClick", function(self) Window:Select(self.tabKey) end)
     if button.tabKey == "garrison" then
@@ -752,8 +921,8 @@ function Window:BuildTabs()
         local tooltip = GetGlobal("GameTooltip")
         if not tooltip then return end
         tooltip:SetOwner(self, "ANCHOR_BOTTOM")
-        tooltip:AddLine("Garrison unavailable", 1, 1, 1)
-        tooltip:AddLine("Visit an Outpost or Settlement to manage its garrison.", 0.8, 0.8, 0.8, 1)
+  tooltip:AddLine(WF.L("Garrison unavailable"), 1, 1, 1)
+  tooltip:AddLine(WF.L("Visit an Outpost or Settlement to manage its garrison."), 0.8, 0.8, 0.8, 1)
         tooltip:Show()
       end)
       hit:SetScript("OnLeave", function()
@@ -766,14 +935,13 @@ function Window:BuildTabs()
     self.tabButtons[#self.tabButtons + 1] = button
     index = index + 1
   end
-  -- Every tab shares the width of the window evenly.
-  local width = math.floor((WIDTH - 2 * TAB_LEFT) / #self.tabButtons)
-  index = 1
+  WF.Skin:SizeTranslatedTabs(frame, self.tabButtons, self.tabs, WIDTH - 2 * TAB_LEFT, 4)
+  local left = TAB_LEFT
   for index = 1, #self.tabButtons do
     local button = self.tabButtons[index]
-    button:SetWidth(width - 4)
     button:ClearAllPoints()
-    button:SetPoint("TOPLEFT", frame, "TOPLEFT", TAB_LEFT + (index - 1) * width, -36)
+    button:SetPoint("TOPLEFT", frame, "TOPLEFT", left, -36)
+    left = left + button:GetWidth() + 4
   end
 end
 
@@ -806,6 +974,7 @@ function Window:Build()
   local ok, frame = pcall(create, "Frame", NAME, UIParent, "BackdropTemplate")
   if not ok or not frame then return nil end
   self.frame = frame
+  self:ApplyScale()
   frame:SetWidth(WIDTH)
   frame:SetHeight(-LIST_TOP + ROWS * ROW_HEIGHT + 40)
   frame:SetPoint("CENTER", UIParent, "CENTER", 0, 40)
@@ -830,7 +999,7 @@ function Window:Build()
 
   local title = frame:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
   title:SetPoint("TOP", frame, "TOP", 0, -16)
-  title:SetText("|cfff5ae0aWarfront|r |cff999999(classic)|r")
+  title:SetText("|cfff5ae0aWarfront|r |cff999999" .. WF.L("(classic)") .. "|r")
   local close = create("Button", NAME .. "Close", frame, "UIPanelCloseButton")
   close:SetPoint("TOPRIGHT", frame, "TOPRIGHT", -6, -6)
 
@@ -866,9 +1035,9 @@ function Window:Render(rows)
     local row = rows[self.offset + index] or {}
     local buttons = row.buttons and #row.buttons or 0
     local right = row.right or ""
-    slot.left:SetText(row.left or "")
+    slot.left:SetText(WF.L and WF.L(row.left or "") or row.left or "")
     slot.left:SetWidth(right ~= "" and LEFT_WITH_RIGHT or WIDTH - 40)
-    slot.right:SetText(right)
+    slot.right:SetText(WF.L and WF.L(right) or right)
     slot.right:ClearAllPoints()
     slot.right:SetPoint("TOPRIGHT", self.frame, "TOPRIGHT", -20 - buttons * (BUTTON_WIDTH + 2), slot.y)
     slot.right:SetWidth(WIDTH - 44 - LEFT_WITH_RIGHT - buttons * (BUTTON_WIDTH + 2))
@@ -879,7 +1048,7 @@ function Window:Render(rows)
       local action = row.buttons and row.buttons[column - (BUTTONS_PER_ROW - buttons)]
       button.action = action
       if action then
-        button:SetText(action.label)
+        button:SetText(WF.L and WF.L(action.label) or action.label)
         button:Show()
       else
         button:Hide()
@@ -890,7 +1059,8 @@ function Window:Render(rows)
   end
   if total > ROWS then
     local last = self.offset + ROWS
-    self.page:SetText((self.offset + 1) .. "-" .. last .. " of " .. total .. ", scroll for more")
+    local page = (self.offset + 1) .. "-" .. last .. " of " .. total .. ", scroll for more"
+    self.page:SetText(WF.L and WF.L(page) or page)
   else
     self.page:SetText("")
   end
@@ -969,7 +1139,7 @@ end
 function Window:Toggle()
   local frame = self:Build()
   if not frame then
-    WF.Print("the classic Warfront window is unavailable")
+    WF.Print(WF.L("The classic Warfront window is unavailable."))
     return false
   end
   if frame:IsShown() then frame:Hide() else frame:Show() end
@@ -981,4 +1151,5 @@ Window:AddTab("res", "Resources", Window.ResourceRows)
 Window:AddTab("army", "Army", Window.ArmyRows)
 Window:AddTab("garrison", "Garrison", Window.GarrisonRows, Window.InGarrison)
 Window:AddTab("war", "War", Window.WarRows)
+Window:AddTab("ranks", "Ranks", Window.RankRows)
 Window:AddTab("guide", "Guide", Window.GuideRows)

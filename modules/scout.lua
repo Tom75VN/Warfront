@@ -5,6 +5,7 @@ local Scout = {
   records = {},
   count = 0,
   out = {},
+  addressedOut = {},
   sent = 0,
   received = 0,
 }
@@ -36,13 +37,17 @@ local ZONES = {
   barrens = { 10133.33, 6756.25, "KA" },
 }
 local TARGET_TYPES = { OUTPOST = "Outpost", SETTLEMENT = "Settlement" }
-local ORIGIN_TYPES = { OUTPOST = true, SETTLEMENT = true, BARRACKS = true }
+local ORIGIN_TYPES = { OUTPOST = true, SETTLEMENT = true, CAPITAL = true }
 local FACTIONS = { H = true, A = true }
 local MAX_RECORDS = 128
 local MAX_PER_OWNER = 4
 local MAX_OP = 1000000000
-local MAX_GENERATION = 1000000
+-- The target's capture generation, bounded as in S lines (decision 0089).
+local MAX_GENERATION = 999999999
 local MAX_IDENTITY = 64
+-- Wire bound of an order's War Camp count (decision 0123 § 5); the real bound
+-- is the destination continent's catalog total, checked in Parse.
+local MAX_HELD = 999
 -- The owner repeats its order once, in case the first copy was lost.
 local REPEAT_AFTER = 10
 -- Catch-up: one request per channel join (at most one per minute), answered
@@ -56,6 +61,13 @@ local REPLY_MATCHES = 2
 local REPLY_ANY = 4
 local SEND_GAP = 1
 local QUEUE_ROOM = 4
+-- Addressed catch-up (decision 0077 § 5f): outside the channel and the group,
+-- the same request goes by whisper to ADDRESSED_TARGETS guild peers or
+-- contacts (modules/transport.lua), and a whispered request is answered to its
+-- asker alone, without the R14 cancellation nobody else could hear: at most
+-- ADDRESSED_LINES records per asker, once per minute per asker
+-- (Transport:MayAnswer), one line per second through the same queue room.
+local ADDRESSED_TARGETS, ADDRESSED_LINES, ADDRESSED_MAX = 2, 16, 48
 local PRUNE_INTERVAL = 1
 local SAVE_INTERVAL = 5
 local SCHEMA = 1
@@ -91,6 +103,10 @@ end
 
 local function Print(text)
   if WF.Print then WF.Print(text) end
+end
+
+local function Alert(category, text, options)
+  if WF.Alerts and WF.Alerts.Push then WF.Alerts:Push(category, text, options) else Print(text) end
 end
 
 local function Int(text, maximum)
@@ -163,6 +179,26 @@ function Scout:Travel(origin, target)
   if seconds < SAME_ZONE_MIN then return SAME_ZONE_MIN end
   if seconds > SAME_ZONE_MAX then return SAME_ZONE_MAX end
   return seconds
+end
+
+-- Front Network travel (decision 0123 § 5): the base travel time reduced by
+-- the order faction's network on the destination continent, from the held
+-- count snapshotted at departure. Nil when held is outside 0..total of the
+-- shipped catalog, or without travel data. The same for scouts and armies.
+function Scout:OrderTravel(origin, target, held)
+  local base = self:Travel(origin, target)
+  if not base or type(held) ~= "number" then return nil end
+  local network = WF.FrontNetwork
+  if not network then return held == 0 and base or nil end
+  return network:TravelDuration(base, target, held)
+end
+
+-- The duration and held snapshot of an order leaving now toward target for
+-- faction, from the accepted owner registry. Later camp captures never move it.
+function Scout:DepartureTravel(origin, target, faction)
+  local network = WF.FrontNetwork
+  local held = network and network:TravelSnapshot(target, faction) or 0
+  return self:OrderTravel(origin, target, held), held
 end
 
 -- Records -------------------------------------------------------------------
@@ -310,7 +346,7 @@ function Scout:Learn(owner, f, direct, now)
   if not self:MakeRoom(now) then return nil, false end
   r = {
     key = key, owner = owner, op = f.op, target = f.target, origin = f.origin, gen = f.gen,
-    dur = f.dur, fac = f.fac, depart = depart, direct = direct,
+    dur = f.dur, fac = f.fac, held = f.held or 0, depart = depart, direct = direct,
   }
   self.records[key] = r
   self.count = self.count + 1
@@ -330,11 +366,12 @@ end
 
 local function Body(r, now)
   return r.target .. "," .. r.origin .. "," .. r.op .. "," .. r.gen .. "," .. r.dur .. ","
-    .. Floor(math.max(0, now - r.depart)) .. "," .. r.fac
+    .. Floor(math.max(0, now - r.depart)) .. "," .. r.fac .. "," .. (r.held or 0)
 end
 
--- SC <target>,<origin>,<op>,<gen>,<dur>,<elapsed>,<fac>: the owner's order, an
--- event, never replaced (rule R12).
+-- SC <target>,<origin>,<op>,<gen>,<dur>,<elapsed>,<fac>,<held>: the owner's
+-- order, an event, never replaced (rule R12). held is the War Camp count of
+-- the order's faction on the destination continent at departure (0123 § 5).
 function Scout:SendOrder(r, now)
   return self:Send("SC", Body(r, now), nil, true)
 end
@@ -353,7 +390,7 @@ function Scout:Check(targetId, now)
   if not talk then return nil, lockReason or "you cannot take part in the conquest yet" end
   local mine = self:Mine(now)
   if mine then return nil, "your scout is still travelling (" .. Clock(Arrival(mine) - now) .. " left)" end
-  local origin, why = army:Place()
+  local origin, why = army:DeparturePlace()
   if not origin then return nil, why end
   local target = self:Target(targetId)
   if not target then return nil, "only an Outpost or a Settlement can be scouted" end
@@ -368,9 +405,9 @@ function Scout:Check(targetId, now)
   if travelling then
     return nil, "a scout of your faction is already on its way (" .. Clock(Arrival(travelling) - now) .. " left)"
   end
-  local duration = self:Travel(origin, target)
+  local duration, held = self:DepartureTravel(origin, target, faction)
   if not duration then return nil, "no travel data for this map" end
-  return origin, target, duration, generation
+  return origin, target, duration, generation, held
 end
 
 -- Sends the player's scout: it leaves the reserve at once and for good. op is
@@ -378,20 +415,22 @@ end
 -- recruitment). Returns true, record or false, reason.
 function Scout:Launch(targetId, op)
   local now = Now()
-  local origin, target, duration, generation = self:Check(targetId, now)
+  local origin, target, duration, generation, held = self:Check(targetId, now)
   if not origin then return false, target end
   local reserve = WF.Army:Reserve()
   if op ~= reserve.sop then return false, "request already done or out of date" end
   local me = Me()
   local f = {
     target = target.id, origin = origin.id, op = reserve.sop + 1, gen = generation, dur = duration,
-    el = 0, fac = MyFaction(),
+    el = 0, fac = MyFaction(), held = held,
   }
   if self.records[me .. "#" .. f.op] then return false, "request already done or out of date" end
   local r = self:Learn(me, f, true, now)
   if not r then return false, "too many scouts known" end
   reserve.SCOUT = reserve.SCOUT - 1
   reserve.sop = f.op
+  -- War effort (decision 0126 § 5): a scout sent counts its full cost.
+  if WF.WarRecord then WF.WarRecord:Add("attack", "SCOUT", 1) end
   r.repeatAt = now + REPEAT_AFTER
   self:SendOrder(r, now)
   Record("SCOUT_SENT", { target = f.target, origin = f.origin, op = f.op, gen = f.gen, dur = f.dur })
@@ -410,8 +449,9 @@ function Scout:Command(text)
     Print("scout refused: " .. tostring(result))
     return
   end
-  Print(WF.Army:Name("SCOUT") .. " sent to " .. self:Label(id) .. ", arrives in " .. Clock(result.dur)
-    .. "; it is discovered for your faction for one hour from its arrival")
+  Alert("orders", WF.Army:Name("SCOUT") .. " sent to " .. self:Label(id) .. ", arrives in "
+    .. Clock(result.dur) .. "; it is discovered for your faction for one hour from its arrival",
+    { title = "Order sent", side = result.fac })
 end
 
 -- Reception -----------------------------------------------------------------
@@ -421,14 +461,17 @@ function Scout:Reject(reason, sender)
 end
 
 -- Fields shared by SC and SL, strictly checked (rule R2); the duration must
--- be the catalog's (same WF level, same catalog).
+-- be the catalog's (same WF level, same catalog), reduced by the order's own
+-- held count (decision 0123 § 5): never the receiver's current owner view, so
+-- an honest order is accepted while War Camp owners still differ.
 function Scout:Parse(parts, maxElapsed)
   local f = {
     target = parts[1], origin = parts[2],
     op = Int(parts[3], MAX_OP), gen = Int(parts[4], MAX_GENERATION), dur = Int(parts[5], OTHER_CONTINENT),
-    fac = parts[7],
+    fac = parts[7], held = Int(parts[8], MAX_HELD),
   }
   if not f.op or not f.gen or not f.dur or f.op < 1 then return nil, "bad scout number" end
+  if not f.held then return nil, "bad scout network" end
   f.el = Int(parts[6], f.dur + (maxElapsed or 0))
   if not f.el then return nil, "bad scout elapsed time" end
   if not FACTIONS[f.fac or ""] then return nil, "bad scout faction" end
@@ -437,13 +480,23 @@ function Scout:Parse(parts, maxElapsed)
   if not origin or not ORIGIN_TYPES[origin.type] or origin.id == target.id then
     return nil, "bad scout origin"
   end
-  if self:Travel(origin, target) ~= f.dur then return nil, "bad scout duration" end
+  local expected = self:OrderTravel(origin, target, f.held)
+  if not expected then return nil, "bad scout network" end
+  if expected ~= f.dur then return nil, "bad scout duration" end
   return f
 end
 
 local function ValidOwner(text)
-  return type(text) == "string" and #text <= MAX_IDENTITY
-    and string.find(text, "^[^,@]+@[^,@]+$") ~= nil
+  return type(text) == "string" and #text <= MAX_IDENTITY and WF.Names
+    and WF.Names.Valid(text) and WF.Names.Complete(text)
+end
+
+-- Saved level-6 records written before decision 0096 still carry @realm. They
+-- are local data, so strip that suffix once while loading; current wire data is
+-- required to use the realm-free identity.
+local function SavedOwner(text)
+  local owner = WF.Names and WF.Names.Short(text) or text
+  if ValidOwner(owner) then return owner end
 end
 
 -- R14: our pending answer is cancelled after two other answers matching
@@ -467,29 +520,40 @@ end
 function Scout:OnMessage(kind, parts, sender, now)
   self.received = self.received + 1
   if kind == "SC" then
-    if #parts ~= 7 then return self:Reject("bad SC field count", sender) end
+    if #parts ~= 8 then return self:Reject("bad SC field count", sender) end
     local f, err = self:Parse(parts, 0)
     if not f then return self:Reject(err, sender) end
     -- Identity: the chat sender, never a field (rule R1).
     self:Learn(sender, f, true, now)
     return true
   elseif kind == "SL" then
-    if #parts ~= 8 then return self:Reject("bad SL field count", sender) end
+    -- A whispered answer ends our addressed rounds (decision 0077 § 5f).
+    if WF.Capture and WF.Capture.addressedFrom then self.pullAnswered = true end
+    if #parts ~= 9 then return self:Reject("bad SL field count", sender) end
     local f, err = self:Parse(parts, DISCOVERY)
     if not f then return self:Reject(err, sender) end
-    if not ValidOwner(parts[8]) then return self:Reject("bad SL owner", sender) end
+    if not ValidOwner(parts[9]) then return self:Reject("bad SL owner", sender) end
     -- Our own scouts are known and saved locally: a relay about them could
     -- only be a forgery blocking our next scout.
-    if parts[8] == Me() then
-      self:SeeReply(sender, self.records[parts[8] .. "#" .. f.op] ~= nil)
+    if parts[9] == Me() then
+      self:SeeReply(sender, self.records[parts[9] .. "#" .. f.op] ~= nil)
       return true
     end
     -- A relay about a third party: data, never the relayer's identity.
-    local _, new = self:Learn(parts[8], f, false, now)
+    local _, new = self:Learn(parts[9], f, false, now)
     self:SeeReply(sender, not new)
     return true
   elseif kind == "SQ" then
     if #parts ~= 1 or parts[1] ~= "*" then return self:Reject("bad SQ", sender) end
+    local asker = WF.Capture and WF.Capture.addressedFrom
+    if asker then
+      local transport = WF.Transport
+      if self.count > 0 and transport and type(transport.MayAnswer) == "function"
+          and transport:MayAnswer("SQ", asker, now) then
+        self:AnswerTo(asker, now)
+      end
+      return true
+    end
     if self.count > 0 and not self.replyAt then
       self.replyAt = now + REPLY_MIN + math.random() * REPLY_SPREAD
       self.replyAny, self.replyMatch = nil, nil
@@ -514,7 +578,7 @@ local function QueueRoom()
   return queue:Pending() < QUEUE_ROOM
 end
 
--- SL <target>,<origin>,<op>,<gen>,<dur>,<elapsed>,<fac>,<owner>: one known
+-- SL <target>,<origin>,<op>,<gen>,<dur>,<elapsed>,<fac>,<held>,<owner>: one known
 -- scout, elapsed since its departure; replaceable, dropped first (rule R13).
 function Scout:Answer(now)
   self.replyAt = nil
@@ -526,13 +590,49 @@ function Scout:Answer(now)
   table.sort(self.out, function(a, b) return a.key < b.key end)
 end
 
+-- A whispered SQ: our records to that asker alone (decision 0077 § 5f).
+function Scout:AnswerTo(target, now)
+  self:Prune(now)
+  local keys = {}
+  for key in pairs(self.records) do keys[#keys + 1] = key end
+  table.sort(keys)
+  for i = 1, math.min(#keys, ADDRESSED_LINES) do
+    if #self.addressedOut >= ADDRESSED_MAX then break end
+    self.addressedOut[#self.addressedOut + 1] = { key = keys[i], target = target }
+  end
+end
+
+-- The same request whispered to a few guild peers or contacts (decision 0077
+-- § 5f); at most once per QUERY_GAP.
+function Scout:PullAddressed(now)
+  now = now or Now()
+  if self.pulledAt and now - self.pulledAt < QUERY_GAP then return false end
+  if self.pullAnswered then return false end
+  local transport, capture = WF.Transport, WF.Capture
+  if not transport or type(transport.PullTargets) ~= "function" or not capture
+      or type(capture.SendTo) ~= "function" then
+    return false
+  end
+  local targets = transport:PullTargets(ADDRESSED_TARGETS, now)
+  if #targets == 0 then return false end
+  self.pulledAt = now
+  local sent = 0
+  for i = 1, #targets do
+    if capture:SendTo(targets[i], "SQ", "*") then sent = sent + 1 end
+  end
+  self.pulls = (self.pulls or 0) + sent
+  return sent > 0
+end
+
 -- Driver --------------------------------------------------------------------
 
 function Scout:Tick(now)
   if not self.loaded then self:Load() end
+  if not self.loaded then return end
   if self.queryAt and now >= self.queryAt then
     self.queryAt = nil
     self:Send("SQ", "*")
+    self:PullAddressed(now)
   end
   if self.replyAt and now >= self.replyAt then self:Answer(now) end
   if #self.out > 0 and now >= (self.nextSendAt or 0) and QueueRoom() then
@@ -543,11 +643,30 @@ function Scout:Tick(now)
       self.answers = (self.answers or 0) + 1
     end
     self.nextSendAt = now + SEND_GAP
+  elseif #self.addressedOut > 0 and now >= (self.nextSendAt or 0) and QueueRoom() then
+    local line = table.remove(self.addressedOut, 1)
+    local r = self.records[line.key]
+    if r and WF.Capture and WF.Capture:SendTo(line.target, "SL", Body(r, now) .. "," .. r.owner, "SL:" .. line.target .. ":" .. line.key) then
+      self.answers = (self.answers or 0) + 1
+    end
+    self.nextSendAt = now + SEND_GAP
   end
   local mine = self:Mine(now)
   if mine and mine.repeatAt and now >= mine.repeatAt then
     mine.repeatAt = nil
     self:SendOrder(mine, now)
+  end
+  local me = Me()
+  for _, r in pairs(self.records) do
+    if r.owner == me and not r.alerted and Arrival(r) <= now then
+      local _, finish = self:Discovery(r.target, r.fac, now)
+      if finish then
+        r.alerted = true
+        self.dirty = true
+        Alert("scouts", self:Label(r.target) .. " discovered: " .. Clock(finish - now) .. " left",
+          { title = "Scout arrived", side = r.fac })
+      end
+    end
   end
   if not self.lastPruneAt or now - self.lastPruneAt >= PRUNE_INTERVAL then
     self.lastPruneAt = now
@@ -596,17 +715,30 @@ function Scout:Store()
   return entry
 end
 
-function Scout:Save()
+-- Campaign end (decision 0102 § 4): discoveries and scouts on their way are
+-- cleared; nothing comes back.
+function Scout:ResetCampaign()
+  self.records, self.count = {}, 0
+  self.out, self.addressedOut = {}, {}
+  self.replyAt = nil
   local entry = self:Store()
+  if entry then entry.records = {} end
   self.dirty = nil
+end
+
+function Scout:Save()
+  if not self.loaded then self:Load() end
+  if not self.loaded then return end
+  local entry = self:Store()
   if not entry then return end
+  self.dirty = nil
   local now = Now()
   entry.at = Wall()
   entry.records = {}
   for key, r in pairs(self.records) do
     entry.records[key] = {
       owner = r.owner, op = r.op, target = r.target, origin = r.origin, gen = r.gen, dur = r.dur, fac = r.fac,
-      el = Floor(math.max(0, now - r.depart)),
+      held = r.held or 0, el = Floor(math.max(0, now - r.depart)), alerted = r.alerted and true or nil,
     }
   end
 end
@@ -614,22 +746,27 @@ end
 -- Restores the saved scouts, aged by the wall time spent offline; the same
 -- checks as a received record.
 function Scout:Load()
-  self.loaded = true
   local entry = self:Store()
   if not entry then return end
   local now = Now()
   local away = math.max(0, Wall() - (tonumber(entry.at) or Wall()))
   for key, saved in pairs(entry.records) do
-    if type(saved) == "table" and ValidOwner(saved.owner) then
+    local owner = type(saved) == "table" and SavedOwner(saved.owner) or nil
+    if owner then
       local el = (tonumber(saved.el) or 0) + away
       local parts = { tostring(saved.target), tostring(saved.origin), tostring(saved.op), tostring(saved.gen),
         tostring(saved.dur), tostring(Floor(math.min(el, (tonumber(saved.dur) or 0) + DISCOVERY))),
-        tostring(saved.fac) }
+        -- Saved before decision 0123: no held count, an unreduced duration.
+        tostring(saved.fac), tostring(saved.held or 0) }
       local f = self:Parse(parts, DISCOVERY)
-      if f then self:Learn(saved.owner, f, false, now) end
+      if f then
+        local r = self:Learn(owner, f, false, now)
+        if r and saved.alerted then r.alerted = true end
+      end
     end
   end
   self.dirty = nil
+  self.loaded = true
 end
 
 -- Display -------------------------------------------------------------------
@@ -712,15 +849,15 @@ function Scout:PrintStatus()
     end
   end
   if shown == 0 and not mine then Print("no scouting under way for your faction") end
-  local origin = WF.Army and WF.Army:Place()
+  local origin = WF.Army and WF.Army:DeparturePlace()
   if not origin then
-    Print("send a scout from an Outpost or Settlement of your faction: /wf scout <POI id>")
+    Print("send a scout from your capital or an Outpost or Settlement of your faction: /wf scout <POI id>")
     return
   end
   for id, area in pairs(WF.Map.areas) do
     local owner = self:Target(id) and WF.Capture:TargetOwner(id)
     if FACTIONS[owner or ""] and owner ~= faction then
-      local duration = self:Travel(origin, area)
+      local duration = self:DepartureTravel(origin, area, faction)
       Print("/wf scout " .. id .. " - " .. (area.label or TARGET_TYPES[area.type]) .. ", "
         .. (duration and Clock(duration) or "no travel data"))
     end

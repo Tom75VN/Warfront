@@ -68,10 +68,10 @@ if JoinPermanentChannel then
   end
 end
 
--- 1.12 map file names by Forever uiMapID. Map names are localized, so maps
--- are matched by ID (UiMap.db2, build 1.60.1.69913; checked in-game on a
--- frFR client, 2026-11-07). 947 "Azeroth" is the world map; 1463 and 1464
--- are the second continent maps that UiMap.db2 also lists.
+-- Stable POI map keys by Forever uiMapID. Map names are localized, so maps
+-- are matched by ID (UiMap.db2, build 1.60.1.70291; localization behavior
+-- checked in-game on a frFR client, 2026-11-07). 947 "Azeroth" is the world
+-- map; 1463 and 1464 are the second continent maps that UiMap.db2 also lists.
 local MAP_KEYS = {
   [947] = "World",
   [1414] = "Kalimdor",
@@ -79,11 +79,59 @@ local MAP_KEYS = {
   [1415] = "Azeroth",
   [1463] = "Azeroth",
   [1411] = "Durotar",
+  [1412] = "Mulgore",
   [1413] = "Barrens",
+  [1416] = "Alterac",
   [1417] = "Arathi",
+  [1418] = "Badlands",
+  [1419] = "BlastedLands",
+  [1420] = "Tirisfal",
+  [1421] = "Silverpine",
+  [1422] = "WesternPlaguelands",
+  [1423] = "EasternPlaguelands",
   [1424] = "Hilsbrad",
+  [1425] = "Hinterlands",
+  [1426] = "DunMorogh",
+  [1427] = "SearingGorge",
+  [1428] = "BurningSteppes",
   [1429] = "Elwynn",
+  [1430] = "DeadwindPass",
+  [1431] = "Duskwood",
+  [1432] = "LochModan",
+  [1433] = "Redridge",
+  [1434] = "Stranglethorn",
+  [1435] = "SwampOfSorrows",
   [1436] = "Westfall",
+  [1437] = "Wetlands",
+  [1438] = "Teldrassil",
+  [1439] = "Darkshore",
+  [1440] = "Ashenvale",
+  [1441] = "ThousandNeedles",
+  [1442] = "StonetalonMountains",
+  [1443] = "Desolace",
+  [1444] = "Feralas",
+  [1445] = "Dustwallow",
+  [1446] = "Tanaris",
+  [1447] = "Aszhara",
+  [1448] = "Felwood",
+  [1449] = "UngoroCrater",
+  [1450] = "Moonglade",
+  [1451] = "Silithus",
+  [1452] = "Winterspring",
+  [1453] = "StormwindCity",
+  [1454] = "Orgrimmar",
+  -- Measured in game 2026-11-12 (/frp mapbounds v2): Forgefer, Thunder Bluff,
+  -- Darnassus and Fossoyeuse on the frFR client.
+  [1455] = "Ironforge",
+  [1456] = "ThunderBluff",
+  [1457] = "Darnassus",
+  [1458] = "Undercity",
+  [2482] = "Hyjal",
+  [2521] = "ZephrasIsle",
+  -- Forever zones Riverglades (area 16591) and Shen'dralas (area 16651),
+  -- UiMap IDs from the wowdata.app catalog, build 1.60.1.69893.
+  [2548] = "Riverglades",
+  [2652] = "Shendralas",
 }
 Compat.MAP_KEYS = MAP_KEYS
 
@@ -179,6 +227,18 @@ api.GetPlayerMapPosition = function(unit)
   end
   if type(x) ~= "number" or type(y) ~= "number" then return 0, 0 end
   return x, y
+end
+
+-- A single player-map snapshot, independent of the world map's selection.
+function Compat.GetPlayerZonePosition()
+  local mapID = PlayerMapID()
+  if not mapID or not C_Map or not C_Map.GetPlayerMapPosition then return nil end
+  local position = C_Map.GetPlayerMapPosition(mapID, "player")
+  if not position then return nil end
+  local x, y
+  if type(position.GetXY) == "function" then x, y = position:GetXY()
+  else x, y = position.x, position.y end
+  return MapName(mapID), x, y
 end
 
 function Compat.GetWorldMapCanvas()

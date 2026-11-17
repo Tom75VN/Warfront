@@ -21,6 +21,9 @@ local Capture = {
   -- Cloud owners of the import (decision 0060): one entry per POI, apart from
   -- the P2P hints, never persisted nor sent.
   cloud = {},
+  ownerRevision = 0,
+  queryRevision = 0,
+  mapDirty = {},
   -- Sender faction for the hint quorum. Only the chat language may fill it,
   -- once risk B12 is measured on OctoWoW; empty until then (decision 0038).
   senderFactions = {},
@@ -33,6 +36,9 @@ local Capture = {
   received = 0,
   ignored = 0,
   duplicates = 0,
+  -- AC-2 measurement (decision 0093): relayer -> tally; diagnostics only.
+  relayTally = {},
+  relayTallyCount = 0,
 }
 
 WF.Capture = Capture
@@ -42,16 +48,37 @@ WF.Capture = Capture
 -- C contested or frozen, D return.
 local CAPTURE_DURATION = 180
 local DECAY_DURATION = 360
--- Each attempt carries its own full-bar duration, fixed when it starts and
--- announced in S (decision 0053): an Outpost from its garrison's defense,
--- 180 to 1,200 s (decision 0047); a Settlement always 600 s. An empty area
--- returns at half the attempt's speed.
-local MAX_DURATION = 1200
+-- Each attempt carries its current full-bar duration in S. The authority
+-- recomputes it from occupied Garrison Capacity whenever the garrison changes,
+-- without changing the current capture percentage (decision 0082).
+local OUTPOST_MAX_DURATION = 480
 local SETTLEMENT_DURATION = 600
+local SETTLEMENT_MAX_DURATION = 1080
+-- A capital attempt (decision 0103 § 2): 30 minutes, no garrison, so fixed.
+local CAPITAL_DURATION = 1800
+local MAX_DURATION = CAPITAL_DURATION
+-- A War Camp attempt (decision 0123 § 3): always 3 minutes, no garrison, no
+-- Front Network reduction; only the layer arena's half speed doubles it.
+local WAR_CAMP_DURATION = 180
+-- Defensive Coordination (decision 0123 § 6): the moving faction's Front
+-- Network shortens an Outpost or Settlement push by up to 35 %, so the fastest
+-- accepted durations are ceil(180 * 0.65) and ceil(600 * 0.65).
+local OUTPOST_MIN_DURATION = 117
+local SETTLEMENT_MIN_DURATION = 390
 -- A Settlement attempt needs two attackers to open and to advance.
 local SIEGE_ATTACKERS = 2
--- Plausibility bound: the fastest attempt.
-local MAX_RATE = 1000 / CAPTURE_DURATION
+-- A capital attempt needs five (decision 0103 § 2).
+local CAPITAL_ATTACKERS = 5
+-- Plausibility bound: the fastest attempt, an Outpost at the full Front
+-- Network reduction (decision 0123 § 6).
+local MAX_RATE = 1000 / OUTPOST_MIN_DURATION
+-- Scoreboard credit (decision 0126 § 2): a player counted inside during the
+-- last CREDIT_RECENT seconds of an attempt shares its capture or defense; a
+-- defense needs the attempt to have reached DEFENSE_MIN_PROGRESS thousandths.
+-- recentIn keeps at most MAX_RECENT_IN players per POI (R9). Local only.
+local CREDIT_RECENT = 60
+local DEFENSE_MIN_PROGRESS = 250
+local MAX_RECENT_IN = 64
 local PRESENCE_INTERVAL = 10
 local PRESENCE_TTL = 25
 -- A defender of an idle POI it owns, with no rival in sight, slows down; each
@@ -97,8 +124,18 @@ local QUOTA_TOTAL = 48
 local QUOTA_BY_KIND = {
   S = 40, P = 20, Q = 6, HQ = 6, H = 10, K = 20, OD = 4, OL = 12, X = 20, G = 20, GD = 6, GQ = 6,
   SC = 6, SQ = 6, SL = 20, AC = 6, AQ = 6, AL = 20, AR = 10,
+  -- FW, FQ: siege window start and its request (modules/front.lua, decision 0098).
+  FW = 6, FQ = 6,
   -- T, TQ: membership ticket and its request (modules/ticket.lua, decision 0061).
   T = 6, TQ = 6,
+  -- Board copies (decision 0110): a holder sends one piece per 4 s at most.
+  BP = 4, BD = 2, BQ = 2,
+  -- LJ, LN: a request to join a layer and its refusal (decision 0119 step 4).
+  LJ = 2, LN = 4,
+  -- CE, CQ, CL: campaign end, its request and answers (modules/campaign.lua,
+  -- decision 0103 § 4b): two CE per confirmation, one CQ a minute, CL one a
+  -- second and at most 8 per request.
+  CE = 6, CQ = 4, CL = 10,
 }
 -- Owner claims nobody here saw happen (decision 0038): relayed S and H, OL
 -- catch-up lines, K beyond the next capture. They are hints, never confirmed
@@ -106,9 +143,19 @@ local QUOTA_BY_KIND = {
 local HINT_SENDERS = 4
 local HINT_TTL = 900
 local HINT_JUMP = 10
--- Generation floor (decision 0060): values this close to the wire bound (1,000,000)
--- are ignored, so a forged generation can never make the next capture unrepresentable.
+-- A hint is promoted at most this far above the registry (decision 0089): far
+-- beyond any honest gap, so walking a forged generation up needs many quorums.
+local PROMOTE_JUMP = 100000
+-- Generation floor (decision 0060): cloud entries and hints near 1,000,000, the
+-- bound of catch-up lines and the cloud, are ignored.
 local FLOOR_MAX = 990000
+-- Wire bound of a generation in S lines (decision 0089): far beyond honest reach.
+local MAX_GENERATION = 999999999
+-- A live S may raise the generation at most LIVE_JUMP above the local floor,
+-- and jump more than HINT_JUMP once per JUMP_COOLDOWN seconds (decision 0089
+-- B2): a far-behind client still catches up, a forged value cannot be walked up.
+local LIVE_JUMP = 100000
+local JUMP_COOLDOWN = 600
 local CLOUD_RANKS = { U = 0, C = 1, Q = 2, W = 3, D = 4 }
 -- Rule R14 with two answers: a pending reply waits for two matching answers
 -- from distinct senders, or four of any kind, before it is dropped.
@@ -122,11 +169,22 @@ local CAMPAIGN = "permanent"
 Capture.CAPTURE_DURATION = CAPTURE_DURATION
 Capture.DECAY_DURATION = DECAY_DURATION
 Capture.MAX_DURATION = MAX_DURATION
+Capture.OUTPOST_MAX_DURATION = OUTPOST_MAX_DURATION
 Capture.SETTLEMENT_DURATION = SETTLEMENT_DURATION
+Capture.SETTLEMENT_MAX_DURATION = SETTLEMENT_MAX_DURATION
 Capture.SIEGE_ATTACKERS = SIEGE_ATTACKERS
+Capture.CAPITAL_DURATION = CAPITAL_DURATION
+Capture.CAPITAL_ATTACKERS = CAPITAL_ATTACKERS
+Capture.WAR_CAMP_DURATION = WAR_CAMP_DURATION
+Capture.OUTPOST_MIN_DURATION = OUTPOST_MIN_DURATION
+Capture.SETTLEMENT_MIN_DURATION = SETTLEMENT_MIN_DURATION
 
 local FACTION_KEYS = { H = "HORDE", A = "ALLIANCE" }
 local FACTION_CODES = { HORDE = "H", ALLIANCE = "A" }
+-- Saved owners: a faction, or NEUTRAL above generation 0 after a failed siege
+-- (decision 0098).
+local OWNER_CODES = { HORDE = "H", ALLIANCE = "A", NEUTRAL = "N" }
+local OWNER_KEYS = { H = "HORDE", A = "ALLIANCE", N = "NEUTRAL" }
 local FACTION_NAMES = { H = "Horde", A = "Alliance", N = "Neutral" }
 local OWNERS = { N = true, H = true, A = true }
 local SIDES = { ["-"] = true, H = true, A = true }
@@ -215,11 +273,13 @@ local function Int(text, maximum)
   return value
 end
 
+local ArenaToken
 local function Copy(st)
   return {
     id = st.id, owner = st.owner, generation = st.generation,
     challenger = st.challenger, progress = st.progress, mode = st.mode, dir = st.dir,
     nH = st.nH, nA = st.nA, epoch = st.epoch, seq = st.seq, dur = st.dur, siege = st.siege,
+    capital = st.capital, arena = st.arena, slowed = st.slowed,
   }
 end
 
@@ -228,7 +288,8 @@ local function CopyInto(view, st)
   view.id, view.owner, view.generation = st.id, st.owner, st.generation
   view.challenger, view.progress, view.mode, view.dir = st.challenger, st.progress, st.mode, st.dir
   view.nH, view.nA, view.epoch, view.seq = st.nH, st.nA, st.epoch, st.seq
-  view.dur, view.siege = st.dur, st.siege
+  view.dur, view.siege, view.capital = st.dur, st.siege, st.capital
+  view.arena, view.slowed = st.arena, st.slowed
   return view
 end
 
@@ -338,7 +399,7 @@ local function Realm()
   return "unknown"
 end
 
--- "First Surname@Realm" (decision 0070): see core/names.lua.
+-- Realm-free "First Surname" (decision 0096): see core/names.lua.
 function Capture.Identity(name)
   return WF.Names.Identity(name)
 end
@@ -365,31 +426,43 @@ end
 -- Catalogue and ownership -----------------------------------------------------
 
 -- A POI with the timed presence bar: an OUTPOST or, since decision 0053, a
--- SETTLEMENT (its attempts gated by Capture:SiegeMode).
-local TIMED_TYPES = { OUTPOST = true, SETTLEMENT = true }
+-- SETTLEMENT (its attempts gated by Capture:SiegeMode). A CAPITAL has it only
+-- while its siege window runs (decision 0103 § 2), so a busy city sends no
+-- presence the rest of the time. A WAR_CAMP (decision 0123) uses the Outpost
+-- bar with a fixed duration, active on and off the campaign routes.
+local TIMED_TYPES = { OUTPOST = true, SETTLEMENT = true, WAR_CAMP = true }
+-- Owner registry: a CAPITAL always, held by its faction outside a fall.
+local OWNED_TYPES = { OUTPOST = true, SETTLEMENT = true, CAPITAL = true, WAR_CAMP = true }
+
+local function CapitalLive(id)
+  local front = WF.Front
+  return front ~= nil and type(front.CapitalLive) == "function" and front:CapitalLive(id, Now())
+end
 
 function Capture:Outpost(id)
   local map = WF.Map
   local area = map and type(id) == "string" and map.areas[id] or nil
-  if area and TIMED_TYPES[area.type] and area.enabled then return area end
-  return nil
-end
-
--- OUTPOST, SETTLEMENT and HUNTING_GROUNDS share one owner registry; hunting
--- grounds use modules/hunting.lua instead of the timed bar (decision 0026).
-function Capture:Capturable(id)
-  -- Unsupported rulesets (RP, Hardcore, unknown) capture nothing (decision 0072).
-  if WF.Ruleset and not WF.Ruleset:Supported() then return nil end
-  local map = WF.Map
-  local area = map and type(id) == "string" and map.areas[id] or nil
-  if area and area.enabled and (TIMED_TYPES[area.type] or area.type == "HUNTING_GROUNDS") then
+  if area and area.enabled and (TIMED_TYPES[area.type] or (area.type == "CAPITAL" and CapitalLive(id))) then
     return area
   end
   return nil
 end
 
--- Objectives linked to a Settlement (decision 0053): every enabled OUTPOST
--- and HUNTING_GROUNDS of its map, sorted by id.
+-- OUTPOST, SETTLEMENT and CAPITAL share one owner registry; the first two
+-- the timed capture bar.
+function Capture:Capturable(id)
+  -- Unsupported rulesets (RP, Hardcore, unknown) capture nothing (decision 0072).
+  if WF.Ruleset and not WF.Ruleset:Supported() then return nil end
+  local map = WF.Map
+  local area = map and type(id) == "string" and map.areas[id] or nil
+  if area and area.enabled and OWNED_TYPES[area.type] then
+    return area
+  end
+  return nil
+end
+
+-- Objectives linked to a Settlement (decision 0091): every enabled OUTPOST of
+-- its map, sorted by id.
 function Capture:LinkedObjectives(id)
   local links = {}
   local map = WF.Map
@@ -397,7 +470,7 @@ function Capture:LinkedObjectives(id)
   if not settlement or settlement.type ~= "SETTLEMENT" then return links end
   for other, area in pairs(map.areas) do
     if type(area) == "table" and area.enabled and area.map == settlement.map
-        and (area.type == "OUTPOST" or area.type == "HUNTING_GROUNDS") then
+        and area.type == "OUTPOST" then
       links[#links + 1] = other
     end
   end
@@ -405,44 +478,47 @@ function Capture:LinkedObjectives(id)
   return links
 end
 
--- Full-bar duration of an Outpost attempt from its garrison's total defense
--- (decision 0047): 180 + floor(1020 x DEF x size_best / (12 x DEF_best)),
--- capped at 1,200, where DEF_best / size_best is the best DEF per Unit Size.
-function Capture.DefenseDuration(defense)
-  local units = WF.Army and WF.Army.UNITS
-  if not units or defense <= 0 then return CAPTURE_DURATION end
-  local bestDef, bestSize = 0, 1
-  for key, unit in pairs(units) do
-    if (unit.def or 0) > 0 and unit.size and unit.def * bestSize > bestDef * unit.size then
-      bestDef, bestSize = unit.def, unit.size
-    end
+-- Full-bar duration from occupied Garrison Capacity (decision 0082). Equal
+-- occupancy always gives equal capture resistance; composition remains a
+-- battle concern. Empty/full are exactly 3/8 min or 10/18 min.
+function Capture.DurationFor(area, used, capacity)
+  if area and area.type == "CAPITAL" then return CAPITAL_DURATION end
+  if area and area.type == "WAR_CAMP" then return WAR_CAMP_DURATION end
+  local base, maximum = CAPTURE_DURATION, OUTPOST_MAX_DURATION
+  if area and area.type == "SETTLEMENT" then
+    base, maximum = SETTLEMENT_DURATION, SETTLEMENT_MAX_DURATION
   end
-  if bestDef <= 0 then return CAPTURE_DURATION end
-  local capacity = WF.Garrison and WF.Garrison.OUTPOST_CAPACITY or 12
-  local extra = mathFloor((MAX_DURATION - CAPTURE_DURATION) * defense * bestSize / (capacity * bestDef))
-  return mathMin(MAX_DURATION, CAPTURE_DURATION + extra)
+  capacity = Floor(tonumber(capacity) or 0)
+  if capacity <= 0 then return base end
+  used = mathMin(capacity, mathMax(0, Floor(tonumber(used) or 0)))
+  return base + mathFloor((maximum - base) * used / capacity)
 end
 
--- Defense and unit count of the garrison as this client knows it, read
+-- Occupancy of the garrison as this client knows it, read
 -- without creating or wiping a garrison record; an older generation is empty.
-function Capture:GarrisonDefense(id)
+function Capture:GarrisonOccupancy(id)
   local garrison = WF.Garrison
   local units = WF.Army and WF.Army.UNITS
-  if not garrison or not units then return 0, 0 end
+  local area = self:Outpost(id)
+  -- A capital never holds a garrison (decision 0103 § 2), nor a War Camp (0123 § 7).
+  if not garrison or not units or not area or area.type == "CAPITAL" or area.type == "WAR_CAMP" then
+    return 0, 0
+  end
   local g = garrison.states and garrison.states[id]
   local _, generation = self:GetOwner(id)
-  if not g or g.gen ~= generation then return 0, 0 end
-  local defense = g.f * units.FOOTMAN.def + g.r * units.RIFLEMAN.def + g.m * units.MORTAR.def
-  return defense, g.f + g.r + g.m
+  local capacity = garrison:Capacity(area, g and g.gold or 0, g and g.wood or 0)
+  if not g or g.gen ~= generation then return 0, capacity end
+  local used = g.f * units.FOOTMAN.size + g.r * units.RIFLEMAN.size + g.m * units.MORTAR.size
+  return used, capacity
 end
 
--- Duration the next attempt on this POI would take, fixed when it opens.
+-- Current full-bar duration of this POI. During an attempt, only the authority
+-- publishes changes; observers keep following the duration carried by S.
 function Capture:AttemptDuration(id)
   local area = self:Outpost(id)
-  if area and area.type == "SETTLEMENT" then return SETTLEMENT_DURATION end
-  local owner = self:GetOwner(id)
-  if not FACTION_KEYS[owner] then return CAPTURE_DURATION end
-  return Capture.DefenseDuration((self:GarrisonDefense(id)))
+  if not area then return CAPTURE_DURATION end
+  local used, capacity = self:GarrisonOccupancy(id)
+  return Capture.DurationFor(area, used, capacity)
 end
 
 -- Owner used only by the linked-objective gate of a Settlement siege. During
@@ -475,13 +551,35 @@ function Capture:TargetOwner(id, now)
   return owner, generation, true
 end
 
--- The Settlement prerequisites for faction side (decisions 0053 and 0062), in the order
--- SiegeBlocked checks them: every linked objective held or provisionally reported by side, an empty
--- garrison and, when the other faction holds it, a valid discovery by side.
+-- The Settlement prerequisites for faction side (decisions 0053, 0062 and
+-- 0082), in the order SiegeBlocked checks them: every linked objective held or
+-- provisionally reported by side and, when the other faction holds it, a valid
+-- discovery by side. A garrison adds time but never blocks the attempt.
 -- Each item { ok, text, why }: why is the refusal when ok is false. The two
 -- attackers are counted by SiegeMode. A local reading only (gameplay UI).
 function Capture:SiegeChecklist(id, side, now)
   local list = {}
+  local area = WF.Map and WF.Map.areas[id]
+  if area and area.type == "CAPITAL" then
+    -- Only the day-long siege window (decision 0103 § 2): no garrison, no
+    -- scouting, no linked Outposts.
+    local front = WF.Front
+    local reason = "the siege has not begun"
+    if front and front:HasRoutes() then reason = front:SiegeWhy(id, side, now) end
+    local text = "Capital siege under way"
+    if reason == nil then
+      local node = front.byCapital[id]
+      text = text .. " (" .. front.Clock(front:Remaining(front:Window(node.route.id), now)) .. " left)"
+    end
+    table.insert(list, { ok = reason == nil, why = reason, text = text })
+    return list
+  end
+  -- Only the faction the Active Front names may besiege this Settlement (0098).
+  if WF.Front and WF.Front:HasRoutes() then
+    local open = WF.Front:CanBesiege(id, side)
+    table.insert(list, { ok = open, text = "On the active front",
+      why = not open and ("not on the " .. FACTION_NAMES[side] .. " front") or nil })
+  end
   local links = self:LinkedObjectives(id)
   local held, provisional, missing = 0, 0, nil
   for index = 1, #links do
@@ -498,12 +596,19 @@ function Capture:SiegeChecklist(id, side, now)
     why = (WF.Map.areas[missing].label or missing) .. " is not held by the " .. FACTION_NAMES[side]
   end
   local accepted = provisional > 0 and (", " .. provisional .. " unconfirmed accepted") or ""
-  table.insert(list, { ok = not missing, why = why,
-    text = "Every Outpost and Hunting Grounds of the zone held (" .. held .. "/" .. #links
+  table.insert(list, { key = "outposts", ok = not missing, why = why,
+    text = "Every Outpost of the zone held (" .. held .. "/" .. #links
       .. accepted .. ")" })
-  local _, units = self:GarrisonDefense(id)
-  table.insert(list, { ok = units == 0, text = "Garrison emptied",
-    why = units > 0 and ("its garrison still has " .. units .. " defender(s)") or nil })
+  -- The three-hour window those Outposts opened (decisions 0079 and 0098).
+  if WF.Front and WF.Front:HasRoutes() then
+    local reason = WF.Front:SiegeWhy(id, side, now)
+    local text = "Siege under way"
+    if reason == nil then
+      local node = WF.Front.bySettlement[id]
+      text = text .. " (" .. WF.Front.Clock(WF.Front:Remaining(WF.Front:Window(node.route.id), now)) .. " left)"
+    end
+    table.insert(list, { key = "siege", ok = reason == nil, why = reason, text = text })
+  end
   if FACTION_KEYS[self:GetOwner(id)] then
     local found = WF.Scout and WF.Scout:Discovery(id, side, now)
     table.insert(list, { ok = found and true or false, text = "Scouted in the last hour",
@@ -535,20 +640,20 @@ end
 -- not quiet: one of them is behind, the fast cadence stays until they agree.
 function Capture:SettlementQuiet(id, now)
   local area = self:Outpost(id)
-  if not area or area.type ~= "SETTLEMENT" then return false end
+  if not area or (area.type ~= "SETTLEMENT" and area.type ~= "CAPITAL") then return false end
   local st = self.states[id]
   if st and st.known and (st.owner ~= self:GetOwner(id) or not IsIdle(st)) then return false end
   return self:SiegeBlocked(id, "H", now) ~= nil and self:SiegeBlocked(id, "A", now) ~= nil
 end
 
--- Mode and direction of a Settlement's bar (decision 0053). With no attempt,
--- one opens only toward a majority of at least two attackers that meets the
--- prerequisites. During an attempt: two attackers ahead push, one alone with
--- no defender freezes it (no time limit), defenders ahead push back at full
--- speed, a non-zero tie freezes, an empty area returns.
+-- Mode and direction of a Settlement's bar (decisions 0053, 0065 and 0100).
+-- A neutral Settlement needs one attacker; a held one needs two. During an
+-- attempt, the same threshold advances it, a smaller attacking force freezes,
+-- defenders ahead push back at full speed, a non-zero tie freezes, and an
+-- empty area returns.
 function Capture:SiegeMode(id, st, nH, nA, now)
   local counts = { H = nH, A = nA }
-  local required = st.owner == "N" and 1 or SIEGE_ATTACKERS
+  local required = st.capital and CAPITAL_ATTACKERS or st.owner == "N" and 1 or SIEGE_ATTACKERS
   if st.challenger == "-" then
     local side = nil
     if nH > nA then side = "H" elseif nA > nH then side = "A" end
@@ -571,6 +676,19 @@ function Capture:SiegeMode(id, st, nH, nA, now)
   return "D", "-"
 end
 
+-- Mode of an Outpost under the front rules (decision 0098): a faction outside
+-- its front zones opens nothing there, and its majority only freezes another
+-- faction's attempt. The owner always defends. A War Camp ignores the front
+-- (decision 0123 § 2): any strict majority moves its bar.
+function Capture:OutpostMode(id, st, nH, nA)
+  local mode, dir = ModeFromCounts(nH, nA, st)
+  if mode ~= "P" or dir == st.owner or not WF.Front or st.camp or WF.Front:OutpostOpen(id, dir) then
+    return mode, dir
+  end
+  if st.challenger == "-" then return "R", "-" end
+  return "C", "-"
+end
+
 local function StaticOwner(area)
   local key = area.baseColorKey
   if key == nil then key = area.colorKey end
@@ -581,18 +699,39 @@ function Capture:GetOwner(id)
   local entry = self.owners[id]
   if entry then return entry.owner, entry.generation, entry.source end
   local area = self:Capturable(id)
-  return area and StaticOwner(area) or "N", 0, "STATIC"
+  -- A War Camp always starts neutral, whatever colour the catalog gives it (0123 § 2).
+  local owner = area and area.type ~= "WAR_CAMP" and StaticOwner(area) or "N"
+  -- ParseState pairs generation 0 with a neutral owner. A confirmed capture
+  -- starts at generation 1 (decision 0100).
+  return owner, owner == "N" and 0 or 1, "STATIC"
 end
 
-local function OwnerWins(owner, generation, currentOwner, currentGeneration)
+-- Equal generations only diverge after a network partition: Horde or Alliance
+-- by a fair draw, both before a neutral reset (decisions 0098, 0122). The draw
+-- depends only on the POI and the generation, so nobody can steer it; the
+-- Worker computes the same (owners.ts drawOwner, contract/vectors/owner-draw.json).
+-- Self-contained: the simulations load this function alone.
+local function OwnerWins(id, owner, generation, currentOwner, currentGeneration)
   if generation ~= currentGeneration then return generation > currentGeneration end
   if owner == currentOwner then return false end
-  -- Equal generations only diverge after a network partition: HORDE first.
-  return owner == "H"
+  local faction = owner == "H" or owner == "A"
+  if not (faction and (currentOwner == "H" or currentOwner == "A")) then return faction end
+  local h = 5381
+  for index = 1, string.len(id) do
+    h = (h * 33 + string.byte(id, index)) % 1000003
+  end
+  h = (h * 33 + generation % 1000003) % 1000003
+  h = (h * 33 + math.floor(generation / 1000003)) % 1000003
+  return (h % 2 == 0 and "H" or "A") == owner
+end
+
+-- The faction the draw gives at generation of id (tests and diagnostics).
+function Capture.Draw(id, generation)
+  return OwnerWins(id, "H", generation, "A", generation) and "H" or "A"
 end
 
 -- The sections of a scope's captures table (Capture:Bucket).
-local SECTIONS = { "pois", "progress", "hunting" }
+local SECTIONS = { "pois", "progress", "hunting", "front" }
 
 -- Captures are kept per channel compatibility level WF<n> (decision 0029):
 -- owners agreed on by another level's network never enter this one, and
@@ -653,7 +792,57 @@ function Capture:Bucket()
   if type(captures.pois) ~= "table" then captures.pois = {} end
   if type(captures.progress) ~= "table" then captures.progress = {} end
   if type(captures.hunting) ~= "table" then captures.hunting = {} end
+  if type(captures.front) ~= "table" then captures.front = {} end
+  if not captures.realmAdopted then
+    local ok, realm = Call("GetRealmName")
+    local db = WF.Storage and WF.Storage:GetDB()
+    if ok then Capture.AdoptRealm(captures, db, realm) end
+  end
   return captures
+end
+
+-- Copies one entry (two levels at most: saved entries are flat records).
+local function CopyEntry(entry, depth)
+  local copy = {}
+  for key, value in pairs(entry) do
+    if type(value) == "table" then
+      if depth < 2 then copy[key] = CopyEntry(value, depth + 1) end
+    else
+      copy[key] = value
+    end
+  end
+  return copy
+end
+
+-- Decision 0073: once per scope, the captures an older build saved for the
+-- current realm (WarfrontDB.captures.realms[realm], before decision 0072) are
+-- copied into the scope. The current realm's record chose this scope, so no
+-- other realm is read. Same level only; an entry the scope holds is kept; the
+-- realm archive is never changed. LoadOwners validates what was copied.
+function Capture.AdoptRealm(captures, db, realm)
+  if captures.realmAdopted then return 0 end
+  if type(realm) ~= "string" or realm == "" then return 0 end
+  captures.realmAdopted = true
+  local legacy = type(db) == "table" and db.captures
+  local realms = type(legacy) == "table" and legacy.realms
+  local old = type(realms) == "table" and realms[realm]
+  if type(old) ~= "table" then return 0 end
+  -- Data saved before levels existed follows level 2 (Capture.SelectLevel).
+  if (tonumber(legacy.level) or 2) ~= tonumber(captures.level) then return 0 end
+  local count = 0
+  for _, key in ipairs(SECTIONS) do
+    local from, into = old[key], captures[key]
+    if type(from) == "table" and type(into) == "table" then
+      for id, entry in pairs(from) do
+        if type(id) == "string" and type(entry) == "table" and into[id] == nil then
+          into[id] = CopyEntry(entry, 1)
+          count = count + 1
+        end
+      end
+    end
+  end
+  Record("CAPTURE_REALM_ADOPTED", { count = count })
+  return count
 end
 
 function Capture:Store()
@@ -666,17 +855,24 @@ function Capture:LoadOwners()
   if not bucket then return false end
   local pois = bucket.pois
   self.loaded = true
+  self.ownerRevision = (self.ownerRevision or 0) + 1
+  self.queryRevision = (self.queryRevision or 0) + 1
+  self.mapOwners = nil
   local stale = {}
   for id, entry in pairs(pois) do
-    local owner = type(entry) == "table" and FACTION_CODES[entry.owner or ""]
+    local owner = type(entry) == "table" and OWNER_CODES[entry.owner or ""]
     local generation = type(entry) == "table" and tonumber(entry.generation)
-    if not self:Capturable(id) or not owner or not generation or generation < 1
-        or Floor(generation) ~= generation then
+    local area = WF.Map and WF.Map.areas[id]
+    if type(area) == "table" and area.offFront then
+      -- Out of play in this campaign (decision 0106): kept as saved, not loaded,
+      -- so a route edit that brings the zone back finds its owner again.
+    elseif not self:Capturable(id) or not owner or not generation or generation < 1
+        or generation > MAX_GENERATION or Floor(generation) ~= generation then
       stale[#stale + 1] = id
     else
       local source = entry.source == "LOCAL" and "LOCAL" or "PEER"
       local currentOwner, currentGeneration = self:GetOwner(id)
-      if OwnerWins(owner, generation, currentOwner, currentGeneration) then
+      if OwnerWins(id, owner, generation, currentOwner, currentGeneration) then
         self.owners[id] = { owner = owner, generation = generation, source = source }
       end
       if generation > (self.captured[id] or 0) then self.captured[id] = generation end
@@ -696,7 +892,7 @@ function Capture:LoadOwners()
     end
   end
   self:RestoreProgress(bucket)
-  if WF.Hunting then WF.Hunting:Restore(bucket) end
+  self:PromoteCloud(Now())
   return true
 end
 
@@ -714,23 +910,47 @@ function Capture:RestoreProgress(bucket)
       local progress = tonumber(entry.progress)
       local at = tonumber(entry.at)
       local savedEpoch = tonumber(entry.epoch)
-      -- Saves from before decision 0053 carry no duration: 180 s then.
+      -- Saves from before decision 0053 carry no duration. A duration from the
+      -- former 3..20 minute defense formula is clamped into decision 0082's
+      -- area-specific range; the authority will recompute it from the loaded
+      -- garrison before publishing another state.
       local dur = tonumber(entry.dur or CAPTURE_DURATION)
-      if self:Outpost(id).type == "SETTLEMENT" then dur = SETTLEMENT_DURATION end
+      local area = self:Outpost(id)
+      local minimum = area.type == "SETTLEMENT" and SETTLEMENT_DURATION or CAPTURE_DURATION
+      local maximum = area.type == "SETTLEMENT" and SETTLEMENT_MAX_DURATION or OUTPOST_MAX_DURATION
+      if area.type == "CAPITAL" then minimum, maximum = CAPITAL_DURATION, CAPITAL_DURATION end
+      if area.type == "WAR_CAMP" then minimum, maximum = WAR_CAMP_DURATION, WAR_CAMP_DURATION end
+      -- Nobody is assumed present, so the bar returns empty, at the unmodified
+      -- garrison base saved with it (decision 0123 § 6): no Front Network
+      -- reduction, no layer doubling (0119), which the saved dur may carry, up
+      -- to a slowed capital's 3,600 s. A bar saved without that base falls
+      -- back to its duration clamped into the area's range.
+      local base = tonumber(entry.base)
       if entry.owner == owner and tonumber(entry.generation) == generation
           and (entry.challenger == "H" or entry.challenger == "A") and entry.challenger ~= owner
           and progress and progress > 0 and progress < 1000 and at and at <= epoch
-          and savedEpoch and savedEpoch >= 0 and savedEpoch <= 1000000
-          and dur and dur >= CAPTURE_DURATION and dur <= MAX_DURATION then
-        dur = Floor(dur)
+          and savedEpoch and savedEpoch >= 0 and savedEpoch <= WF.Serial.MAX
+          and dur and dur >= OUTPOST_MIN_DURATION and dur <= CAPITAL_DURATION * 2 then
+        if base and base == Floor(base) and base >= minimum and base <= maximum then
+          dur = base
+        else
+          dur = mathMin(maximum, mathMax(minimum, Floor(dur)))
+        end
         local left = progress - HalfRate({ dur = dur }) * (epoch - at)
         if left > 0 then
           st = self:GetState(id)
           st.owner, st.generation = owner, generation
           st.challenger, st.progress, st.dur = entry.challenger, left, dur
           st.mode, st.dir, st.nH, st.nA = "D", "-", 0, 0
-          st.epoch = mathMax(st.epoch, Floor(savedEpoch))
+          -- The state is not known yet: its 0 means "no epoch", so the saved
+          -- one is taken as it is (decision 0083).
+          st.epoch = Floor(savedEpoch)
           st.at, st.lastStateAt = now, now
+          -- Our own timer before a reload (risk B13, decision 0087): taken back
+          -- while nobody announces a newer epoch, within the usual 90 s.
+          if entry.held == true and epoch - at <= AUTHORITY_SILENCE then
+            st.heldEpoch, st.heldUntil = st.epoch, now + AUTHORITY_SILENCE - (epoch - at)
+          end
           bucket.progress[id] = entry
           Record("CAPTURE_RESTORED", { id = id, progress = Floor(left) })
         end
@@ -749,6 +969,7 @@ function Capture:SaveProgress(now)
   local progress = bucket.progress
   local view, keep = saveView, saveKeep
   local epoch = Epoch()
+  local me = self:Me()
   for id, st in pairs(self.states) do
     CopyInto(view, st)
     Advance(view, (now or Now()) - st.at, false)
@@ -760,6 +981,9 @@ function Capture:SaveProgress(now)
       end
       entry.owner, entry.generation, entry.challenger = view.owner, view.generation, view.challenger
       entry.progress, entry.epoch, entry.at, entry.dur = Floor(view.progress), st.epoch, epoch, view.dur
+      -- The unmodified garrison base the restored bar returns at.
+      entry.base = self:AttemptDuration(id)
+      entry.held = (me ~= nil and st.authority == me) or nil
       keep[id] = true
     end
   end
@@ -770,13 +994,37 @@ function Capture:SaveProgress(now)
 end
 
 function Capture:MergeOwner(id, owner, generation, source)
-  if not FACTION_KEYS[owner] or generation < 1 then return false end
+  if not OWNER_KEYS[owner] or generation < 1 then return false end
   local currentOwner, currentGeneration = self:GetOwner(id)
-  if not OwnerWins(owner, generation, currentOwner, currentGeneration) then return false end
+  if not OwnerWins(id, owner, generation, currentOwner, currentGeneration) then return false end
   self.owners[id] = { owner = owner, generation = generation, source = source }
+  self.ownerRevision = (self.ownerRevision or 0) + 1
+  self.queryRevision = (self.queryRevision or 0) + 1
+  self.mapDirty = self.mapDirty or {}
+  self.mapDirty[id] = true
   local pois = self:Store()
   if pois then
-    pois[id] = { owner = FACTION_KEYS[owner], generation = generation, source = source }
+    pois[id] = { owner = OWNER_KEYS[owner], generation = generation, source = source }
+  end
+  return true
+end
+
+-- A failed siege (decision 0098): the Outpost goes neutral at the next
+-- generation, on every client that saw the window close. The same numbering
+-- as a capture, so a later capture is numbered above it.
+function Capture:Neutralize(id, now)
+  if not self:Capturable(id) then return false end
+  local _, generation = self:GetOwner(id)
+  local nextGeneration = self:NextGeneration(id, generation)
+  if not self:MergeOwner(id, "N", nextGeneration, "LOCAL") then return false end
+  Record("CAPTURE_NEUTRALIZED", { id = id, generation = nextGeneration })
+  -- For the cloud owner ledger: this client's own report (decision 0098).
+  if WF.Witness then WF.Witness:Note(self:Me(), "NEUTRAL", id, nextGeneration, "N") end
+  local st = self.states[id]
+  if st and nextGeneration > st.generation then
+    st.owner, st.generation = "N", nextGeneration
+    st.challenger, st.progress, st.mode, st.dir = "-", 0, "R", "-"
+    if st.authority and st.authority == self:Me() then self:AuthorityStep(id, now or Now(), true) end
   end
   return true
 end
@@ -787,10 +1035,13 @@ end
 
 local function Beats(id, owner, generation)
   local currentOwner, currentGeneration = Capture:GetOwner(id)
-  return OwnerWins(owner, generation, currentOwner, currentGeneration)
+  return OwnerWins(id, owner, generation, currentOwner, currentGeneration)
 end
 
 function Capture:ClearHints(id)
+  self.queryRevision = (self.queryRevision or 0) + 1
+  self.mapDirty = self.mapDirty or {}
+  self.mapDirty[id] = true
   self.hints[id] = nil
 end
 
@@ -806,18 +1057,26 @@ function Capture:PruneHints(id, now)
     end
   end
   self.hints[id] = #kept > 0 and kept or nil
+  if #kept ~= #list then
+    self.queryRevision = (self.queryRevision or 0) + 1
+    self.mapDirty = self.mapDirty or {}
+    self.mapDirty[id] = true
+  end
 end
 
 -- One claim of `sender`, read from the chat event (rule R1). A sender replaces
 -- its own claim; a full table drops the oldest one.
 function Capture:NoteHint(id, sender, owner, generation, now)
-  if not self:Capturable(id) or not FACTION_KEYS[owner] or type(generation) ~= "number"
+  if not self:Capturable(id) or not OWNER_KEYS[owner] or type(generation) ~= "number"
       or generation < 1 or not sender or sender == self:Me() then
     return false
   end
   -- A relayed claim counts once per relayer (decision 0068): a bridge, not the
   -- server, wrote its origin, so one bridge can never make a quorum alone.
   if self.relayVia then sender = "relay:" .. self.relayVia end
+  self.queryRevision = (self.queryRevision or 0) + 1
+  self.mapDirty = self.mapDirty or {}
+  self.mapDirty[id] = true
   local list = self.hints[id] or {}
   local index = 1
   while index <= #list do
@@ -849,6 +1108,13 @@ end
 -- Q1: two distinct senders of two known factions; Q2: three distinct senders.
 -- A jump of more than HINT_JUMP generations needs one sender more.
 function Capture:Quorum(id, owner, generation)
+  -- A witnessed cloud owner within HINT_JUMP of the registry needs no live
+  -- sender: a partition never provides one (decision 0122 § 4).
+  local witnessed = self.cloud[id]
+  if witnessed and witnessed.t == "W" and witnessed.o == owner and witnessed.g == generation then
+    local _, registry = self:GetOwner(id)
+    if generation - registry <= HINT_JUMP then return true end
+  end
   local list = self.hints[id]
   if not list then return false end
   local count, factions = 0, {}
@@ -884,11 +1150,12 @@ end
 
 -- A promoted hint enters the registry as PEER, without any effect (rule R4).
 function Capture:PromoteHint(id, owner, generation, now)
+  local _, registry = self:GetOwner(id)
+  if generation > registry + PROMOTE_JUMP then return false end
   if not self:Quorum(id, owner, generation) then return false end
   if not self:MergeOwner(id, owner, generation, "PEER") then return false end
   self.promoted = self.promoted + 1
   Record("CAPTURE_HINT_PROMOTED", { id = id, owner = owner, generation = generation })
-  if WF.Hunting and WF.Hunting:Area(id) then WF.Hunting:OnPromoted(id, owner, generation) end
   self:PruneHints(id, nil)
   return true
 end
@@ -910,7 +1177,7 @@ function Capture:BestHint(id, now)
         end
       end
       if not bestCount or count > bestCount or (count == bestCount
-          and OwnerWins(claim.owner, claim.generation, bestOwner, bestGeneration)) then
+          and OwnerWins(id, claim.owner, claim.generation, bestOwner, bestGeneration)) then
         bestOwner, bestGeneration, bestCount, bestAt = claim.owner, claim.generation, count, newest
       end
     end
@@ -926,26 +1193,42 @@ end
 -- never an owner for gameplay, never sent (rule R16 as amended).
 
 function Capture:SetCloud(owners, now)
+  self.queryRevision = (self.queryRevision or 0) + 1
   self.cloud = {}
   if type(owners) ~= "table" then return end
+  -- Generations restart with each campaign (decision 0103 § 3): cloud rows of
+  -- another campaign never enter this one.
+  if WF.Campaign and not WF.Campaign:CloudAllowed(WF.Import and WF.Import.data) then return end
   for id, e in pairs(owners) do
     if self:Capturable(id) and type(e) == "table" and CLOUD_RANKS[e.t] and type(e.g) == "number" and e.g >= 1 then
-      local owner = FACTION_KEYS[e.o] and e.o or nil
+      -- N: neutral after a failed siege, shown like a faction's cloud owner.
+      local owner = OWNER_KEYS[e.o] and e.o or nil
       self.cloud[id] = { g = e.g, o = owner, t = e.t, c = owner and e.c or nil }
     end
   end
+  self:PromoteCloud(now)
+end
+
+-- Witnessed cloud owners enter the registry once it is loaded: before that, a
+-- merge would compare against an empty registry and overwrite the saved one.
+function Capture:PromoteCloud(now)
+  if not self.loaded then return end
   for id, e in pairs(self.cloud) do
     if e.t == "W" and e.o then self:PromoteHint(id, e.o, e.g, now or Now()) end
   end
 end
 
--- The cloud entry worth showing: newer than the confirmed registry.
+-- The cloud entry worth showing: after the confirmed registry in the owner
+-- order, a tie included (decision 0122 § 4).
 function Capture:CloudHint(id)
   local entry = self.cloud[id]
   if not entry then return nil end
-  local _, generation = self:GetOwner(id)
+  local owner, generation = self:GetOwner(id)
   if entry.t == "U" and generation > 0 then return nil end
-  if entry.g <= generation then return nil end
+  if entry.g < generation then return nil end
+  if entry.g == generation and not (entry.o and OwnerWins(id, entry.o, entry.g, owner, generation)) then
+    return nil
+  end
   return entry
 end
 
@@ -1011,11 +1294,14 @@ function Capture:GetState(id)
   if st then return st end
   local owner, generation = self:GetOwner(id)
   local area = self:Outpost(id)
-  local siege = area ~= nil and area.type == "SETTLEMENT" or nil
+  local capital = area ~= nil and area.type == "CAPITAL" or nil
+  local siege = area ~= nil and (area.type == "SETTLEMENT" or capital) or nil
+  local camp = area ~= nil and area.type == "WAR_CAMP" or nil
   st = {
     id = id, owner = owner, generation = generation, challenger = "-", progress = 0,
     mode = "R", dir = "-", nH = 0, nA = 0, epoch = 0, seq = 0,
-    dur = siege and SETTLEMENT_DURATION or CAPTURE_DURATION, siege = siege,
+    dur = capital and CAPITAL_DURATION or siege and SETTLEMENT_DURATION or CAPTURE_DURATION, siege = siege,
+    capital = capital, camp = camp,
     at = Now(), lastStateAt = -1000, lastBroadcastAt = -1000, known = false,
   }
   self.states[id] = st
@@ -1053,8 +1339,71 @@ function Capture:PresenceList(id)
   return list
 end
 
+-- Who was counted inside a POI recently, by faction (decision 0126 § 2, § 3):
+-- an IN presence (ours included) is remembered CREDIT_RECENT seconds, even
+-- after an OUT or a death. Local memory only, never sent nor saved; at most
+-- MAX_RECENT_IN players per POI, the oldest out (R9).
+function Capture:NoteRecentIn(id, identity, faction, now)
+  if type(identity) ~= "string" or (faction ~= "H" and faction ~= "A") then return end
+  if not self.recentIn then self.recentIn = {} end
+  local list = self.recentIn[id]
+  if not list then
+    list = {}
+    self.recentIn[id] = list
+  end
+  local count, oldest, oldestAt = 0, nil, nil
+  for key, seen in pairs(list) do
+    if now - seen.at > CREDIT_RECENT or seen.at > now then
+      list[key] = nil
+    elseif key ~= identity then
+      count = count + 1
+      if not oldestAt or seen.at < oldestAt then oldest, oldestAt = key, seen.at end
+    end
+  end
+  if count >= MAX_RECENT_IN and oldest then list[oldest] = nil end
+  local seen = list[identity]
+  if not seen then
+    seen = {}
+    list[identity] = seen
+  end
+  seen.at, seen.faction = now, faction
+end
+
+-- Whether this identity was counted inside the POI for that faction within
+-- the last CREDIT_RECENT seconds.
+function Capture:RecentlyIn(id, identity, faction, now)
+  local list = self.recentIn and self.recentIn[id]
+  local seen = list and identity and list[identity]
+  return seen ~= nil and seen.faction == faction and seen.at <= now and now - seen.at <= CREDIT_RECENT
+end
+
+-- The players of a faction counted inside within the last CREDIT_RECENT
+-- seconds, sorted, at most 40: the participants a witness lists with a
+-- capture (decision 0126 § 3).
+function Capture:Participants(id, faction, now)
+  local names = {}
+  local list = self.recentIn and self.recentIn[id]
+  if not list then return names end
+  for identity, seen in pairs(list) do
+    if seen.faction == faction and seen.at <= now and now - seen.at <= CREDIT_RECENT then
+      names[#names + 1] = identity
+    end
+  end
+  table.sort(names)
+  while #names > 40 do table.remove(names) end
+  return names
+end
+
+-- Notes this client as counted inside where it stands, so its own presence
+-- shares the same memory as received ones.
+function Capture:NoteSelfIn(now)
+  local here = self.here
+  local faction = self:MyFaction()
+  if here and here.status == "IN" and faction then self:NoteRecentIn(here.id, self:Me(), faction, now) end
+end
+
 -- ttl is the sender's announced lifetime (CADENCE_TTLS), PRESENCE_TTL if absent.
-function Capture:SetPresence(id, identity, faction, status, now, ttl)
+function Capture:SetPresence(id, identity, faction, status, now, ttl, layer)
   local list = self:PresenceList(id)
   local entry = list.entries[identity]
   if status == "OUT" then
@@ -1066,10 +1415,18 @@ function Capture:SetPresence(id, identity, faction, status, now, ttl)
   end
   if not entry then
     if list.count >= MAX_PRESENCE_PER_POI then
-      local oldestId, oldestAt = nil, nil
+      -- Never the local client, the authority or the epoch holder (B3): an
+      -- expired entry goes first, then one that cannot count (NC), then the oldest.
+      local st = self.states[id]
+      local authority, holder = st and st.authority, st and st.epochHolder
+      local me = self:Me()
+      local oldestId, oldestRank, oldestAt = nil, nil, nil
       for key, value in pairs(list.entries) do
-        if key ~= self:Me() and (not oldestAt or value.at < oldestAt) then
-          oldestId, oldestAt = key, value.at
+        if key ~= me and key ~= authority and key ~= holder then
+          local rank = now > value.expireAt and 0 or (value.status == "NC" and 1 or 2)
+          if not oldestRank or rank < oldestRank or (rank == oldestRank and value.at < oldestAt) then
+            oldestId, oldestRank, oldestAt = key, rank, value.at
+          end
         end
       end
       if not oldestId then return end
@@ -1082,7 +1439,9 @@ function Capture:SetPresence(id, identity, faction, status, now, ttl)
   end
   entry.faction = faction
   entry.status = status
+  entry.layer = layer
   entry.at = now
+  if status == "IN" then self:NoteRecentIn(id, identity, faction, now) end
   entry.expireAt = now + (ttl or PRESENCE_TTL)
   -- A rival in the POI ends the slow cadences: no entry outlives the normal
   -- lifetime from now, so a silent defender is not counted 50 s too long.
@@ -1110,6 +1469,153 @@ end
 
 local function Live(entry, identity, me, now)
   return identity == me or now <= entry.expireAt
+end
+
+-- World layer (decision 0119 step 2): our key `server:zoneUID`, or nil while
+-- unknown (modules/layer.lua). On the wire it is `server.zoneUID`, the fifth
+-- field of P; a P without it states an unknown layer.
+local function MyLayer()
+  local layer = WF.Layer
+  return layer and layer.Current and layer:Current() or nil
+end
+
+local function WireLayer(key)
+  return key and (string.gsub(key, ":", ".", 1)) or nil
+end
+
+-- "6867.2" -> "6867:2"; nil when malformed (each part 1-9 digits).
+local function ParseLayer(text)
+  if type(text) ~= "string" then return nil end
+  local server, zone = string.match(text, "^(%d+)%.(%d+)$")
+  if not server or #server > 9 or #zone > 9 then return nil end
+  return server .. ":" .. zone
+end
+
+-- Arena (decision 0119 § 3-6, step 3) -------------------------------------------
+-- The layer where a POI's fight happens, computed by every client from the
+-- layers its presences carry (P fifth field). Without any known layer among
+-- the counted players there is no arena and today's rules apply unchanged.
+local ARENA_SWITCH = 10
+local OTHER_SIDE = { H = "A", A = "H" }
+
+-- Is layer `a` (row ra) a better arena than `b` (row rb)? Most counted
+-- players; ties: the layer of the side that is not the owner, then on a
+-- neutral POI the side that is not the challenger, then the current arena,
+-- then the smallest key, so every client picks the same one.
+local function BetterArena(a, ra, b, rb, st, current)
+  if ra.n ~= rb.n then return ra.n > rb.n end
+  if st.owner == "H" or st.owner == "A" then
+    local xa, xb = ra.n - ra[st.owner], rb.n - rb[st.owner]
+    if xa ~= xb then return xa > xb end
+  elseif st.challenger == "H" or st.challenger == "A" then
+    local xa, xb = ra.n - ra[st.challenger], rb.n - rb[st.challenger]
+    if xa ~= xb then return xa > xb end
+  end
+  if a == current or b == current then return a == current end
+  return a < b
+end
+
+-- Keeps the arena of a POI: a better layer takes it once it has stayed better
+-- for ARENA_SWITCH s; the first arena is set at once. Returns its key or nil.
+function Capture:UpdateArena(id, st, rows, now)
+  local arenas = self.arenas
+  if not arenas then arenas = {}; self.arenas = arenas end
+  local a = arenas[id]
+  if not a then a = {}; arenas[id] = a end
+  local empty = { n = 0, H = 0, A = 0 }
+  local best, bestRow = nil, nil
+  for key, row in pairs(rows) do
+    if not best or BetterArena(key, row, best, bestRow, st, a.key) then best, bestRow = key, row end
+  end
+  if not best then
+    a.key, a.pending = nil, nil
+    return nil
+  end
+  if not a.key then
+    a.key, a.pending = best, nil
+    Record("CAPTURE_ARENA", { id = id, arena = best })
+  elseif best == a.key or not BetterArena(best, bestRow, a.key, rows[a.key] or empty, st, a.key) then
+    a.pending = nil
+  elseif a.pending ~= best then
+    a.pending, a.pendingAt = best, now
+  elseif now - a.pendingAt >= ARENA_SWITCH then
+    Record("CAPTURE_ARENA", { id = id, before = a.key, arena = best })
+    a.key, a.pending = best, nil
+  end
+  return a.key
+end
+
+-- S field 15 (decision 0119): the authority's arena `server.zoneUID` with "*"
+-- while its push runs at half speed, or "-" without an arena. Observers follow
+-- this arena instead of their own guess.
+ArenaToken = function(st)
+  if not st.arena then return "-" end
+  return (string.gsub(st.arena, ":", ".", 1)) .. (st.slowed and "*" or "")
+end
+
+local function ParseArenaToken(text)
+  if text == "-" then return nil, false end
+  if type(text) ~= "string" then return nil, nil end
+  local server, zone, star = string.match(text, "^(%d+)%.(%d+)(%*?)$")
+  if not server or #server > 9 or #zone > 9 then return nil, nil end
+  return server .. ":" .. zone, star == "*"
+end
+
+-- Counts under the arena rule: counted players on the arena layer or with an
+-- unknown layer; enemies counted on another known layer only slow the other
+-- side's push (slowed[side] = true). Candidates: arena players, or players
+-- with an unknown layer when no arena player is present, or everybody when
+-- neither is. Returns nH, nA, candidates, arena, slowed.
+function Capture:ArenaCount(id, now, given)
+  local nH, nA, candidates = self:Count(id, now)
+  local st, list = self.states[id], self.presence[id]
+  if not st or not list then return nH, nA, candidates, nil, nil end
+  local rows = {}
+  for _, entry in pairs(list.entries) do
+    if entry.status == "IN" and entry.layer and (entry.faction == "H" or entry.faction == "A") then
+      local row = rows[entry.layer]
+      if not row then row = { n = 0, H = 0, A = 0 }; rows[entry.layer] = row end
+      row.n = row.n + 1
+      row[entry.faction] = row[entry.faction] + 1
+    end
+  end
+  local arena = self:UpdateArena(id, st, rows, now)
+  -- An observer follows the arena its authority announced (S field 15).
+  if given then arena = given end
+  if not arena then return nH, nA, candidates, nil, nil end
+  nH, nA = 0, 0
+  local slowed, known, unknown = {}, {}, {}
+  for identity, entry in pairs(list.entries) do
+    local here = entry.layer == nil or entry.layer == arena
+    if entry.status == "IN" then
+      if here then
+        if entry.faction == "H" then nH = nH + 1 elseif entry.faction == "A" then nA = nA + 1 end
+      elseif OTHER_SIDE[entry.faction] then
+        slowed[OTHER_SIDE[entry.faction]] = true
+      end
+    end
+    if entry.layer == arena then known[#known + 1] = identity
+    elseif entry.layer == nil then unknown[#unknown + 1] = identity end
+  end
+  local pick = #known > 0 and known or #unknown > 0 and unknown or candidates
+  if pick ~= candidates then table.sort(pick) end
+  return nH, nA, pick, arena, slowed
+end
+
+-- Live counted (IN) presences of the other faction whose known layer differs
+-- from ours; 0 while our layer is unknown. Display only: no rule uses it yet.
+function Capture:OtherLayerRivals(id, now)
+  local mine, faction = MyLayer(), self:MyFaction()
+  local list = self.presence[id]
+  if not mine or not faction or not list then return 0 end
+  local me, count = self:Me(), 0
+  for identity, entry in pairs(list.entries) do
+    if identity ~= me and entry.faction ~= faction and entry.status == "IN" and entry.layer
+      and entry.layer ~= mine and Live(entry, identity, me, now) then
+      count = count + 1
+    end
+  end
+  return count
 end
 
 function Capture:HasPresence(id, identity, now)
@@ -1173,6 +1679,32 @@ function Capture:Count(id, now)
   end
   table.sort(candidates)
   return nH, nA, candidates
+end
+
+-- Unique counted players of one faction across a local set of POIs. The caller
+-- owns `seen`, so a UI refresh allocates nothing; expired presences are pruned
+-- exactly as in Count. This is a read-only local view and sends nothing.
+function Capture:CountFront(ids, faction, now, seen)
+  if type(ids) ~= "table" or not FACTION_KEYS[faction or ""] then return 0 end
+  seen = seen or {}
+  for identity in pairs(seen) do seen[identity] = nil end
+  local me = self:Me()
+  local count = 0
+  for index = 1, #ids do
+    local list = self.presence[ids[index]]
+    if list then
+      for identity, entry in pairs(list.entries) do
+        if not Live(entry, identity, me, now) then
+          list.entries[identity] = nil
+          list.count = list.count - 1
+        elseif entry.status == "IN" and entry.faction == faction and not seen[identity] then
+          seen[identity] = true
+          count = count + 1
+        end
+      end
+    end
+  end
+  return count
 end
 
 -- Local eligibility -----------------------------------------------------------
@@ -1409,11 +1941,37 @@ function Capture:Send(kind, body, key, priority)
   return false
 end
 
+-- A line addressed to one player (decision 0077 step 3): the owner catch-up
+-- digest and its answers between guild peers. Same talk gate as Send; the
+-- copy passes WF.SendQueue in modules/transport.lua (rule R12, as amended).
+function Capture:SendTo(target, kind, body, key)
+  local talk, lockReason = self:CanTalk()
+  if not talk then
+    self.sendFailures = self.sendFailures + 1
+    self.lastSendError = lockReason
+    return false
+  end
+  local transport = WF.Transport
+  if not transport or type(transport.SendTo) ~= "function" then
+    self.sendFailures = self.sendFailures + 1
+    self.lastSendError = "addressed transport unavailable"
+    return false
+  end
+  local ok, accepted, err = pcall(transport.SendTo, transport, target, kind, body, key)
+  if ok and accepted then
+    self.sent = self.sent + 1
+    return true
+  end
+  self.sendFailures = self.sendFailures + 1
+  self.lastSendError = tostring(ok and err or accepted)
+  return false
+end
+
 -- Cross-faction relay class of a capture line (decision 0068): "C" critical
 -- (redundant, acknowledged), "S" replaceable state with its coalescing key,
 -- nil never relayed. Tickets, requests and catch-up answers stay in their faction.
 Capture.RELAY_CLASS = {
-  K = "C", AC = "C", AR = "C", SC = "C", GD = "C",
+  K = "C", AC = "C", AR = "C", SC = "C", GD = "C", FW = "C", CE = "C",
   P = "S", S = "S", H = "S", X = "S", G = "S",
 }
 
@@ -1425,7 +1983,7 @@ function Capture:RelayClass(kind, data)
   local id = parts[1]
   if id == "" then return nil end
   if kind == "S" then
-    local event = #parts == 14 and CODE_EVENTS[parts[13]] or nil
+    local event = (#parts == 14 or #parts == 15) and CODE_EVENTS[parts[13]] or nil
     if not event then return nil end
     if event ~= "-" then return "C" end
   elseif kind == "G" and parts[14] ~= "0" then
@@ -1438,7 +1996,12 @@ end
 function Capture:SendPresence(id, status, cadence)
   local faction = self:MyFaction()
   if not faction then return false end
-  return self:Send("P", id .. "," .. faction .. "," .. STATUS_CODES[status] .. "," .. (cadence or "F"))
+  local body = id .. "," .. faction .. "," .. STATUS_CODES[status] .. "," .. (cadence or "F")
+  -- Our layer, when known, on an Outpost, Settlement or capital (decision 0119
+  -- step 2); never on OUT nor on a resource POI, whose P keeps four fields.
+  local layer = status ~= "OUT" and not (WF.Stock and WF.Stock:Resource(id)) and WireLayer(MyLayer()) or nil
+  if layer then body = body .. "," .. layer end
+  return self:Send("P", body)
 end
 
 -- R only for a defender of an idle POI its faction owns, with no rival
@@ -1463,7 +2026,8 @@ function Capture:SendState(st, event, age)
   return self:Send("S", st.id .. "," .. st.epoch .. "," .. st.seq .. "," .. st.owner
     .. "," .. st.generation .. "," .. st.challenger .. "," .. Floor(st.progress)
     .. "," .. st.mode .. "," .. st.dir .. "," .. st.nH .. "," .. st.nA .. "," .. Floor(st.dur or CAPTURE_DURATION)
-    .. "," .. (event and EVENT_CODES[event] or "-") .. "," .. Floor(age or 0), key, event ~= nil)
+    .. "," .. (event and EVENT_CODES[event] or "-") .. "," .. Floor(age or 0)
+    .. "," .. ArenaToken(st), key, event ~= nil)
 end
 
 -- Events ----------------------------------------------------------------------
@@ -1472,19 +2036,19 @@ function Capture:OnEvent(callback)
   if type(callback) == "function" then self.listeners[#self.listeners + 1] = callback end
 end
 
-function Capture:Emit(kind, id, side)
+function Capture:Emit(kind, id, side, previousOwner)
   local index = 1
   while index <= #self.listeners do
-    local ok, err = pcall(self.listeners[index], kind, id, side)
+    local ok, err = pcall(self.listeners[index], kind, id, side, previousOwner)
     if not ok and WF.RecordError then WF.RecordError("capture listener", err) end
     index = index + 1
   end
 end
 
 -- generation: the POI generation the event belongs to. A capture is identified
--- by (POI, generation), so it is announced once even when two authorities, a
--- repeated state or a hunting relay report it again.
-function Capture:HandleEvent(id, event, side, now, generation)
+-- by (POI, generation), so it is announced once even when two authorities or a
+-- repeated state report it again.
+function Capture:HandleEvent(id, event, side, now, generation, previousOwner)
   if event == "START" then
     local mine = self:MyFaction()
     if not mine or side == mine then return end
@@ -1502,7 +2066,33 @@ function Capture:HandleEvent(id, event, side, now, generation)
     end
     self.captured[id] = generation
     Record("CAPTURE_DONE", { id = id, owner = side, generation = generation })
-    self:Emit("CAPTURED", id, side)
+    self:Emit("CAPTURED", id, side, previousOwner)
+    -- Scoreboard credit (decision 0088): a player counted inside for the
+    -- winning faction at the capture or within its last CREDIT_RECENT
+    -- seconds (decision 0126 § 2), once per POI and hour (decision 0109 § 3).
+    -- A capture ends any defense watched there.
+    local here = self.here
+    if self.defending then self.defending[id] = nil end
+    local inside = here and here.id == id and here.status == "IN"
+    if WF.WarRecord and self:MyFaction() == side
+        and (inside or self:RecentlyIn(id, self:Me(), side, now)) then
+      local area = self:Outpost(id)
+      if area then WF.WarRecord:CreditPoi("capture", id, area.type) end
+    end
+    -- The Active Front reads the same once-per-generation event (decision 0098).
+    if WF.Front then
+      local ok, err = pcall(WF.Front.OnCaptured, WF.Front, id, side, now)
+      if not ok and WF.RecordError then WF.RecordError("front capture", err) end
+    end
+    -- A capital fall ends the campaign once confirmed (decision 0103 § 4).
+    local area = WF.Map and WF.Map.areas[id]
+    if area and area.type == "CAPITAL" and WF.Campaign then
+      local inside = here ~= nil and here.id == id and here.status ~= nil
+      local st = self.states[id]
+      local ok, err = pcall(WF.Campaign.OnCapitalCaptured, WF.Campaign, id, side, generation,
+        st and st.authority, inside, now)
+      if not ok and WF.RecordError then WF.RecordError("campaign capital", err) end
+    end
   end
 end
 
@@ -1510,13 +2100,39 @@ end
 
 function Capture:AuthorityStep(id, now, force)
   local st = self.states[id]
-  local nH, nA = self:Count(id, now)
+  local previousOwner = st.owner
+  local nH, nA, _, arena, slowed = self:ArenaCount(id, now)
+  -- Our layer is no longer the arena's (decision 0119 § 6): hand over like an
+  -- explicit OUT; an arena player takes over with a higher epoch.
+  local mine = MyLayer()
+  if arena and mine and mine ~= arena then
+    Advance(st, now - st.at, true)
+    st.at = now
+    st.authority = nil
+    Record("CAPTURE_AUTHORITY_ARENA", { id = id, arena = arena, mine = mine })
+    return
+  end
   -- An attempt by the faction the map reports as holder (restored or opened
   -- before the owner was known) ends at once.
   local reset = false
   if st.siege and st.challenger ~= "-" and self:TargetOwner(id, now) == st.challenger then
     st.challenger, st.progress, st.mode, st.dir = "-", 0, "R", "-"
     reset = true
+  end
+  -- Likewise an Outpost attempt by a faction its front no longer allows there
+  -- (or locked by a siege), and a siege whose front moved or whose three
+  -- hours are over: the capture must finish strictly before the deadline.
+  if st.challenger ~= "-" and WF.Front and not st.camp then
+    local stop
+    if st.siege then
+      stop = WF.Front:SiegeEnded(id, st.challenger, now)
+    else
+      stop = not WF.Front:OutpostOpen(id, st.challenger, now)
+    end
+    if stop then
+      st.challenger, st.progress, st.mode, st.dir = "-", 0, "R", "-"
+      reset = true
+    end
   end
   local event = Advance(st, now - st.at, true)
   st.at = now
@@ -1527,20 +2143,33 @@ function Capture:AuthorityStep(id, now, force)
   if st.siege then
     mode, dir = self:SiegeMode(id, st, nH, nA, now)
   else
-    mode, dir = ModeFromCounts(nH, nA, st)
+    mode, dir = self:OutpostMode(id, st, nH, nA)
   end
   if not event and mode == "P" and dir ~= st.owner and not (st.mode == "P" and st.dir == dir) then
     event = "START"
   end
   local transition = reset or event ~= nil or mode ~= st.mode or dir ~= st.dir
-  -- While no attempt runs, the next one's duration follows the garrison; it
-  -- is fixed once the attempt opens and travels in S (decision 0053).
-  if st.challenger == "-" then
-    local dur = self:AttemptDuration(id)
-    if dur ~= st.dur then
-      st.dur = dur
-      if mode == "P" and dir ~= st.owner then transition = true end
-    end
+  -- The authoritative duration follows occupied Garrison Capacity even while
+  -- an attempt runs. Progress is already a percentage (0..1000), so changing
+  -- dur preserves the bar exactly (decision 0082).
+  local dur = self:AttemptDuration(id)
+  -- Defensive Coordination (decision 0123 § 6): the faction moving the bar,
+  -- attacker or defender pushing back, shortens it by its Front Network
+  -- (Outposts and Settlements only). A tie keeps the current duration; an
+  -- empty return uses the unmodified base. Garrison base, then Front Network,
+  -- then the layer slowdown below.
+  if mode == "C" and st.dur then
+    dur = st.dur
+  elseif mode == "P" and FACTION_KEYS[dir] and (st.challenger ~= "-" or dir ~= st.owner) and WF.FrontNetwork then
+    dur = WF.FrontNetwork:CaptureDuration(self:Outpost(id), dir, dur)
+  end
+  -- Enemies counted on another layer slow this push to half speed: the
+  -- full-bar duration doubles while it lasts (decision 0119 § 4).
+  if mode == "P" and slowed and slowed[dir] then dur = dur * 2 end
+  if dur ~= st.dur then
+    Record("CAPTURE_DURATION_CHANGED", { id = id, before = st.dur, after = dur, progress = Floor(st.progress) })
+    st.dur = dur
+    transition = true
   end
   -- Only the authority opens a Settlement attempt, prerequisites checked.
   if st.siege and mode == "P" and st.challenger == "-" and dir ~= st.owner then
@@ -1548,6 +2177,9 @@ function Capture:AuthorityStep(id, now, force)
     Record("SIEGE_OPENED", { id = id, attacker = dir })
   end
   local recounted = nH ~= st.nH or nA ~= st.nA
+  local half = mode == "P" and slowed ~= nil and slowed[dir] == true
+  if arena ~= st.arena or half ~= (st.slowed == true) then transition = true end
+  st.arena, st.slowed = arena, half or nil
   st.mode, st.dir, st.nH, st.nA = mode, dir, nH, nA
   st.lastStateAt = now
 
@@ -1570,17 +2202,25 @@ function Capture:AuthorityStep(id, now, force)
   if event == "START" then
     self:HandleEvent(id, "START", dir, now)
   elseif event == "CAPTURED" then
-    self:HandleEvent(id, "CAPTURED", st.owner, now, st.generation)
-    -- Our own capture: a claim for the cloud owner ledger (decision 0060).
-    if WF.Witness then WF.Witness:Note(self:Me(), "CAPTURED", id, st.generation, st.owner) end
+    self:NoteSelfIn(now)
+    self:HandleEvent(id, "CAPTURED", st.owner, now, st.generation, previousOwner)
+    -- Our own capture: a claim for the cloud owner ledger (decision 0060),
+    -- with the participants we counted (decision 0126 § 3).
+    if WF.Witness then
+      WF.Witness:Note(self:Me(), "CAPTURED", id, st.generation, st.owner, self:Participants(id, st.owner, now))
+    end
   end
 end
 
-function Capture:AuthorityLost(st, now)
+function Capture:AuthorityLost(st, now, arena)
   local me = self:Me()
   if st.authority and st.authority == me then return false end
   if st.authority then
     if not self:HasPresence(st.id, st.authority, now) then return true end
+    -- An authority off the arena's layer counts as an explicit OUT (0119 § 6).
+    local list = arena and self.presence[st.id]
+    local entry = list and list.entries[st.authority]
+    if entry and entry.layer and entry.layer ~= arena then return true, true end
     if not IsIdle(st) and now - st.lastStateAt > AUTHORITY_SILENCE then return true end
     return false
   end
@@ -1603,10 +2243,11 @@ function Capture:TakeOver(id, now)
       st.challenger, st.progress = "-", 0
     end
   end
-  st.epoch = st.epoch + 1
+  st.epoch = WF.Serial.Next(st.epoch)
   st.seq = 0
   st.authority = self:Me()
   st.epochHolder = st.authority
+  st.heldEpoch, st.heldUntil = nil, nil
   st.known = true
   st.takeoverAt = nil
   st.explicitOut = nil
@@ -1644,11 +2285,33 @@ end
 
 function Capture:OnPresenceChange(area, previous)
   local now = Now()
-  if previous and self:Outpost(previous.id) and self.here and self.here.id == previous.id then
+  if previous and self.here and self.here.id == previous.id then
     self:Leave(previous.id, now)
   end
   if area and self:Outpost(area.id) then
     self:Enter(area.id, now)
+  end
+end
+
+-- A capital gains or loses its bar while the player stands in it (its siege
+-- window opens or closes, decision 0103 § 2): enter or leave it then. A
+-- capital state left after its window is dropped with its presences.
+function Capture:SyncCapital(now)
+  local current = WF.Presence and WF.Presence.current
+  if type(current) == "table" and current.type == "CAPITAL" then
+    local live = self:Outpost(current.id) ~= nil
+    local inside = self.here ~= nil and self.here.id == current.id
+    if live and not inside then
+      self:Enter(current.id, now)
+    elseif not live and inside then
+      self:Leave(current.id, now)
+    end
+  end
+  for id, st in pairs(self.states) do
+    if st.capital and not self:Outpost(id) and not (self.here and self.here.id == id) then
+      self.states[id] = nil
+      self.presence[id] = nil
+    end
   end
 end
 
@@ -1669,9 +2332,12 @@ function Capture:UpdateEligibility(now, force)
   end
   local status, reason = self:Eligibility()
   local changed = status ~= here.status
-  here.status, here.reason = status, reason
+  -- A new or lost layer goes out at once (decision 0119 step 2).
+  local layer = MyLayer()
+  if layer ~= here.layer then changed = true end
+  here.status, here.reason, here.layer = status, reason, layer
   here.faction = faction
-  self:SetPresence(here.id, me, faction, status, now)
+  self:SetPresence(here.id, me, faction, status, now, nil, layer)
   local cadence = self:PresenceCadence(here.id, faction, now)
   -- W only after QUIET_SETTLE of quiet in a row: a receiver still behind on
   -- the owner change that made it quiet would cap it to 25 s (decision 0058).
@@ -1760,7 +2426,7 @@ function Capture:DropPresence(id, sender, now)
   if WF.Garrison then WF.Garrison:OnDrop(id, sender) end
 end
 
-function Capture:OnPresenceMessage(sender, id, faction, status, now, cadence)
+function Capture:OnPresenceMessage(sender, id, faction, status, now, cadence, layer)
   if status == "OUT" then
     self:DropPresence(id, sender, now)
     return true
@@ -1770,7 +2436,7 @@ function Capture:OnPresenceMessage(sender, id, faction, status, now, cadence)
   for other, list in pairs(self.presence) do
     if other ~= id and list.entries[sender] then self:DropPresence(other, sender, now) end
   end
-  self:SetPresence(id, sender, faction, status, now, CADENCE_TTLS[cadence])
+  self:SetPresence(id, sender, faction, status, now, CADENCE_TTLS[cadence], layer)
   return true
 end
 
@@ -1790,6 +2456,9 @@ function Capture:CheckPlausible(st, f, now)
   local elapsed = mathMax(0, now - st.lastStateAt)
   local reach = MAX_RATE * elapsed + PLAUSIBILITY_SLACK
   if f.owner ~= st.owner then
+    -- A neutral reset at a higher generation comes with no capture bar: the
+    -- authority applied a failed siege before us (decision 0098).
+    if f.owner == "N" and f.generation > st.generation then return true end
     -- Any generation above ours: the authority numbers a capture above every
     -- generation it knows, which may be more than ours (decision 0060).
     if f.generation <= st.generation or st.challenger ~= f.owner
@@ -1805,20 +2474,75 @@ function Capture:CheckPlausible(st, f, now)
   return true
 end
 
+-- AC-2 measurement (decision 0093): per relayer, accepted live states with a new
+-- epoch or a higher generation, and the most seen in 60 s and 600 s from the last
+-- 64 times of each kind. 32 relayers at most. Never sent, saved or read by a rule.
+local RELAY_TALLY = { MAX = 32, RECENT = 64, SHORT = 60, LONG = 600 }
+
+local function TallyKind(entry, kind, now)
+  local times = entry[kind]
+  times[#times + 1] = now
+  if #times > RELAY_TALLY.RECENT then table.remove(times, 1) end
+  local short, long = 0, 0
+  for i = 1, #times do
+    local age = now - times[i]
+    if age < RELAY_TALLY.LONG then long = long + 1 end
+    if age < RELAY_TALLY.SHORT then short = short + 1 end
+  end
+  entry.total[kind] = entry.total[kind] + 1
+  if short > entry.max60[kind] then entry.max60[kind] = short end
+  if long > entry.max600[kind] then entry.max600[kind] = long end
+end
+
+function Capture:TallyRelayed(via, newEpoch, ownerChange, now)
+  if not newEpoch and not ownerChange then return end
+  local tally = self.relayTally
+  local entry = tally[via]
+  if not entry then
+    if self.relayTallyCount >= RELAY_TALLY.MAX then
+      local oldest, at
+      for name, e in pairs(tally) do
+        if not at or e.at < at then oldest, at = name, e.at end
+      end
+      tally[oldest] = nil
+      self.relayTallyCount = self.relayTallyCount - 1
+    end
+    entry = { epochs = {}, owners = {}, total = { epochs = 0, owners = 0 },
+      max60 = { epochs = 0, owners = 0 }, max600 = { epochs = 0, owners = 0 } }
+    tally[via] = entry
+    self.relayTallyCount = self.relayTallyCount + 1
+  end
+  entry.at = now
+  if newEpoch then TallyKind(entry, "epochs", now) end
+  if ownerChange then TallyKind(entry, "owners", now) end
+end
+
 function Capture:OnStateMessage(sender, f, now)
   local id = f.id
   local st = self:GetState(id)
   local me = self:Me()
   local live = f.age == 0
+  local jumped = false
 
   if live then
     if not self:HasPresence(id, sender, now) then return self:Reject("state without presence", sender) end
     -- Like a P, even if a rule below refuses the state: a refused authority
     -- must not also lose its presence (decision 0034).
     self:RefreshPresence(id, sender, now)
+    -- Generation jumps (risk B76, decision 0089 B2): at most LIVE_JUMP above
+    -- everything known here, and one jump above HINT_JUMP per JUMP_COOLDOWN.
+    -- A deliberate exception to R6, out of honest reach.
+    local base = self:Floor(id, st.generation)
+    if f.generation > base + HINT_JUMP then
+      if f.generation > base + LIVE_JUMP then return self:Reject("implausible generation", sender) end
+      if st.jumpAt and now - st.jumpAt < JUMP_COOLDOWN then
+        return self:Reject("generation jump too soon", sender)
+      end
+      jumped = true
+    end
     -- A provisional state never refuses a live one (decision 0038).
     if st.known and not st.provisional then
-      if f.epoch < st.epoch then return self:Reject("old epoch", sender) end
+      if WF.Serial.Newer(st.epoch, f.epoch) then return self:Reject("old epoch", sender) end
       if f.epoch == st.epoch then
         -- The producer of the epoch is kept after it leaves, so its late or
         -- repeated states stay ordered; unknown (relayed) epochs are ordered too.
@@ -1843,6 +2567,7 @@ function Capture:OnStateMessage(sender, f, now)
     st.owner, st.generation = owner, generation
     st.challenger, st.progress = f.challenger, f.progress
     st.mode, st.dir, st.nH, st.nA, st.dur = f.mode, f.dir, f.nH, f.nA, f.dur
+    st.arena, st.slowed = f.arena, f.slowed or nil
     st.epoch, st.seq = f.epoch, f.seq
     st.at = now - f.age
     st.lastStateAt = now - f.age
@@ -1852,9 +2577,22 @@ function Capture:OnStateMessage(sender, f, now)
   end
 
   local wasMine = st.authority ~= nil and st.authority == me
+  local previousOwner = st.owner
+  if jumped then st.jumpAt = now end
+  if self.relayVia then
+    self:TallyRelayed(self.relayVia, not st.known or st.provisional or f.epoch ~= st.epoch,
+      f.generation > st.generation, now)
+  end
+  -- A capture whose C line was lost (risk B5, decision 0086): we held a live
+  -- attempt by the faction that now owns the POI, seen at most 90 s ago, and
+  -- the generation rose.
+  local missed = f.event == nil and st.known and not st.provisional and FACTION_KEYS[f.owner] ~= nil
+    and st.challenger == f.owner and f.generation > st.generation
+    and now - st.lastStateAt <= AUTHORITY_SILENCE
   st.owner, st.generation = f.owner, f.generation
   st.challenger, st.progress = f.challenger, f.progress
   st.mode, st.dir, st.nH, st.nA, st.dur = f.mode, f.dir, f.nH, f.nA, f.dur
+  st.arena, st.slowed = f.arena, f.slowed or nil
   st.epoch, st.seq = f.epoch, f.seq
   st.at = now - f.age
   st.lastStateAt = now - f.age
@@ -1873,52 +2611,119 @@ function Capture:OnStateMessage(sender, f, now)
   if f.event == "START" then
     self:HandleEvent(id, "START", f.dir, now)
   elseif f.event == "CAPTURED" then
-    self:HandleEvent(id, "CAPTURED", f.owner, now, f.generation)
+    self:NoteSelfIn(now)
+    self:HandleEvent(id, "CAPTURED", f.owner, now, f.generation, previousOwner)
     -- The authority's own announce, accepted above; never a relayed answer.
-    if WF.Witness then WF.Witness:Note(sender, "CAPTURED", id, f.generation, f.owner) end
+    -- It lists the participants this client counted (decision 0126 § 3).
+    if WF.Witness then
+      WF.Witness:Note(sender, "CAPTURED", id, f.generation, f.owner, self:Participants(id, f.owner, now))
+    end
+  elseif missed then
+    -- Not a witness: we never received the authority's announce.
+    self:HandleEvent(id, "CAPTURED", f.owner, now, f.generation, previousOwner)
   end
   return true
 end
 
 -- parts: the S fields after the event id, starting with the POI.
-function Capture:ParseState(parts)
-  if #parts ~= 14 then return nil, "bad S field count" end
+function Capture:ParseState(parts, catalogArea)
+  -- Field 15, the arena, is absent in a line without it (decision 0119).
+  if #parts ~= 14 and #parts ~= 15 then return nil, "bad S field count" end
   local f = {
     id = parts[1],
-    epoch = Int(parts[2], 1000000),
+    epoch = Int(parts[2], WF.Serial.MAX),
     seq = Int(parts[3], 100000000),
     owner = parts[4],
-    generation = Int(parts[5], 1000000),
+    generation = Int(parts[5], MAX_GENERATION),
     challenger = parts[6],
     progress = Int(parts[7], 1000),
     mode = parts[8],
     dir = parts[9],
     nH = Int(parts[10], MAX_PRESENCE_PER_POI),
     nA = Int(parts[11], MAX_PRESENCE_PER_POI),
-    dur = Int(parts[12], MAX_DURATION),
+    dur = Int(parts[12], MAX_DURATION * 2),
     event = CODE_EVENTS[parts[13]],
     age = Int(parts[14], 3600),
   }
+  f.arena, f.slowed = nil, false
+  if parts[15] then
+    f.arena, f.slowed = ParseArenaToken(parts[15])
+    if f.slowed == nil then return nil, "bad S arena" end
+  end
   if not f.epoch or not f.seq or not f.generation or not f.progress or not f.nH or not f.nA
       or not f.dur or not f.age then
     return nil, "bad S number"
   end
-  -- Attempt duration (decision 0053): 180 to 1,200 s, exactly 600 s for a
-  -- Settlement.
-  local area = self:Outpost(f.id)
-  if f.dur < CAPTURE_DURATION or (area and area.type == "SETTLEMENT" and f.dur ~= SETTLEMENT_DURATION) then
+  -- Attempt duration (decision 0082): 180..480 s for an Outpost and
+  -- 600..1,080 s for a Settlement, down to 117 and 390 s with the moving
+  -- faction's Front Network (decision 0123 § 6); exactly 1,800 s for a capital
+  -- (0103) and 180 s for a War Camp (0123 § 3).
+  local area = catalogArea or self:Outpost(f.id)
+  local minimum = area and area.type == "SETTLEMENT" and SETTLEMENT_MIN_DURATION or OUTPOST_MIN_DURATION
+  local maximum = area and area.type == "SETTLEMENT" and SETTLEMENT_MAX_DURATION or OUTPOST_MAX_DURATION
+  if area and area.type == "CAPITAL" then minimum, maximum = CAPITAL_DURATION, CAPITAL_DURATION end
+  if area and area.type == "WAR_CAMP" then minimum, maximum = WAR_CAMP_DURATION, WAR_CAMP_DURATION end
+  -- A push slowed by enemies on another layer doubles it (decision 0119 § 4).
+  -- A capital or War Camp has no garrison and no Front Network reduction: its
+  -- only durations are the fixed base and, slowed, exactly its double.
+  if minimum == maximum then
+    if f.dur ~= minimum and f.dur ~= minimum * 2 then return nil, "bad S duration" end
+  elseif f.dur < minimum or f.dur > maximum * 2 then
     return nil, "bad S duration"
   end
   if not OWNERS[f.owner] or not SIDES[f.challenger] or not MODES[f.mode] or not SIDES[f.dir]
       or not f.event then
     return nil, "bad S value"
   end
-  if (f.owner == "N") ~= (f.generation == 0) or f.challenger == f.owner
+  -- A faction owner is never generation 0; a neutral one may be above it
+  -- after a failed siege (decision 0098).
+  if (f.owner ~= "N" and f.generation == 0) or f.challenger == f.owner
       or (f.challenger == "-" and f.progress ~= 0) or ((f.mode == "P") ~= (f.dir ~= "-")) then
     return nil, "inconsistent S"
   end
   if f.event == "-" then f.event = nil end
   return f
+end
+
+-- Forwarding validates shape/catalog rules, not this receiver's epoch,
+-- presence or private battle snapshot. Reuse gameplay parsers (0131).
+function Capture:ValidateForward(kind, data)
+  if type(data) ~= "string" or not self:RelayClass(kind, data) then return false end
+  local p = Split(data, ",")
+  local id = p[1]
+  if kind == "P" then
+    if WF.Stock and WF.Stock:Resource(id) then
+      return #p == 4 and FACTION_KEYS[p[2]] ~= nil and CODE_STATUSES[p[3]] ~= nil and p[4] == "F"
+    end
+    local area = self:Capturable(id)
+    return area ~= nil and (#p == 4 or (#p == 5 and ParseLayer(p[5]) ~= nil))
+      and FACTION_KEYS[p[2]] ~= nil and CODE_STATUSES[p[3]] ~= nil and CADENCE_TTLS[p[4]] ~= nil
+      and (p[4] ~= "W" or area.type == "SETTLEMENT" or area.type == "CAPITAL")
+  elseif kind == "S" then
+    -- A bridge may not have learned the capital window yet. Validate against
+    -- the catalog; the receiving gameplay handler still applies its own gate.
+    local area = self:Capturable(id)
+    return area ~= nil and self:ParseState(p, area) ~= nil
+  elseif kind == "X" then
+    return WF.Stock ~= nil and WF.Stock:ParseState(p) ~= nil
+  elseif kind == "G" or kind == "GD" then
+    local module = WF.Garrison
+    local area = module and module:Area(id)
+    if not area then return false end
+    if kind == "G" then return module:ParseState(p, area) ~= nil end
+    return module:ParseRequest(p, area) ~= nil
+  elseif kind == "SC" then
+    return #p == 8 and WF.Scout ~= nil and WF.Scout:Parse(p, 0) ~= nil
+  elseif kind == "AC" then
+    return #p == 11 and WF.Attack ~= nil and WF.Attack:Parse(p, 0) ~= nil
+  elseif kind == "AR" then
+    return WF.Attack ~= nil and WF.Attack:ParseResult(p) ~= nil
+  elseif kind == "FW" then
+    return WF.Front ~= nil and WF.Front:HasRoutes() and WF.Front:ParseWindow(p) ~= nil
+  elseif kind == "CE" then
+    return WF.Campaign ~= nil and WF.Campaign.Parse(p, kind) ~= nil
+  end
+  return false
 end
 
 function Capture:Ignore(reason, senderName)
@@ -1939,13 +2744,17 @@ function Capture:OnRelayedMessage(kind, data, senderName, relay)
   if self.relayVia then return self:Reject("nested relay", via) end
   if kind == "T" or kind == "TQ" then return self:Reject("relayed ticket", via) end
   if not self:RelayClass(kind, data) then return self:Reject("not relayable", via) end
-  if kind == "P" and Split(data, ",")[2] ~= relay.faction then
-    return self:Reject("relayed P faction", via)
+  -- A relayed presence or kill speaks for the relay's faction only (AC-15).
+  if (kind == "P" or kind == "K") and Split(data, ",")[2] ~= relay.faction then
+    return self:Reject("relayed " .. kind .. " faction", via)
   end
   self.relayedIn = (self.relayedIn or 0) + 1
   self.relayVia = via
+  -- B from a Battle.net link, C an R line of our group, W the chain (decision
+  -- 0103 § 4b counts only bridge copies).
+  self.relayHop = relay.hop
   local ok, result = pcall(self.OnMessage, self, kind, data, senderName, false)
-  self.relayVia = nil
+  self.relayVia, self.relayHop = nil, nil
   if not ok then error(result, 0) end
   return result
 end
@@ -1954,6 +2763,7 @@ end
 -- event id, data its comma-separated fields, POI first (decision 0027). relay:
 -- { via, faction } when the relay carried it from the other faction.
 function Capture:OnMessage(kind, data, senderName, isEcho, relay)
+  self.forwardable = nil -- This synchronous call only; never saved.
   if relay ~= nil then return self:OnRelayedMessage(kind, data, senderName, relay) end
   self.received = self.received + 1
   if isEcho then return self:Ignore("session echo", senderName) end
@@ -1976,11 +2786,20 @@ function Capture:OnMessage(kind, data, senderName, isEcho, relay)
     if not handled then return self:Reject(err or ("bad " .. kind), sender) end
     return true
   end
-  if WF.Ticket and not WF.Ticket:Admit(sender, kind, now) then return self:Ignore("revoked character", senderName) end
+  local relayed = self.relayVia ~= nil
+  if WF.Ticket and not WF.Ticket:Admit(sender, kind, now, relayed) then
+    return self:Ignore("revoked character", senderName)
+  end
+  self.forwardable = self:ValidateForward(kind, data)
+  -- Strict parsing and admission precede every forwarded copy. Local order
+  -- below decides application here, independently of usefulness to a peer.
+  if self.forwardable and not relayed and WF.Relay and WF.Relay.BridgeLocal then
+    local bridged, bridgeError = pcall(WF.Relay.BridgeLocal, WF.Relay, sender, kind, now)
+    if not bridged then WF.RecordError("relay bridge", bridgeError) end
+  end
   local id = parts[1]
   if kind == "K" or kind == "H" or kind == "HQ" then
-    if not WF.Hunting then return self:Reject("hunting unavailable", sender) end
-    return WF.Hunting:OnMessage(kind, parts, sender, now)
+    return self:Reject("retired event", sender)
   end
   if kind == "OD" or kind == "OL" then
     if not WF.Catchup then return self:Reject("catch-up unavailable", sender) end
@@ -1993,6 +2812,14 @@ function Capture:OnMessage(kind, data, senderName, isEcho, relay)
   if kind == "SC" or kind == "SQ" or kind == "SL" then
     if not WF.Scout then return self:Reject("scouting unavailable", sender) end
     return WF.Scout:OnMessage(kind, parts, sender, now)
+  end
+  if kind == "FW" or kind == "FQ" then
+    if not WF.Front then return self:Reject("front unavailable", sender) end
+    return WF.Front:OnMessage(kind, parts, sender, now)
+  end
+  if kind == "CE" or kind == "CQ" or kind == "CL" then
+    if not WF.Campaign then return self:Reject("campaigns unavailable", sender) end
+    return WF.Campaign:OnMessage(kind, parts, sender, now)
   end
   if kind == "AC" or kind == "AQ" or kind == "AL" or kind == "AR" then
     if not WF.Attack then return self:Reject("attacks unavailable", sender) end
@@ -2007,16 +2834,21 @@ function Capture:OnMessage(kind, data, senderName, isEcho, relay)
 
   if kind == "P" then
     local status = CODE_STATUSES[parts[3]]
-    if #parts ~= 4 or not FACTION_KEYS[parts[2]] or not status or not CADENCE_TTLS[parts[4]] then
+    -- Fifth field: the sender's layer (decision 0119 step 2), absent when unknown.
+    local layer = parts[5] and ParseLayer(parts[5]) or nil
+    if (#parts ~= 4 and #parts ~= 5) or (#parts == 5 and not layer) or not FACTION_KEYS[parts[2]]
+      or not status or not CADENCE_TTLS[parts[4]] then
       return self:Reject("bad P", sender)
     end
-    -- W exists only in a Settlement (static type, the same for every client).
-    if parts[4] == "W" and self:Outpost(id).type ~= "SETTLEMENT" then
+    -- W exists only in a Settlement or a capital (static type, the same for
+    -- every client).
+    local placeType = self:Outpost(id).type
+    if parts[4] == "W" and placeType ~= "SETTLEMENT" and placeType ~= "CAPITAL" then
       return self:Reject("bad P", sender)
     end
     -- Counted only (OBSERVE mode): a verified member stating the other faction.
     if WF.Ticket then WF.Ticket:NoteFaction(sender, parts[2]) end
-    return self:OnPresenceMessage(sender, id, parts[2], status, now, parts[4])
+    return self:OnPresenceMessage(sender, id, parts[2], status, now, parts[4], layer)
   elseif kind == "Q" then
     if #parts ~= 1 then return self:Reject("bad Q", sender) end
     return self:OnQuery(sender, id, now)
@@ -2041,19 +2873,32 @@ function Capture:Maintain(id, st, now)
     self:SendState(st, nil, mathMax(1, Floor(now - st.at)))
   end
   local present = self.here and self.here.id == id and self.here.status and me
-  if not self:AuthorityLost(st, now) then
+  -- Our own timer before a reload (risk B13, decision 0087): free for us while
+  -- no authority was heard since and nobody announced a newer epoch.
+  local held = false
+  if st.heldEpoch then
+    if not st.authority and st.epoch == st.heldEpoch and now <= st.heldUntil then
+      held = present and true or false
+    else
+      st.heldEpoch, st.heldUntil = nil, nil
+    end
+  end
+  local _, _, candidates, arena = self:ArenaCount(id, now, st.authority and st.arena or nil)
+  local lost, offArena = self:AuthorityLost(st, now, arena)
+  if not held and not lost then
     st.takeoverAt = nil
     return
   end
   if present then
     if not st.takeoverAt then
-      local _, _, candidates = self:Count(id, now)
-      local rank = 0
+      -- Only a candidate takes over: off the arena's layer we never do (0119 § 3).
+      local rank = nil
       for index = 1, #candidates do
         if candidates[index] == me then rank = index - 1 end
       end
+      if not rank then return end
       local delay = 2 + 3 * rank
-      if st.explicitOut and rank == 0 then delay = 0 end
+      if (st.explicitOut or offArena) and rank == 0 then delay = 0 end
       local earliest = now + delay
       if self.here.queried and earliest < self.here.enterAt + ENTRY_GRACE then
         earliest = self.here.enterAt + ENTRY_GRACE
@@ -2072,11 +2917,84 @@ function Capture:Maintain(id, st, now)
   end
 end
 
+-- Defense credit (decision 0109 § 3), local only: a POI held by our faction
+-- where we stood counted inside while an enemy attempt ran is noted, with the
+-- attempt's highest progress and the last time we were inside; when that
+-- attempt ends without a capture (same owner and generation, challenger gone)
+-- and an authority is known, the defense is credited once if the attempt
+-- reached DEFENSE_MIN_PROGRESS and we were inside within its last
+-- CREDIT_RECENT seconds (decision 0126 § 2); WarRecord:CreditPoi then allows
+-- one per siege. A capture, a new owner or generation, or DEFENSE_KEEP seconds
+-- forget the note. Memory only, one note per POI.
+local DEFENSE_KEEP = 7200
+
+function Capture:WatchDefense(now)
+  local mine = self:MyFaction()
+  if not mine then return end
+  local defending = self.defending
+  if not defending then
+    defending = {}
+    self.defending = defending
+  end
+  local here = self.here
+  self:NoteSelfIn(now)
+  if here and here.status == "IN" then
+    local st = self.states[here.id]
+    if st and st.owner == mine and st.challenger ~= "-" and st.challenger ~= mine then
+      local note = defending[here.id]
+      if not note or note.generation ~= st.generation or note.side ~= st.challenger then
+        note = { generation = st.generation, side = st.challenger, at = now, peak = 0 }
+        defending[here.id] = note
+      end
+      note.seenAt = now
+    end
+  end
+  for id, note in pairs(defending) do
+    local st = self.states[id]
+    if not st or st.owner ~= mine or st.generation ~= note.generation or now - note.at > DEFENSE_KEEP then
+      defending[id] = nil
+    elseif st.challenger ~= note.side then
+      if st.authority then
+        defending[id] = nil
+        -- A real threat, defended to its end (decision 0126 § 2).
+        local area = self:Outpost(id)
+        if area and WF.WarRecord and note.peak >= DEFENSE_MIN_PROGRESS
+            and note.seenAt and now - note.seenAt <= CREDIT_RECENT then
+          WF.WarRecord:CreditPoi("defense", id, area.type)
+        end
+      end
+    elseif type(st.progress) == "number" and st.progress > note.peak then
+      note.peak = st.progress
+    end
+  end
+end
+
 function Capture:UpdateMap(now)
   local map = WF.Map
   if not map or type(map.SetCaptureView) ~= "function" then return end
-  for index = 1, #map.order do
-    local id = map.order[index]
+  local dirty = self.mapDirty
+  local full = self.mapCatalog ~= map or self.mapRevision ~= map.revision or self.mapCount ~= #map.order
+    or self.mapOwners ~= self.owners or self.mapCloud ~= self.cloud or self.mapStates ~= self.states
+  if full then
+    self.mapCapitals = {}
+    for index = 1, #map.order do
+      local id = map.order[index]
+      dirty[id] = true
+      if map.areas[id] and map.areas[id].type == "CAPITAL" then self.mapCapitals[id] = true end
+    end
+    self.mapCatalog, self.mapRevision, self.mapCount = map, map.revision, #map.order
+    self.mapOwners, self.mapCloud, self.mapStates = self.owners, self.cloud, self.states
+  end
+  -- Only moving bars, hints awaiting expiry and the two capital gates need a
+  -- clock. Previously moving bars get one final repaint when they stop.
+  self.mapActive = self.mapActive or {}
+  for id in pairs(self.mapActive) do dirty[id] = true self.mapActive[id] = nil end
+  for id, st in pairs(self.states) do
+    if st.challenger ~= "-" then dirty[id], self.mapActive[id] = true, true end
+  end
+  for id in pairs(self.hints) do dirty[id] = true end
+  for id in pairs(self.mapCapitals) do dirty[id] = true end
+  for id in pairs(dirty) do
     if self:Outpost(id) then
       local owner, half = self:GetDisplay(id, now)
       local hint = self:BestHint(id, now)
@@ -2090,7 +3008,16 @@ function Capture:UpdateMap(now)
         map:SetCaptureView(id, FACTION_KEYS[owner], half and FACTION_KEYS[half] or nil)
       end
     end
+    dirty[id] = nil
   end
+end
+
+function Capture:TickModule(name, now)
+  local module = WF[name]
+  if not module then return true end
+  local ok, err = pcall(module.Tick, module, now)
+  if not ok and WF.RecordError then WF.RecordError(name .. " tick", err) end
+  return ok
 end
 
 function Capture:Tick()
@@ -2098,8 +3025,15 @@ function Capture:Tick()
   if now <= 0 then return end
   if self.lastTickAt and now - self.lastTickAt < TICK_INTERVAL then return end
   self.lastTickAt = now
+  -- The campaign first (decision 0103 § 3): a campaign change resets owners
+  -- and may change the routes before they are loaded or used.
+  if not self:TickModule("Campaign", now) then return end
   if not self.loaded then self:LoadOwners() end
 
+  if not self.lastCapitalSyncAt or now - self.lastCapitalSyncAt >= ELIGIBILITY_INTERVAL then
+    self.lastCapitalSyncAt = now
+    self:SyncCapital(now)
+  end
   if self.here and (not self.lastEligibilityAt or now - self.lastEligibilityAt >= ELIGIBILITY_INTERVAL) then
     self.lastEligibilityAt = now
     self:UpdateEligibility(now, false)
@@ -2107,6 +3041,7 @@ function Capture:Tick()
   for id, st in pairs(self.states) do
     self:Maintain(id, st, now)
   end
+  self:WatchDefense(now)
   if not self.lastMapAt or now - self.lastMapAt >= MAP_INTERVAL then
     self.lastMapAt = now
     for hinted in pairs(self.hints) do self:PruneHints(hinted, now) end
@@ -2114,12 +3049,14 @@ function Capture:Tick()
     -- Every second, so a disconnect without PLAYER_LOGOUT loses at most that.
     self:SaveProgress(now)
   end
-  if WF.Hunting then WF.Hunting:Tick(now) end
-  if WF.Catchup then WF.Catchup:Tick(now) end
-  if WF.Stock then WF.Stock:Tick(now) end
-  if WF.Garrison then WF.Garrison:Tick(now) end
-  if WF.Scout then WF.Scout:Tick(now) end
-  if WF.Attack then WF.Attack:Tick(now) end
+  self:TickModule("Catchup", now)
+  local frontOK = self:TickModule("Front", now)
+  self:TickModule("Stock", now)
+  if frontOK then
+    local garrisonOK = self:TickModule("Garrison", now)
+    self:TickModule("Scout", now)
+    if garrisonOK then self:TickModule("Attack", now) end
+  end
 end
 
 -- Display helpers ---------------------------------------------------------------
@@ -2143,11 +3080,13 @@ function Capture:Remaining(view)
   return nil
 end
 
--- A Settlement attempt held by one attacker with no defender (decision 0053).
+-- A Settlement attempt held by one attacker, or a capital attempt held by
+-- fewer than five, with no defender (decisions 0053, 0103).
 local function Frozen(view)
   if not view.siege or view.mode ~= "C" or view.challenger == "-" then return false end
   local attackers = view.challenger == "H" and view.nH or view.nA
   local defenders = view.challenger == "H" and view.nA or view.nH
+  if view.capital then return attackers > 0 and attackers < CAPITAL_ATTACKERS and defenders == 0 end
   return attackers == 1 and defenders == 0
 end
 
@@ -2166,6 +3105,9 @@ function Capture:ModeText(view)
     end
     return "Capturing - " .. FACTION_NAMES[view.dir]
   elseif view.mode == "C" then
+    if Frozen(view) and view.capital then
+      return "Frozen - " .. FACTION_NAMES[view.challenger] .. " needs " .. CAPITAL_ATTACKERS .. " attackers"
+    end
     if Frozen(view) then return "Frozen - " .. FACTION_NAMES[view.challenger] .. " needs a second attacker" end
     return "Contested (" .. view.nH .. " vs " .. view.nA .. ")"
   elseif view.mode == "D" then
@@ -2178,31 +3120,86 @@ end
 
 -- Why an attempt takes its time, or why a Settlement attempt cannot open for
 -- faction side (roadmap WP10): one line for the HUD and the map tooltip.
+-- Second value: true when side cannot open the siege at all (the HUD hides).
 function Capture:Detail(id, view, side, now)
   local area = self:Outpost(id)
   if not area or not view then return nil end
+  if area.type == "CAPITAL" then
+    -- The day-long capital siege (decision 0103 § 2).
+    local siege = WF.Front and WF.Front:SiegeText(id, now or Now())
+    if view.challenger ~= "-" then
+      return "Siege: " .. Clock(view.slowed and CAPITAL_DURATION * 2 or CAPITAL_DURATION) .. " for a full bar, "
+        .. CAPITAL_ATTACKERS .. " attackers needed to advance"
+        .. (view.slowed and ", half speed: enemies on another layer" or "") .. (siege and (". " .. siege) or "")
+    end
+    if not FACTION_KEYS[side or ""] or side == view.owner then return siege end
+    local blocked = self:SiegeBlocked(id, side, now or Now())
+    if blocked then
+      return (siege and (siege .. ". ") or "") .. "Siege locked: " .. blocked, self:TargetOwner(id, now) ~= side
+    end
+    local inside = (side == "H" and view.nH or view.nA) or 0
+    if inside > CAPITAL_ATTACKERS then inside = CAPITAL_ATTACKERS end
+    return (siege and (siege .. ". ") or "") .. inside .. "/" .. CAPITAL_ATTACKERS .. " attackers inside"
+  end
   if area.type == "SETTLEMENT" then
     local required = view.owner == "N" and 1 or SIEGE_ATTACKERS
+    -- The three-hour countdown of a running siege, for both factions (0079).
+    local siege = WF.Front and WF.Front:SiegeText(id, now or Now())
     if view.challenger ~= "-" then
       local attackers = required == 1 and "1 attacker" or required .. " attackers"
-      return "Siege: " .. Clock(view.dur or SETTLEMENT_DURATION) .. " for a full bar, " .. attackers .. " needed to advance"
+      -- A neutral POI holds no garrison: the line names none.
+      local garrisonText = ""
+      if FACTION_KEYS[view.owner or ""] then
+        local used, capacity = self:GarrisonOccupancy(id)
+        garrisonText = " (garrison " .. used .. "/" .. capacity .. " Unit Size)"
+      end
+      return "Siege: " .. Clock(view.dur or SETTLEMENT_DURATION) .. " for a full bar"
+        .. garrisonText .. ", " .. attackers .. " needed to advance"
+        .. (view.slowed and ", half speed: enemies on another layer" or "")
+        .. (siege and (". " .. siege) or "")
     end
-    if not FACTION_KEYS[side or ""] or side == view.owner then return nil end
+    if not FACTION_KEYS[side or ""] or side == view.owner then return siege end
     local blocked = self:SiegeBlocked(id, side, now or Now())
-    if blocked then return "Siege locked: " .. blocked end
+    if blocked then
+      return (siege and (siege .. ". ") or "") .. "Siege locked: " .. blocked, self:TargetOwner(id, now) ~= side
+    end
+    if siege then
+      local inside = (side == "H" and view.nH or view.nA) or 0
+      if inside > required then inside = required end
+      return siege .. ". " .. inside .. "/" .. required .. " attackers inside"
+    end
     if required == 1 then return "Siege open: 1 " .. FACTION_NAMES[side] .. " attacker inside starts it" end
     local inside = (side == "H" and view.nH or view.nA) or 0
     if inside > SIEGE_ATTACKERS then inside = SIEGE_ATTACKERS end
     return FACTION_NAMES[side] .. " siege: " .. inside .. "/" .. SIEGE_ATTACKERS .. " attackers inside"
   end
-  if view.challenger ~= "-" then
-    return "Capture time " .. Clock(view.dur or CAPTURE_DURATION) .. ", set by the garrison when the attempt began"
+  -- A War Camp (decision 0123 § 3): fixed time, no garrison, no front rule.
+  if area.type == "WAR_CAMP" then
+    if view.challenger ~= "-" then
+      return "Capture time " .. Clock(view.dur or WAR_CAMP_DURATION)
+        .. (view.slowed and ", half speed: enemies on another layer" or "")
+    end
+    return "Capture time " .. Clock(WAR_CAMP_DURATION)
   end
-  if not FACTION_KEYS[view.owner] then return "Capture time " .. Clock(CAPTURE_DURATION) .. " (no garrison)" end
-  local defense, units = self:GarrisonDefense(id)
+  if view.challenger ~= "-" then
+    local garrisonText = ""
+    if FACTION_KEYS[view.owner or ""] then
+      local used, capacity = self:GarrisonOccupancy(id)
+      garrisonText = " (garrison " .. used .. "/" .. capacity .. " Unit Size)"
+    end
+    return "Capture time " .. Clock(view.dur or CAPTURE_DURATION) .. garrisonText
+      .. (view.slowed and ", half speed: enemies on another layer" or "")
+  end
+  local locked = WF.Front and WF.Front:LockText(id, now or Now())
+  if locked then return locked end
+  if FACTION_KEYS[side or ""] and side ~= view.owner and WF.Front and not WF.Front:OutpostOpen(id, side) then
+    return WF.Front:FrozenText(id, side, now or Now()) or ("Closed: not on the " .. FACTION_NAMES[side] .. " front")
+  end
+  if not FACTION_KEYS[view.owner] then return "Capture time " .. Clock(CAPTURE_DURATION) end
+  local used, capacity = self:GarrisonOccupancy(id)
   local dur = self:AttemptDuration(id)
-  if units == 0 then return "Capture time " .. Clock(dur) .. " (empty garrison)" end
-  return "Capture time " .. Clock(dur) .. " (garrison defense " .. defense .. ")"
+  if used == 0 then return "Capture time " .. Clock(dur) .. " (empty garrison)" end
+  return "Capture time " .. Clock(dur) .. " (garrison " .. used .. "/" .. capacity .. " Unit Size)"
 end
 
 -- Capture details for the map tooltip, nil when the area cannot be captured:
@@ -2214,10 +3211,6 @@ function Capture:TooltipInfo(id, now)
   info.cloud = self:CloudHint(id)
   if info.cloud and info.hint and info.hint.generation >= info.cloud.g then info.cloud = nil end
   if info.cloud and info.cloud.o and info.hint then info.hint = nil end
-  if WF.Hunting and WF.Hunting:Area(id) then
-    WF.Hunting:TooltipInfo(id, info)
-    return info
-  end
   if not self:Outpost(id) then return info end
   local _, _, view = self:GetDisplay(id, now or Now())
   if view then
@@ -2250,6 +3243,7 @@ function Capture:GetHud(now)
   local st = self:GetState(here.id)
   local view = self:GetView(here.id, now)
   local me = self:Me()
+  local detail, locked = self:Detail(here.id, view, self:MyFaction(), now)
   return {
     id = here.id,
     area = area,
@@ -2259,7 +3253,10 @@ function Capture:GetHud(now)
     status = here.status,
     reason = here.reason,
     remaining = self:Remaining(view),
-    detail = self:Detail(here.id, view, self:MyFaction(), now),
+    detail = detail,
+    locked = locked,
+    -- Enemies counted here from another layer (decision 0119 step 2, display only).
+    otherLayer = self:OtherLayerRivals(here.id, now),
   }
 end
 
@@ -2303,6 +3300,12 @@ function Capture:PrintStatus()
     .. (p2p.lastCapError and (" lastRouteError=" .. p2p.lastCapError) or ""))
   Print("capture: received=" .. self.received .. " ignored=" .. self.ignored
     .. (self.lastIgnore and (" lastIgnore=" .. self.lastIgnore) or ""))
+  -- AC-2 measurement (decision 0093).
+  Print("capture: relayed takeovers, relayers=" .. self.relayTallyCount)
+  for via, e in pairs(self.relayTally) do
+    Print(strFormat("capture: via %s epochs=%d max60=%d max600=%d owners=%d max60=%d max600=%d",
+      via, e.total.epochs, e.max60.epochs, e.max600.epochs, e.total.owners, e.max60.owners, e.max600.owners))
+  end
   if WF.lastHandlerError then Print("capture: lastHandlerError=" .. WF.lastHandlerError) end
   local counts = WF.eventCounts or {}
   local total, name, value = 0

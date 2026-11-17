@@ -6,7 +6,6 @@ local SendAddonMessage = WF.Compat.Global("SendAddonMessage")
 local RegisterAddonMessagePrefix = WF.Compat.Global("RegisterAddonMessagePrefix")
 local SendChatMessage = WF.Compat.Global("SendChatMessage")
 local JoinChannelByName = WF.Compat.Global("JoinChannelByName")
-local LeaveChannelByName = WF.Compat.Global("LeaveChannelByName")
 
 WF.P2PTest = WF.P2PTest or {}
 local P2P = WF.P2PTest
@@ -35,7 +34,6 @@ local EVENT_TRANSPORTS = {
 }
 local SAFE_AUTO_REPLY = { PARTY = true, RAID = true, GUILD = true }
 local DEFAULT_CUSTOM_CHANNEL = "Warfront"
-local LEGACY_TEST_CHANNEL = "WarfrontTest"
 -- Visible channel line (decisions 0027, 0029):
 -- WF<level>:<addon version>:<id>:<session>:<seq base 36>:<body>. The addon
 -- version always follows "WF<n>:", so a build reads it even on another level.
@@ -43,26 +41,38 @@ local CHANNEL_LEVEL = WF.channelLevel
 local CHANNEL_WIRE_PREFIX = "WF" .. tostring(CHANNEL_LEVEL) .. ":" .. tostring(WF.version) .. ":"
 -- One short id per event. HI and D are diagnostics, V the version announce
 -- (core/version.lua), B and R the cross-faction relay beacon and relayed packet
--- (modules/relay.lua, decision 0068); the capture ids are routed to
+-- (modules/relay.lua, decision 0068), NP the guild network presence
+-- (modules/transport.lua, decision 0077), F a fact passed hand to hand by
+-- whisper (modules/chain.lua, decision 0077 step 4b), BD/BQ/BP the board copies
+-- (modules/boards.lua, decision 0110, group and guild only); the capture ids are routed to
 -- WF.Capture:OnMessage (docs/p2p-protocol.md).
 local CHANNEL_ID_BY_TYPE = { HELLO = "HI", DATA = "D" }
-local CHANNEL_TYPE_BY_ID = { HI = "HELLO", D = "DATA", V = "VERSION", B = "BEACON", R = "RELAY" }
+-- LJ/LN: a request to join a layer and its refusal (modules/layer_jump.lua,
+-- decision 0119 step 4), whisper only.
+local CHANNEL_TYPE_BY_ID = { HI = "HELLO", D = "DATA", V = "VERSION", B = "BEACON", R = "RELAY", NP = "NETWORK",
+  F = "FORWARD", BD = "BOARD", BQ = "BOARD", BP = "BOARD", AM = "ALLIES", LJ = "LAYER", LN = "LAYER" }
 local CAPTURE_IDS = {
   P = true, S = true, Q = true, K = true, H = true, HQ = true, OD = true, OL = true, X = true,
   G = true, GD = true, GQ = true, SC = true, SQ = true, SL = true, AC = true, AQ = true, AL = true, AR = true,
-  T = true, TQ = true,
+  T = true, TQ = true, FW = true, FQ = true, CE = true, CQ = true, CL = true,
 }
+-- modules/transport.lua routes the same capture ids (decision 0077).
+function P2P.IsCaptureId(id)
+  return CAPTURE_IDS[id] == true
+end
 local CUSTOM_CHANNEL_MAX_BYTES = 255
 local CUSTOM_CHANNEL_TRANSPORT = "CHANNEL_CHAT"
+-- Visible custom-channel sends stay off (decision 0075). Decision 0134 adds a
+-- hidden addon-message lane through modules/transport.lua; this guard still
+-- protects the old visible CHAT_MSG_CHANNEL path and its diagnostics.
+local CHANNEL_SEND_OFF = true
+local CHANNEL_SEND_OFF_ERROR = "custom channel sending is off on Forever"
 -- Octo's own UI whispers addon data through the server: a GUILD addon message
 -- whose prefix is TW_CHAT_MSG_WHISPER<Name> reaches only Name, which receives
 -- the first payload is TW_CHAT_MSG_WHISPER and the fourth is the sender.
 local TW_WHISPER_PREFIX = "TW_CHAT_MSG_WHISPER"
 local TW_WHISPER_TRANSPORT = "TW_WHISPER"
-local AUTO_JOIN_INITIAL_DELAY_SECONDS = 5
-local AUTO_JOIN_RETRY_SECONDS = 3
-local AUTO_JOIN_MAX_ATTEMPTS = 4
-local AUTO_JOIN_MONITOR_SECONDS = 60
+local CHANNEL_MONITOR_SECONDS = 5
 local PREPARED_CHAT_DELAY_SECONDS = 0.05
 local SIZE_SWEEP_BASELINE_BYTES = { 32, 64, 96, 128, 160, 192, 224, 240, MAX_MESSAGE_BYTES, 32 }
 local SIZE_SWEEP_BOUNDARY_BYTES = {
@@ -73,16 +83,18 @@ local pendingPings = {}
 local pendingPingOrder = {}
 local seen = {}
 local seenOrder = {}
-local lastSequence = {}
+-- Last sequence per session seen, for the diagnostic counters only; at most
+-- 256 sessions, the oldest seen dropped first (risk B15).
+local lastSequence = { bySession = {}, order = {} }
 local burstState
 local sizeSweepState
-local autoJoinState
 local preparedChatState
 local configuredChannelTab
-local legacyChannelCleanupDone = false
+local channelMonitorState
+local joinAttemptAt
 local burstFrame = CreateFrame("Frame", "WarfrontP2PBurstFrame", UIParent)
 local sizeSweepFrame = CreateFrame("Frame", "WarfrontP2PSizeSweepFrame", UIParent)
-local channelJoinFrame = CreateFrame("Frame", "WarfrontP2PChannelJoinFrame", UIParent)
+local channelMonitorFrame = CreateFrame("Frame", "WarfrontP2PChannelMonitorFrame", UIParent)
 local preparedChatFrame = CreateFrame("Frame", "WarfrontP2PPreparedChatFrame", UIParent)
 
 local function Upper(value)
@@ -102,6 +114,28 @@ local function TakeWord(text)
   local source = tostring(text or "")
   local _, _, word, rest = string.find(source, "^%s*(%S+)%s*(.*)$")
   return word, rest or ""
+end
+
+-- A player named in a command: every word, since a Forever name is "First
+-- Surname" (decision 0070), minus a trailing keyword from options. "First-Surname"
+-- is read as Warfront reads a sender (WF.Names.Split). Returns target, keyword.
+local function TakeTarget(text, options)
+  local words = {}
+  for word in string.gmatch(tostring(text or ""), "%S+") do words[#words + 1] = word end
+  local option
+  if options and #words > 1 and options[string.lower(words[#words])] then
+    option = string.lower(table.remove(words))
+  end
+  local target = table.concat(words, " ")
+  if target == "" then return nil, option end
+  local names = WF.Names
+  if names and type(names.Split) == "function" then
+    local ok, name, realm = pcall(names.Split, target)
+    if ok and type(name) == "string" and name ~= "" then
+      target = realm and (name .. "-" .. realm) or name
+    end
+  end
+  return target, option
 end
 
 local function AddSeen(key)
@@ -191,10 +225,36 @@ local function Base36(value)
   return output
 end
 
+-- The campaign header field <N>.<S>.<set> (decision 0103 § 4b, 0102 § 5):
+-- every line carries the sender's campaign; modules/campaign.lua decides.
+local NO_CAMPAIGN = "0.0.-"
+
+local function CampaignTag()
+  local campaign = WF.Campaign
+  if not campaign or type(campaign.Tag) ~= "function" then return NO_CAMPAIGN end
+  local ok, tag = pcall(campaign.Tag, campaign)
+  if ok and type(tag) == "string" then return tag end
+  return NO_CAMPAIGN
+end
+
 local function ChannelWire(id, session, sequence, body)
-  return CHANNEL_WIRE_PREFIX .. id .. ":" .. session .. ":" .. Base36(sequence) .. ":" .. (body or "")
+  return CHANNEL_WIRE_PREFIX .. id .. ":" .. session .. ":" .. Base36(sequence) .. ":" .. CampaignTag() .. ":"
+    .. (body or "")
 end
 P2P.ChannelWire = ChannelWire
+
+-- Whether a received line of the given id and campaign header may be applied
+-- (modules/campaign.lua): a line of another campaign is counted, not applied.
+function P2P.AdmitCampaign(id, campaign)
+  local module = WF.Campaign
+  if not module or type(module.Admit) ~= "function" then return campaign == CampaignTag() end
+  local ok, admitted = pcall(module.Admit, module, id, campaign, WF.Now())
+  if not ok then
+    WF.RecordError("campaign admit", admitted)
+    return false
+  end
+  return admitted
+end
 
 local function ChannelMessageType(id)
   return CHANNEL_TYPE_BY_ID[id] or id
@@ -217,8 +277,10 @@ function P2P.ParseChannel(text)
   if #text > CUSTOM_CHANNEL_MAX_BYTES then return nil, "channel message exceeds 255 bytes", meta end
   if not meta then return nil, "invalid addon version" end
 
-  local _, _, id, session, sequenceText, body = string.find(tail, "^([A-Z][A-Z0-9]*):([0-9A-F]+):([0-9A-Z]+):(.*)$")
+  local _, _, id, session, sequenceText, campaign, body = string.find(tail,
+    "^([A-Z][A-Z0-9]*):([0-9A-F]+):([0-9A-Z]+):([0-9A-Z]+%.[0-9A-Z]+%.[A-Z0-9%-]+):(.*)$")
   if not id then return nil, "envelope does not match WF" .. tostring(CHANNEL_LEVEL), meta end
+  if #campaign > 20 then return nil, "invalid campaign", meta end
   if not CHANNEL_TYPE_BY_ID[id] and not CAPTURE_IDS[id] then return nil, "unknown channel event id", meta end
   if #session < 4 or #session > 12 then return nil, "invalid session id", meta end
   local sequence = #sequenceText <= 6 and tonumber(sequenceText, 36)
@@ -232,6 +294,7 @@ function P2P.ParseChannel(text)
     messageType = ChannelMessageType(id),
     session = session,
     sequence = sequence,
+    campaign = campaign,
     data = body,
   }, nil, meta
 end
@@ -327,7 +390,7 @@ end
 
 -- Experimental hidden whisper to one player; see TW_WHISPER_PREFIX.
 local function SendTwWhisper(target, messageType, data, reservedSequence)
-  if type(target) ~= "string" or target == "" or #target > 24 or string.find(target, "[%c<>|]") then
+  if type(target) ~= "string" or target == "" or #target > 48 or string.find(target, "[%c<>|]") then
     return false, "target must be a player name"
   end
   if not ALLOWED_TYPES[messageType] then return false, "invalid message type" end
@@ -426,12 +489,18 @@ local function HandleParsed(parsed, rawPayload, transport, rawEntry)
   local fresh = AddSeen(key)
   if not fresh then Storage:IncrementReceive("duplicates") end
 
-  local previous = lastSequence[parsed.session]
+  local sequences = lastSequence.bySession
+  local previous = sequences[parsed.session]
   if previous and parsed.sequence < previous then Storage:IncrementReceive("outOfOrder") end
   if previous and parsed.sequence > previous + 1 then
     Storage:AddReceiveAmount("missingSequences", parsed.sequence - previous - 1)
   end
-  if not previous or parsed.sequence > previous then lastSequence[parsed.session] = parsed.sequence end
+  if not previous then
+    local order = lastSequence.order
+    order[#order + 1] = parsed.session
+    while #order > 256 do sequences[table.remove(order, 1)] = nil end
+  end
+  if not previous or parsed.sequence > previous then sequences[parsed.session] = parsed.sequence end
 
   if db and parsed.session == db.session.id then Storage:IncrementReceive("echoes") end
 
@@ -504,6 +573,8 @@ local function OnAddonMessage(eventName, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10
   -- TW_ whispers, before building any capture.
   local twWhisper = a1 == TW_WHISPER_PREFIX and type(a2) == "string" and IsWire(a2)
   if a1 ~= PREFIX and not twWhisper then return end
+  -- A WF<level> capture line is modules/transport.lua's (decision 0077), not a diagnostic.
+  if a1 == PREFIX and type(a2) == "string" and string.find(a2, "^WF%d") then return end
   local values, descriptors, count = PackArguments(a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, a16)
   local rawEntry = {
     at = WF.Epoch(),
@@ -901,123 +972,96 @@ local function InstallChannelDisplayGuard()
 end
 InstallChannelDisplayGuard()
 
-local function CompleteAutoJoinCycle(status, channel, errorText)
-  local attempts = autoJoinState and autoJoinState.attempts or 0
-  Storage:AddResult({
-    kind = "CHANNEL_AUTO_JOIN_END",
-    status = status,
-    channelName = channel and channel.name or DEFAULT_CUSTOM_CHANNEL,
-    channelId = channel and channel.id or nil,
-    attempts = attempts,
-    error = errorText,
-  })
-  if status == "JOINED" then
-    if autoJoinState.lastStatus ~= "JOINED" then
-      local applied, applyError = ApplyChannelDisplay(channel)
-      if not applied then
-        WF.Print("Warfront chat tab could not be set up; /wf tab retries it.")
-        WF.RecordError("chat display", applyError)
-      end
-      -- Tell the channel which build we run; older peers get warned, and newer
-      -- ones answer so that we get warned (core/version.lua).
-      if WF.Version then
-        local announced, announceError = pcall(WF.Version.Announce, WF.Version)
-        if not announced then WF.RecordError("version announce", announceError) end
-      end
-      -- Membership ticket, once per join (modules/ticket.lua, decision 0061).
-      if WF.Ticket then
-        local joined, joinError = pcall(WF.Ticket.OnJoined, WF.Ticket)
-        if not joined then WF.RecordError("ticket join", joinError) end
-      end
-      -- Owner catch-up digest, 10 s later (modules/catchup.lua, decision 0038).
-      if WF.Catchup then
-        local joined, joinError = pcall(WF.Catchup.OnJoined, WF.Catchup)
-        if not joined then WF.RecordError("catch-up join", joinError) end
-      end
-      -- Scouts under way and discoveries (modules/scout.lua, decision 0050).
-      if WF.Scout then
-        local asked, askError = pcall(WF.Scout.OnJoined, WF.Scout)
-        if not asked then WF.RecordError("scout join", askError) end
-      end
-      -- Armies under way and pending battles (modules/attack.lua, decision 0052).
-      if WF.Attack then
-        local asked, askError = pcall(WF.Attack.OnJoined, WF.Attack)
-        if not asked then WF.RecordError("attack join", askError) end
-      end
-    end
-  elseif status == "FAILED" then
-    WF.Print("Warfront could not connect yet; retrying in " .. AUTO_JOIN_MONITOR_SECONDS .. " seconds.")
+-- The client, rather than the addon, owns permanent-channel membership. Once it
+-- has joined the channel, synchronization starts automatically without calling
+-- the protected JoinPermanentChannel API.
+local function OnChannelJoined(channel)
+  local applied, applyError = ApplyChannelDisplay(channel)
+  if not applied then
+    WF.Print("Warfront chat tab could not be set up; /wf tab retries it.")
+    WF.RecordError("chat display", applyError)
   end
-  autoJoinState.attempts = 0
-  autoJoinState.lastError = errorText
-  autoJoinState.lastStatus = status
-  autoJoinState.nextAt = WF.Now() + AUTO_JOIN_MONITOR_SECONDS
+  -- Tell the channel which build we run; older peers get warned, and newer
+  -- ones answer so that we get warned (core/version.lua).
+  if WF.Version then
+    local announced, announceError = pcall(WF.Version.Announce, WF.Version)
+    if not announced then WF.RecordError("version announce", announceError) end
+  end
+  -- Membership ticket, once per join (modules/ticket.lua, decision 0061).
+  if WF.Ticket then
+    local joined, joinError = pcall(WF.Ticket.OnJoined, WF.Ticket)
+    if not joined then WF.RecordError("ticket join", joinError) end
+  end
+  -- Owner catch-up digest, 10 s later (modules/catchup.lua, decision 0038).
+  if WF.Catchup then
+    local joined, joinError = pcall(WF.Catchup.OnJoined, WF.Catchup)
+    if not joined then WF.RecordError("catch-up join", joinError) end
+  end
+  -- Scouts under way and discoveries (modules/scout.lua, decision 0050).
+  if WF.Scout then
+    local asked, askError = pcall(WF.Scout.OnJoined, WF.Scout)
+    if not asked then WF.RecordError("scout join", askError) end
+  end
+  -- Armies under way and pending battles (modules/attack.lua, decision 0052).
+  if WF.Attack then
+    local asked, askError = pcall(WF.Attack.OnJoined, WF.Attack)
+    if not asked then WF.RecordError("attack join", askError) end
+  end
+  -- Siege windows under way (modules/front.lua, decision 0098).
+  if WF.Front then
+    local asked, askError = pcall(WF.Front.OnJoined, WF.Front)
+    if not asked then WF.RecordError("front join", askError) end
+  end
+  return applied, applyError
 end
 
-local function AutoJoinTick()
-  if not autoJoinState then return end
-  local now = WF.Now()
-  if now < autoJoinState.nextAt then return end
-
-  if not legacyChannelCleanupDone then
-    legacyChannelCleanupDone = true
-    if type(LeaveChannelByName) == "function" then
-      local left, leaveError = pcall(LeaveChannelByName, LEGACY_TEST_CHANNEL)
-      if not left and WF.RecordError then WF.RecordError("legacy test channel leave", leaveError) end
-    end
-  end
+local function ChannelMonitorTick()
+  if not channelMonitorState or WF.Now() < channelMonitorState.nextAt then return end
+  channelMonitorState.nextAt = WF.Now() + CHANNEL_MONITOR_SECONDS
 
   local channel = FindJoinedChannel(DEFAULT_CUSTOM_CHANNEL)
-  if channel then
-    CompleteAutoJoinCycle("JOINED", channel)
+  if channelMonitorState.autoJoinPending then
+    -- SavedVariables initialize on ADDON_LOADED, after this file is loaded.
+    -- Wait until that event has classified the profile before consuming the
+    -- one-shot decision.
+    if not (Storage and Storage.initialized) then return end
+    channelMonitorState.autoJoinPending = false
+    if Storage.newProfile == true and not channel then
+      joinAttemptAt = WF.Now()
+      local joined, joinError = JoinDiagnosticChannel(DEFAULT_CUSTOM_CHANNEL, true, true)
+      if not joined then
+        joinAttemptAt = nil
+        WF.RecordError("new profile channel join", joinError)
+      end
+      channel = FindJoinedChannel(DEFAULT_CUSTOM_CHANNEL)
+    end
+  end
+  if not channel then
+    channelMonitorState.channelId = nil
     return
   end
-  if autoJoinState.lastStatus == "JOINED" then
-    Storage:AddResult({
-      kind = "CHANNEL_AUTO_JOIN_LOST",
-      status = "RETRYING",
-      channelName = DEFAULT_CUSTOM_CHANNEL,
-    })
-    autoJoinState.attempts = 0
-    autoJoinState.lastStatus = "LOST"
-  end
-  if autoJoinState.attempts >= AUTO_JOIN_MAX_ATTEMPTS then
-    CompleteAutoJoinCycle("FAILED", nil, autoJoinState.lastError)
-    return
-  end
+  if channelMonitorState.channelId == channel.id then return end
 
-  autoJoinState.attempts = autoJoinState.attempts + 1
-  local hidden = autoJoinState.attempts < AUTO_JOIN_MAX_ATTEMPTS
-  local ok, err = JoinDiagnosticChannel(DEFAULT_CUSTOM_CHANNEL, true, hidden)
-  autoJoinState.lastError = err
-  autoJoinState.lastStatus = "PENDING"
-  autoJoinState.nextAt = now + AUTO_JOIN_RETRY_SECONDS
+  channelMonitorState.channelId = channel.id
+  local synchronized, syncError = OnChannelJoined(channel)
   Storage:AddResult({
-    kind = "CHANNEL_AUTO_JOIN_ATTEMPT",
-    status = ok and "CALL_ACCEPTED" or "CALL_FAILED",
-    channelName = DEFAULT_CUSTOM_CHANNEL,
-    attempt = autoJoinState.attempts,
-    hidden = hidden,
-    error = err,
+    kind = "CHANNEL_SYNC_START",
+    status = synchronized and "STARTED" or "DISPLAY_FAILED",
+    channelId = channel.id,
+    channelName = channel.name,
+    error = syncError,
   })
 end
 
-local function StartAutoJoin()
-  if autoJoinState then return end
-  autoJoinState = {
-    attempts = 0,
-    lastStatus = "SCHEDULED",
-    nextAt = WF.Now() + AUTO_JOIN_INITIAL_DELAY_SECONDS,
+local function StartChannelMonitor()
+  if channelMonitorState then return end
+  channelMonitorState = {
+    nextAt = WF.Now() + 1,
+    autoJoinPending = true,
   }
-  Storage:AddResult({
-    kind = "CHANNEL_AUTO_JOIN_START",
-    status = "SCHEDULED",
-    channelName = DEFAULT_CUSTOM_CHANNEL,
-    delaySeconds = AUTO_JOIN_INITIAL_DELAY_SECONDS,
-    maxAttempts = AUTO_JOIN_MAX_ATTEMPTS,
-  })
-  channelJoinFrame:SetScript("OnUpdate", AutoJoinTick)
+  channelMonitorFrame:SetScript("OnUpdate", ChannelMonitorTick)
 end
+StartChannelMonitor()
 
 local function OpenPreparedChatNow(text)
   if type(ChatFrameUtil) == "table" and type(ChatFrameUtil.OpenChat) == "function" then
@@ -1027,6 +1071,84 @@ local function OpenPreparedChatNow(text)
   end
   return false, "the native chat composer is unavailable"
 end
+
+-- Main window "Connect" button (decision 0118). A new saved profile also makes
+-- one hidden join attempt at startup (0135); established profiles only join
+-- from this button. A blocked attempt is remembered for the client build in
+-- WarfrontDB.channelJoinBlocked, and later clicks open the chat box with the
+-- join command, which the player sends with Enter.
+local JOIN_BLOCK_WINDOW = 0.5
+
+local function ClientBuild()
+  local info = WF.Compat.Global("GetBuildInfo")
+  if type(info) ~= "function" then return nil end
+  local ok, _, build = pcall(info)
+  if ok and build ~= nil then return tostring(build) end
+  return nil
+end
+
+local function JoinDB()
+  if not Storage or Storage.readOnly then return nil end
+  local db = Storage:GetDB()
+  if type(db) == "table" then return db end
+  return nil
+end
+
+local function OpenJoinCommand()
+  return OpenPreparedChatNow("/join " .. DEFAULT_CUSTOM_CHANNEL)
+end
+
+function P2P.ChannelJoined()
+  return FindJoinedChannel(DEFAULT_CUSTOM_CHANNEL) ~= nil
+end
+
+-- Hidden addon-message channel target (decision 0134). Forever's measured
+-- CHANNEL path accepts the joined channel id string, not its name.
+function P2P.ChannelTarget()
+  local channel = FindJoinedChannel(DEFAULT_CUSTOM_CHANNEL)
+  if not channel then return nil end
+  return tostring(channel.id), channel.name
+end
+
+-- "joined", "joining" (direct call made), "chat" (chat box waits for Enter),
+-- or nil and an error.
+function P2P.JoinChannelFromUI()
+  if P2P.ChannelJoined() then return "joined" end
+  local db, build = JoinDB(), ClientBuild()
+  if not (db and build and db.channelJoinBlocked == build) then
+    joinAttemptAt = WF.Now()
+    local joined, joinError = JoinDiagnosticChannel(DEFAULT_CUSTOM_CHANNEL, true)
+    -- A blocked action reported during the call already opened the chat box.
+    if joined and joinAttemptAt then return "joining" end
+    if joined then return "chat" end
+    joinAttemptAt = nil
+    WF.RecordError("channel join", joinError)
+  end
+  local opened, openError = OpenJoinCommand()
+  if opened then return "chat" end
+  return nil, openError
+end
+
+local function OnJoinBlocked(_, source)
+  if not joinAttemptAt then return end
+  local secret = WF.Compat.Global("issecretvalue")
+  if type(secret) == "function" then
+    local ok, isSecret = pcall(secret, source)
+    if not ok or isSecret then return end
+  end
+  if source ~= "Warfront" then return end
+  local attemptAt = joinAttemptAt
+  joinAttemptAt = nil
+  if WF.Now() - attemptAt > JOIN_BLOCK_WINDOW then return end
+  local db, build = JoinDB(), ClientBuild()
+  if db and build then db.channelJoinBlocked = build end
+  Storage:AddResult({ kind = "CHANNEL_JOIN", status = "BLOCKED", channelName = DEFAULT_CUSTOM_CHANNEL })
+  if OpenJoinCommand() and WF.MainWindow and WF.MainWindow.SetStatus then
+    WF.MainWindow:SetStatus("Press Enter in chat to connect.", "GOOD")
+  end
+end
+WF.RegisterEvent("ADDON_ACTION_BLOCKED", OnJoinBlocked)
+WF.RegisterEvent("ADDON_ACTION_FORBIDDEN", OnJoinBlocked)
 
 local function PreparedChatTick()
   if not preparedChatState then return end
@@ -1117,10 +1239,56 @@ local function PrepareChannelData(data)
   return PrepareChannelMessage("DATA", data, DEFAULT_CUSTOM_CHANNEL)
 end
 
-local function SendChannelDataInternal(id, data, reservedSequence, maximumBytes, resultKind, key, priority)
+-- retryCall: only the channel retry (decision 0076) passes it; it goes past
+-- CHANNEL_SEND_OFF and runs right before the client call.
+local function SendChannelDataInternal(id, data, reservedSequence, maximumBytes, resultKind, key, priority, retryCall)
   if not data or data == "" then return false, "text is required" end
   if not IsPrintableASCII(data) then return false, "data must contain printable ASCII only" end
   if string.find(data, "|", 1, true) then return false, "data cannot contain | on the visible channel transport" end
+
+  if CHANNEL_SEND_OFF and not retryCall then
+    -- A capture line still crosses to the other faction (decision 0068) and
+    -- reaches the supplementary hidden channel, group, guild and contacts as
+    -- addon messages (decisions 0077 and 0134).
+    if CAPTURE_IDS[id] then
+      local db = Storage:GetDB()
+      local sequence = reservedSequence or Storage:NextSequence()
+      if db and db.session and sequence then
+        if WF.Relay and WF.Relay.OnLocalSend then
+          local hooked, hookError = pcall(WF.Relay.OnLocalSend, WF.Relay, id, db.session.id, sequence, data, "own")
+          if not hooked then WF.RecordError("relay local send", hookError) end
+        end
+        if WF.Transport and WF.Transport.Send then
+          local called, taken, reason = pcall(WF.Transport.Send, WF.Transport, id, data, db.session.id, sequence,
+            key, priority)
+          if not called then
+            WF.RecordError("transport send", taken)
+          elseif taken then
+            return true, nil, sequence
+          else
+            return false, tostring(reason or CHANNEL_SEND_OFF_ERROR)
+          end
+        end
+      end
+    end
+    -- The relay's beacons and far rebroadcasts, and the version announce, go
+    -- to our group instead (decision 0077 step 5 and § 5f); a group is a
+    -- broadcast medium like the channel.
+    if (id == "B" or id == "R" or id == "V") and WF.Transport and WF.Transport.SendRelayLine then
+      local db = Storage:GetDB()
+      local sequence = reservedSequence or Storage:NextSequence()
+      if db and db.session and sequence then
+        local called, taken = pcall(WF.Transport.SendRelayLine, WF.Transport, id, data, db.session.id, sequence,
+          key, priority)
+        if not called then
+          WF.RecordError("transport relay line", taken)
+        elseif taken then
+          return true, nil, sequence
+        end
+      end
+    end
+    return false, CHANNEL_SEND_OFF_ERROR
+  end
 
   local channel, channelError = FindJoinedChannel(DEFAULT_CUSTOM_CHANNEL)
   if not channel then return false, channelError end
@@ -1141,7 +1309,14 @@ local function SendChannelDataInternal(id, data, reservedSequence, maximumBytes,
   -- 1.12 targets a channel by its number: FrameXML resolves it with
   -- GetChannelName before SendChatMessage; a name is not delivered on OctoWoW.
   local channelId, channelName = channel.id, channel.name
-  local ok, result = Gate(SendChatMessage, 4, visiblePayload, "CHANNEL", nil, channelId,
+  local sendFn = SendChatMessage
+  if retryCall then
+    sendFn = function(a1, a2, a3, a4)
+      pcall(retryCall, WF.Now())
+      return SendChatMessage(a1, a2, a3, a4)
+    end
+  end
+  local ok, result = Gate(sendFn, 4, visiblePayload, "CHANNEL", nil, channelId,
     SendRecorder(CUSTOM_CHANNEL_TRANSPORT, messageType, sequence, visiblePayload, "SendChatMessage CHANNEL",
       function(sent, errorText, skipped)
         Storage:AddResult({
@@ -1188,6 +1363,14 @@ function P2P.SendVersion(flag)
   return SendChannelDataInternal("V", flag, nil, CUSTOM_CHANNEL_MAX_BYTES, "CHANNEL_VISIBLE_SEND")
 end
 
+-- Channel retry, visible test (decision 0076): one version announce past
+-- CHANNEL_SEND_OFF. onCall(now) runs right before the client call.
+-- Returns ok, error, sequence, payload.
+function P2P.TestChannelSend(onCall)
+  if type(onCall) ~= "function" then return false, "onCall is required" end
+  return SendChannelDataInternal("V", "A", nil, CUSTOM_CHANNEL_MAX_BYTES, "CHANNEL_RETRY_SEND", nil, nil, onCall)
+end
+
 -- Relay lines (modules/relay.lua, decision 0068): B bridge beacon, R packet
 -- relayed from the other faction. Never bridged again.
 function P2P.SendRelayLine(id, body, key, priority)
@@ -1197,25 +1380,21 @@ function P2P.SendRelayLine(id, body, key, priority)
     priority and true or nil)
 end
 
-local function FindChannelNameCandidate(values, count, payloadIndex)
-  local channels = GetJoinedChannels()
-  if not channels then return nil end
+-- CHAT_MSG_CHANNEL at its measured fixed arguments (decision 0092, ForeverRuntimeProbe
+-- chanargs 2026-11-10): 1 text, 2 author, 9 channel base name. A line from another
+-- channel or without an author is refused like a lost line; the language is never read.
+local CHANNEL_KEY = string.lower(DEFAULT_CUSTOM_CHANNEL)
 
-  local i
-  local j
-  for i = 1, count do
-    if i ~= payloadIndex and type(values[i]) == "string" then
-      local candidate = string.lower(values[i])
-      for j = 1, #channels do
-        local joinedName = string.lower(channels[j].name)
-        if candidate == joinedName or string.find(candidate, joinedName, 1, true) then
-          return WF.Sanitize(values[i], 100), i
-        end
-      end
-    end
+local function ChannelLine(text, author, baseName)
+  if type(text) ~= "string" or IsSecret(text) then return nil, nil, "no text" end
+  if type(baseName) ~= "string" or IsSecret(baseName) or string.lower(baseName) ~= CHANNEL_KEY then
+    return nil, nil, "other channel"
   end
-  return nil
+  if type(author) ~= "string" or IsSecret(author) or author == "" then return nil, nil, "no author" end
+  return text, WF.Sanitize(author, 100)
 end
+
+P2P.ChannelLine = ChannelLine
 
 local function OnChannelMessage(eventName, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, a16)
   P2P.channelEvents = (P2P.channelEvents or 0) + 1
@@ -1225,18 +1404,19 @@ local function OnChannelMessage(eventName, a1, a2, a3, a4, a5, a6, a7, a8, a9, a
   local parsed
   local parseError
   local meta
-  for i = 1, count do
-    parsed, parseError, meta = P2P.ParseChannel(values[i])
+  local text, senderCandidate, refusal = ChannelLine(a1, a2, a9)
+  if text then
+    parsed, parseError, meta = P2P.ParseChannel(text)
     if parsed or parseError then
-      payloadIndex = i
-      visiblePayload = values[i]
-      break
+      payloadIndex = 1
+      visiblePayload = text
     end
   end
 
   Storage:IncrementReceive("events")
-  local channelCandidate, channelIndex = FindChannelNameCandidate(values, count, payloadIndex)
-  local senderCandidate, senderIndex = FindCandidateSender(values, count, nil, payloadIndex, channelIndex)
+  local channelCandidate = refusal ~= "other channel" and DEFAULT_CUSTOM_CHANNEL or nil
+  local channelIndex = 9
+  local senderIndex = senderCandidate and 2 or nil
   local rawEntry = {
     at = WF.Epoch(),
     elapsed = WF.Now(),
@@ -1254,6 +1434,7 @@ local function OnChannelMessage(eventName, a1, a2, a3, a4, a5, a6, a7, a8, a9, a
 
   if not visiblePayload then
     rawEntry.parseStatus = "OTHER_PREFIX_OR_UNKNOWN_SIGNATURE"
+    rawEntry.refusal = refusal
     Storage:AddMessage(rawEntry)
     WF.Record("CHAT_MSG_CHANNEL", {
       argCount = count,
@@ -1270,7 +1451,7 @@ local function OnChannelMessage(eventName, a1, a2, a3, a4, a5, a6, a7, a8, a9, a
   -- Any readable addon version counts, even on a line that is not applied:
   -- this is how a player learns that the addon is outdated (decision 0029).
   if meta and WF.Version then
-    local noted, noteError = pcall(WF.Version.Note, WF.Version, meta.version, meta.level)
+    local noted, noteError = pcall(WF.Version.Note, WF.Version, meta.version, meta.level, senderCandidate)
     if not noted then WF.RecordError("version note", noteError) end
   end
 
@@ -1306,6 +1487,10 @@ local function OnChannelMessage(eventName, a1, a2, a3, a4, a5, a6, a7, a8, a9, a
     end
     return
   end
+  -- The guild network presence and chain lines never travel on the channel (decision 0077).
+  if parsed.id == "NP" or parsed.id == "F" then return end
+  -- A line of another campaign is never applied (decision 0103 § 4b).
+  if not echo and not P2P.AdmitCampaign(parsed.id, parsed.campaign) then return end
   if parsed.id == "B" or parsed.id == "R" then
     if WF.Relay and WF.Relay.OnChannelLine then
       local handled, relayError = pcall(WF.Relay.OnChannelLine, WF.Relay, parsed.id, parsed.data, senderCandidate, echo)
@@ -1387,10 +1572,11 @@ local function SendAutomaticChannelProbe(channel, apiVariant, sender)
           error = errorText,
         })
       end))
-  return ok, ok and nil or tostring(result)
+  return ok, ok and nil or tostring(result), payload
 end
 
 local function SendAutomaticChannelProbes()
+  if CHANNEL_SEND_OFF then return false, CHANNEL_SEND_OFF_ERROR end
   local channel, channelError = FindJoinedChannel(DEFAULT_CUSTOM_CHANNEL)
   if not channel then return false, channelError end
 
@@ -1432,6 +1618,25 @@ local function SendAutomaticChannelProbes()
   return true, nil, attempted, accepted
 end
 
+-- Channel retry, hidden test (decision 0076): one addon message on the
+-- channel past CHANNEL_SEND_OFF. onCall(now) runs right before the client
+-- call, onResult(result) gets the client's return value.
+-- Returns ok, error, payload.
+function P2P.TestChannelAddon(onCall, onResult)
+  if type(onCall) ~= "function" or type(onResult) ~= "function" then
+    return false, "onCall and onResult are required"
+  end
+  local channel, channelError = FindJoinedChannel(DEFAULT_CUSTOM_CHANNEL)
+  if not channel then return false, channelError end
+  if type(SendAddonMessage) ~= "function" then return false, "SendAddonMessage is unavailable" end
+  return SendAutomaticChannelProbe(channel, "RETRY", function(payload)
+    pcall(onCall, WF.Now())
+    local result = SendAddonMessage(PREFIX, payload, "CHANNEL", channel.id)
+    pcall(onResult, result)
+    return result
+  end)
+end
+
 local function BuildVisibleAutomaticProbe(channel, apiVariant)
   local db = Storage:GetDB()
   local sequence = Storage:NextSequence()
@@ -1461,6 +1666,7 @@ local function RecordVisibleAutomaticProbe(channel, apiVariant, sequence, tag, v
 end
 
 local function SendVisibleAutomaticChannelProbes()
+  if CHANNEL_SEND_OFF then return false, CHANNEL_SEND_OFF_ERROR end
   local channel, channelError = FindJoinedChannel(DEFAULT_CUSTOM_CHANNEL)
   if not channel then return false, channelError end
   if type(SendChatMessage) ~= "function" then return false, "SendChatMessage is unavailable" end
@@ -1549,8 +1755,10 @@ local function SendInvisibleTransportProbes(requestedTarget)
 
   local target = requestedTarget
   if target == "" then target = nil end
-  if target and (#target > 48 or not IsPrintableASCII(target)) then
-    return false, "target must be at most 48 printable ASCII characters"
+  -- Accented names (UTF-8) are valid player names too.
+  local validName = WF.Names and WF.Names.Valid(target)
+  if target and (#target > 48 or not (validName or IsPrintableASCII(target))) then
+    return false, "target must be a player name of at most 48 bytes"
   end
 
   local attempted = 0
@@ -1587,8 +1795,6 @@ local function SendInvisibleTransportProbes(requestedTarget)
   })
   return true, nil, attempted, accepted
 end
-
-StartAutoJoin()
 
 local function SendPing(transport, whisperTarget)
   local db = Storage:GetDB()
@@ -1801,8 +2007,6 @@ local function PrintStatus()
   if joinedChannel then
     WF.Print("custom channel=" .. joinedChannel.name .. " id=" .. tostring(joinedChannel.id) .. " joined=yes chat=tab "
       .. DEFAULT_CUSTOM_CHANNEL .. " only")
-  elseif autoJoinState then
-    WF.Print("custom channel=" .. DEFAULT_CUSTOM_CHANNEL .. " joined=pending status=" .. tostring(autoJoinState.lastStatus) .. " attempts=" .. tostring(autoJoinState.attempts))
   else
     WF.Print("custom channel=" .. DEFAULT_CUSTOM_CHANNEL .. " joined=no")
   end
@@ -1853,42 +2057,43 @@ local function PrintLog(requested)
   end
 end
 
--- Player help lists gameplay commands only; `/wf help dev` adds the
--- diagnostics, which must never appear in player-facing text.
-local function PrintHelp(dev)
+-- /wf help lists gameplay commands only. Diagnostics live in the separate
+-- WarfrontDev addon (/wfd, decision 0115), never in Warfront's own commands.
+local function PrintHelp()
   WF.Print("/wf or /wf ui (open or close the Warfront window); /wf help (this list)")
   WF.Print("/wf classic (open or close the classic text window)")
   WF.Print("/wf tab (reopen the Warfront chat tab after closing it)")
   WF.Print("/wf where (your position and the place you stand in)")
-  WF.Print("/wf hunt (hunting ground progress)")
+  WF.Print("/wf layerhelp on|off (invite players who ask to join your layer's fight)")
+  WF.Print("/wf match [on|off] (meet a Warfront player from the other faction to improve data sharing between factions)")
   WF.Print("/wf army (reserve, unit costs and whether you can recruit here)")
-  WF.Print("/wf recruit <unit> [count] (in an Outpost or Settlement of your faction; footman, rifleman, mortar, scout)")
+  WF.Print("/wf recruit <unit> [count] (in your capital, or a Settlement or War Camp held by your faction; footman, rifleman, mortar, scout)")
+  WF.Print("/wf res (your resources, and the stock of the Gold Mine, Forest or Farm you stand in)")
   WF.Print("/wf garrison (garrison, Settlement level and War Chest of the place you stand in)")
   WF.Print("/wf pledge <unit|gold|wood> [count] confirm (irreversible gift to the garrison or Settlement War Chest)")
   WF.Print("/wf scout [POI id] (scouting status and targets, or send your scout to an enemy Outpost or Settlement)")
   WF.Print("/wf attack [POI id footmen riflemen mortars] (armies and battles, or send an army to a discovered enemy place)")
-  if not dev then return end
-  WF.Print("/wf map (world-map POI area renderer status)")
-  WF.Print("/wf map probe | probe off (area-texture test squares on the world map)")
-  WF.Print("/wf capture (outpost capture states and transport counters)")
-  WF.Print("/wf relay (cross-faction Battle.net relay: links, bridges, queues and drops)")
-  WF.Print("/wf p2p status")
-  WF.Print("/wf p2p join [channel-name] | channels")
-  WF.Print("/wf p2p channelauto (hidden CHANNEL SendAddonMessage experiments; no Enter)")
-  WF.Print("/wf p2p channelvisibleauto (automatic visible API probes; no Enter)")
-  WF.Print("/wf p2p channelsend <printable ASCII text> (automatic visible P2P)")
-  WF.Print("/wf p2p invisible [target-player] (all non-group hidden probes)")
-  WF.Print("/wf p2p channelhello [channel-name] (then press Enter)")
-  WF.Print("/wf p2p channeldata <printable ASCII text> (then press Enter)")
-  WF.Print("/wf p2p hello PARTY|RAID|GUILD|INSTANCE_CHAT")
-  WF.Print("/wf p2p ping PARTY|RAID|GUILD")
-  WF.Print("/wf p2p twhisper <player> [ping|hello] (experimental hidden whisper through the server)")
-  WF.Print("/wf p2p send <transport> <printable ASCII text>")
-  WF.Print("/wf p2p size <transport> <complete message bytes>")
-  WF.Print("/wf p2p sizes <transport> [baseline|boundary]")
+end
+
+-- /wfd p2p help (WarfrontDev, decision 0115); kept here for the size limits.
+function P2P.PrintDevHelp()
+  WF.Print("/wfd p2p status")
+  WF.Print("/wfd p2p join [channel-name] | channels")
+  WF.Print("/wfd p2p channelauto (hidden CHANNEL SendAddonMessage experiments; no Enter)")
+  WF.Print("/wfd p2p channelvisibleauto (automatic visible API probes; no Enter)")
+  WF.Print("/wfd p2p channelsend <printable ASCII text> (automatic visible P2P)")
+  WF.Print("/wfd p2p invisible [target-player] (all non-group hidden probes)")
+  WF.Print("/wfd p2p channelhello [channel-name] (then press Enter)")
+  WF.Print("/wfd p2p channeldata <printable ASCII text> (then press Enter)")
+  WF.Print("/wfd p2p hello PARTY|RAID|GUILD|INSTANCE_CHAT")
+  WF.Print("/wfd p2p ping PARTY|RAID|GUILD")
+  WF.Print("/wfd p2p twhisper <player> [ping|hello] (experimental hidden whisper through the server)")
+  WF.Print("/wfd p2p send <transport> <printable ASCII text>")
+  WF.Print("/wfd p2p size <transport> <complete message bytes>")
+  WF.Print("/wfd p2p sizes <transport> [baseline|boundary]")
   WF.Print("  maximum=" .. MAX_MESSAGE_BYTES .. " message bytes (" .. ADDON_MESSAGE_MAX_BYTES .. " with prefix)")
-  WF.Print("/wf p2p burst <transport> <count> <data bytes> [1|2|4 per second]")
-  WF.Print("/wf p2p report | stop | log [1-20] | clear")
+  WF.Print("/wfd p2p burst <transport> <count> <data bytes> [1|2|4 per second]")
+  WF.Print("/wfd p2p report | stop | log [1-20] | clear")
   WF.Print("channelsend uses the automatic visible custom-channel transport.")
 end
 
@@ -1903,13 +2108,16 @@ end
 local function ChannelCommand(command, rest)
   if command == "join" then
     local channelName = TakeWord(rest)
-    JoinDiagnosticChannel(channelName)
+    local joined, joinError = JoinDiagnosticChannel(channelName)
+    if not joined and joinError then
+      WF.Print("Warfront could not connect: " .. tostring(joinError))
+    end
   elseif command == "channels" then
     PrintJoinedChannels()
   elseif command == "twhisper" then
-    local target, tail = TakeWord(rest)
+    local target, option = TakeTarget(rest, { hello = true, ping = true })
     local ok, err
-    if string.lower(TakeWord(tail) or "") == "hello" then
+    if option == "hello" then
       ok, err = SendTwWhisper(target, "HELLO", WF.version)
     else
       ok, err = SendPing(nil, target)
@@ -1941,7 +2149,7 @@ local function ChannelCommand(command, rest)
       WF.Print("automatic visible CHANNEL DATA not sent: " .. tostring(err))
     end
   elseif command == "invisible" then
-    local target = TakeWord(rest)
+    local target = TakeTarget(rest)
     local ok, err, attempted, accepted = SendInvisibleTransportProbes(target)
     if ok then
       WF.Print("non-group invisible probes completed: " .. tostring(attempted) .. " attempted, " .. tostring(accepted) .. " submitted to the send gate (0.25 s apart, 1.1 s pause after 6 close sends); no Enter was required.")
@@ -1997,80 +2205,23 @@ local function SlashCommand(message)
     end
     return
   end
-  if string.lower(scope or "") == "map" then
-    if not WF.Map or not WF.Map.GetStatus then
-      WF.Print("map renderer is unavailable")
+  if string.lower(scope or "") == "layerhelp" then
+    local jump = WF.LayerJump
+    if not jump or not jump.SetHelpOff then
+      WF.Print("layer help is unavailable (restart the client after an update)")
       return
     end
-    local status = WF.Map:GetStatus()
-    WF.Print("map enabled=" .. tostring(status.enabled)
-      .. " zone=" .. tostring(status.map or "none")
-      .. " registered=" .. tostring(status.registered)
-      .. " visible=" .. tostring(status.visible)
-      .. " patches=" .. tostring(status.patches)
-      .. " icons=" .. tostring(status.icons)
-      .. " building=" .. tostring(status.building)
-      .. " zoneBars=" .. tostring(status.zoneBars)
-      .. " failures=" .. tostring(status.failures)
-      .. " hidden=" .. tostring(status.hidden) .. " locked=" .. tostring(status.locked))
-    local probe = status.probe
-    if probe and probe.branch then
-      WF.Print("last open: mapID=" .. tostring(probe.mapID)
-        .. " file=" .. tostring(probe.mapName) .. " key=" .. tostring(probe.mapKey)
-        .. " continent=" .. tostring(probe.continent) .. " branch=" .. tostring(probe.branch)
-        .. " canvas=" .. tostring(probe.width) .. "x" .. tostring(probe.height)
-        .. " matched=" .. tostring(probe.matched) .. " visible=" .. tostring(probe.visible)
-        .. " patches=" .. tostring(probe.patches) .. " icons=" .. tostring(probe.icons)
-        .. " queued=" .. tostring(probe.queued) .. " failures=" .. tostring(probe.failures))
-    else
-      WF.Print("last open: none yet (open the world map)")
-    end
-    WF.Print("driver shown=" .. tostring(status.driverShown)
-      .. " wakeHooked=" .. tostring(status.wakeHooked)
-      .. " ticks=" .. tostring(status.ticks) .. " openTicks=" .. tostring(status.openTicks)
-      .. " refreshes=" .. tostring(status.refreshes)
-      .. " canvas=" .. tostring(status.canvas) .. " canvasVisible=" .. tostring(status.canvasVisible))
-    WF.Print("map opens=" .. tostring(status.mapShows)
-      .. " driverVisibleOnOpen=" .. tostring(status.showDriverVisible)
-      .. " canvasVisibleOnOpen=" .. tostring(status.showCanvasVisible))
-    local db = WF.Storage and WF.Storage.GetDB and WF.Storage:GetDB()
-    local errors = type(db) == "table" and db.errors
-    if type(errors) == "table" and #errors > 0 then
-      local last = errors[#errors]
-      WF.Print("errors=" .. #errors .. " last: " .. tostring(last.scope) .. ": " .. tostring(last.error))
-    else
-      WF.Print("errors=0")
-    end
-    if WF.MinimapAreas then
-      local mini = WF.MinimapAreas:GetStatus()
-      WF.Print("minimap zone=" .. tostring(mini.zone or "none")
-        .. " patches=" .. tostring(mini.patches) .. " icons=" .. tostring(mini.icons)
-        .. " indoor=" .. tostring(mini.indoor))
-    end
-    local option = string.lower(rest or "")
-    if option == "hover" then
-      WF.Print("hover " .. tostring(WF.Map:HoverDebug() or "no sample yet (open the map)"))
-      WF.Print("last tooltip " .. tostring(WF.Map.tooltipDebug or "none yet (hover an area)"))
-    elseif option == "hover probe" or option == "hover probe off" then
-      WF.Map:SetHoverProbe(option == "hover probe")
-      if option == "hover probe" then
-        WF.Print("hover probe on: sweep the cursor over the areas, then /wf map hover report")
+    local action = string.lower(TakeWord(rest) or "")
+    if action == "on" or action == "off" then
+      if jump:SetHelpOff(action == "off") then
+        WF.Print(action == "off" and "You no longer invite players who ask to join your layer's fight."
+          or "You invite players who ask to join your layer's fight.")
       else
-        WF.Print("hover probe off")
+        WF.Print("layer help cannot be saved right now (read-only storage)")
       end
-    elseif option == "hover report" then
-      local lines = WF.Map:HoverProbeReport()
-      for index = 1, #lines do
-        WF.Print(lines[index])
-      end
-    elseif option == "probe" or option == "probe off" then
-      local ok, shown, detail = pcall(WF.Map.ShowProbe, WF.Map, option == "probe")
-      WF.Print("map probe " .. (ok and tostring(shown) or "error") .. " "
-        .. tostring(ok and detail or shown))
-      if ok and shown and option == "probe" then
-        WF.Print("open the map: 5 pink squares near its top-left corner")
-      end
+      return
     end
+    WF.Print(jump:HelpOff() and "Layer help is off (/wf layerhelp on)." or "Layer help is on (/wf layerhelp off).")
     return
   end
   if string.lower(scope or "") == "where" then
@@ -2099,20 +2250,12 @@ local function SlashCommand(message)
     WF.Companion:PrintStatus()
     return
   end
-  if string.lower(scope or "") == "ticket" then
-    if not WF.Ticket then
-      WF.Print("membership tickets are unavailable (restart the client after an update)")
+  if string.lower(scope or "") == "match" or string.lower(scope or "") == "allies" then
+    if not WF.Allies or not WF.Allies.Command then
+      WF.Print("matchmaking is unavailable (restart the client after an update)")
       return
     end
-    WF.Ticket:Command(rest)
-    return
-  end
-  if string.lower(scope or "") == "fileprobe" then
-    if not WF.FileProbe then
-      WF.Print("file probe is unavailable (restart the client after an update)")
-      return
-    end
-    WF.FileProbe:Command(rest)
+    WF.Allies:Command(rest)
     return
   end
   if string.lower(scope or "") == "res" or string.lower(scope or "") == "resources" then
@@ -2163,37 +2306,13 @@ local function SlashCommand(message)
     WF.Attack:Command(rest)
     return
   end
-  if string.lower(scope or "") == "relay" then
-    if not WF.Relay or not WF.Relay.PrintStatus then
-      WF.Print("cross-faction relay is unavailable (a new file loads only after a client restart)")
-      return
-    end
-    WF.Relay:PrintStatus()
-    return
-  end
-  if string.lower(scope or "") == "capture" then
-    if not WF.Capture or not WF.Capture.PrintStatus then
-      WF.Print("outpost capture is unavailable")
-      return
-    end
-    WF.Capture:PrintStatus()
-    return
-  end
-  if string.lower(scope or "") == "hunt" then
-    if not WF.Hunting or not WF.Hunting.PrintStatus then
-      WF.Print("hunting ground capture is unavailable")
-      return
-    end
-    WF.Hunting:PrintStatus()
-    return
-  end
-  if string.lower(scope or "") ~= "p2p" then
-    PrintHelp(string.lower(scope or "") == "help" and string.lower((TakeWord(rest)) or "") == "dev")
-    return
-  end
+  PrintHelp()
+end
 
-  local command
-  command, rest = TakeWord(rest)
+-- /wfd p2p (WarfrontDev addon, decision 0115). The probes stay in this file,
+-- beside the locals they use; WarfrontDev only routes to them.
+function P2P.DevCommand(message)
+  local command, rest = TakeWord(message)
   command = string.lower(command or "")
   if ChannelCommand(command, rest) then return end
   if command == "status" then
@@ -2258,7 +2377,7 @@ local function SlashCommand(message)
     end
     local ok, err = StartBurst(transport, count, dataBytes, rate)
     if ok then
-      WF.Print("bounded burst started; use /wf p2p stop to cancel")
+      WF.Print("bounded burst started; use /wfd p2p stop to cancel")
     else
       WF.Print("burst not started: " .. tostring(err))
     end
@@ -2280,11 +2399,11 @@ local function SlashCommand(message)
     pendingPingOrder = {}
     seen = {}
     seenOrder = {}
-    lastSequence = {}
+    lastSequence = { bySession = {}, order = {} }
     Storage:ClearDiagnostics()
     WF.Print("P2P diagnostics cleared; session and sequence were preserved.")
   else
-    PrintHelp(true)
+    P2P.PrintDevHelp()
   end
 end
 

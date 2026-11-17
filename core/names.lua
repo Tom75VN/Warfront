@@ -2,13 +2,13 @@ Warfront = Warfront or {}
 
 local WF = Warfront
 
--- Character names on WoW: Forever (decision 0070). A character is a first
--- name plus a surname, unique per region. Chat events give the sender as
+-- Character names on WoW: Forever (decisions 0070 and 0096). A character is a
+-- first name plus a surname, unique per region. Chat events give the sender as
 -- "First Surname": one space, no realm (CHAT_MSG_CHANNEL, measured 2026-11-07).
 -- UnitName("player") returns the two parts apart
 -- (Blizzard_FrameXMLUtil/Camelot/NameUtil.lua). Whisper targets and WTF
--- folders write "First-Surname". Every identity Warfront builds goes through
--- here, so a character is one key for itself and for every peer.
+-- folders write "First-Surname". Technical realms are not identities: every
+-- identity Warfront builds is the bare full name inside the current ruleset.
 local Names = {
   SEPARATOR = " ",
   MAX_BYTES = 48,
@@ -93,11 +93,19 @@ function Names.Split(sender)
   return first, rest
 end
 
--- "First Surname@Realm": the identity of a chat sender (rule R1).
+-- "First Surname": the realm-free identity of a chat sender (rule R1,
+-- decision 0096). Names are unique per region and every peer sees this spelling.
 function Names.Identity(sender)
-  local name, realm = Names.Split(sender)
+  local name = Names.Split(sender)
   if not name then return nil end
-  return name .. "@" .. (realm or Names.Realm())
+  return name
+end
+
+-- True when a chat name carries its surname, or names are not regional. A
+-- first name alone is shared by several characters: never an identity.
+function Names.Complete(name)
+  if not Plain(name) then return false end
+  return strFind(name, Names.SEPARATOR, 1, true) ~= nil or not Regional()
 end
 
 -- The local character as peers see it, and whether that name is final (false
@@ -107,32 +115,54 @@ function Names.Mine()
   if not ok or not Plain(first) then ok, first, surname = Call("UnitName", "player") end
   if not ok or not Plain(first) then return nil, false end
   local name = Names.Full(first, surname)
-  local complete = strFind(name, Names.SEPARATOR, 1, true) ~= nil or not Regional()
-  return name, complete
+  return name, Names.Complete(name)
 end
 
--- The chat name of an identity "Name@Realm" (display).
+-- The chat name of an identity. This also strips the realm from keys saved by
+-- builds before decision 0096.
 function Names.Short(identity)
   if type(identity) ~= "string" then return nil end
   return strMatch(identity, "^([^@]+)@") or identity
 end
 
--- The key builds before decision 0070 used for this identity: "First@Realm".
+-- The key builds before decision 0096 used for this identity on this technical
+-- realm. Names.Adopt also finds the same full name under any former realm and
+-- the pre-0070 first-name spelling.
 function Names.Legacy(identity)
-  if type(identity) ~= "string" then return nil end
-  local name, realm = strMatch(identity, "^([^@]+)@(.+)$")
-  local first = name and strMatch(name, "^([^ ]+) ")
-  if not first then return nil end
-  return first .. "@" .. realm
+  identity = Names.Short(identity)
+  if not identity or identity == "" then return nil end
+  return identity .. "@" .. Names.Realm()
 end
 
--- Saved tables keyed by identity: the entry under the old "First@Realm" key
--- moves to the full identity once, if that one has none yet. Characters that
--- share a first name shared that entry; the first to log in keeps it.
+-- Saved tables keyed by identity: move one pre-0096 "Full Name@Realm" entry to
+-- the realm-free full name on first access. Prefer the current technical realm,
+-- then any former realm; the pre-0070 "First@Realm" spelling is the last
+-- fallback. Existing realm-free data always wins and other aliases stay as an
+-- untouched archive because their module-specific values cannot be merged
+-- safely here. A first name alone is not final yet: nothing moves until the
+-- surname is known, or an old entry would strand under that first name.
 function Names.Adopt(t, identity)
   if type(t) ~= "table" then return false end
-  local legacy = Names.Legacy(identity)
-  if not legacy or t[legacy] == nil or t[identity] ~= nil then return false end
+  identity = Names.Short(identity)
+  if not identity or identity == "" or t[identity] ~= nil or not Names.Complete(identity) then return false end
+  local realm = Names.Realm()
+  local first = strMatch(identity, "^([^ ]+) ")
+  local fullPrefix = identity .. "@"
+  local firstPrefix = first and (first .. "@") or nil
+  local legacy, rank
+  for key, value in pairs(t) do
+    if value ~= nil and type(key) == "string" then
+      local candidate
+      if key == fullPrefix .. realm then candidate = 1
+      elseif strSub(key, 1, #fullPrefix) == fullPrefix then candidate = 2
+      elseif firstPrefix and key == firstPrefix .. realm then candidate = 3
+      elseif firstPrefix and strSub(key, 1, #firstPrefix) == firstPrefix then candidate = 4 end
+      if candidate and (not rank or candidate < rank or (candidate == rank and key < legacy)) then
+        legacy, rank = key, candidate
+      end
+    end
+  end
+  if not legacy then return false end
   t[identity], t[legacy] = t[legacy], nil
   return true
 end

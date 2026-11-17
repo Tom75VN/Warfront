@@ -40,10 +40,17 @@ end
 
 -- Reads the player's position on its own zone map, in percent (0..100) like
 -- data/pois.lua. Returns nil with a reason when no zone position is available.
--- core/compat.lua reads the open map's selection, else the player's zone, live
--- on every call: a closed map never needs re-centring on Forever.
+-- Forever uses a dedicated player-map snapshot, never the viewed map.
 function Presence:ReadPosition()
   local mapShown = WorldMapShown()
+  if WF.Compat and WF.Compat.GetPlayerZonePosition then
+    local ok, map, x, y = pcall(WF.Compat.GetPlayerZonePosition)
+    if not ok or type(map) ~= "string" or type(x) ~= "number" or type(y) ~= "number"
+        or not (x >= 0 and x <= 1 and y >= 0 and y <= 1) or (x == 0 and y == 0) then
+      return nil, "no position"
+    end
+    return { map = map, x = x * 100, y = y * 100, mapShown = mapShown }
+  end
 
   local infoOk, mapFile = Call("GetMapInfo")
   if not infoOk or type(mapFile) ~= "string" or mapFile == "" then
@@ -108,6 +115,28 @@ function Presence:FindAreas(mapFile, x, y)
   return found, nearest, nearestDistance
 end
 
+-- Hot path: the first containing area only. Diagnostic FindAreas still computes
+-- every overlap and the nearest centre. Rebuild when the catalog changes.
+function Presence:FindFirstArea(mapFile, x, y)
+  if not Map or not Contours or not Map.CanonicalMapName then return nil end
+  if not self.zones or self.zoneRevision ~= Map.revision then
+    self.zones, self.zoneRevision = {}, Map.revision
+    for index = #Map.order, 1, -1 do
+      local area = Map.areas[Map.order[index]]
+      if area and area.mapKey then
+        local list = self.zones[area.mapKey] or {}
+        self.zones[area.mapKey] = list
+        list[#list + 1] = area
+      end
+    end
+  end
+  local list = self.zones[Map.CanonicalMapName(mapFile)]
+  for index = 1, list and #list or 0 do
+    local area = list[index]
+    if area.enabled and Contours.AreaContainsPoint(area, x, y) then return area end
+  end
+end
+
 local function AreaName(area)
   return tostring(area.label or area.id)
 end
@@ -141,15 +170,10 @@ function Presence:Sample()
   self.position = position
   self.reason = reason
   if not position then
-    -- An open map showing another zone says nothing about the player: keep
-    -- the last state instead of reporting a false exit.
-    if reason ~= "player not on the viewed map" and reason ~= "continent map shown" then
-      self:SetCurrent(nil)
-    end
+    self:SetCurrent(nil)
     return
   end
-  local found = self:FindAreas(position.map, position.x, position.y)
-  self:SetCurrent(found[1])
+  self:SetCurrent(self:FindFirstArea(position.map, position.x, position.y))
 end
 
 function Presence:Tick()
@@ -169,6 +193,7 @@ function Presence:PrintStatus()
   end
   WF.Print(strFormat("where: map=%s x=%.2f y=%.2f%s", position.map,
     position.x, position.y, position.mapShown and " (map open)" or ""))
+  if WF.Layer and WF.Layer.Label then WF.Print("where: layer " .. WF.Layer:Label()) end
   local found, nearest, distance = self:FindAreas(position.map, position.x, position.y)
   if #found == 0 then
     WF.Print("where: not inside any POI")

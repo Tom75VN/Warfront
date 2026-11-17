@@ -11,7 +11,11 @@ WF.version = "0.1.0"
 -- change that can make two builds disagree on the same messages, at the next
 -- tools/release.py prepare. Lines of another level are never applied.
 -- Keep this exact one-line form: the companion reads it to write imports.
-WF.channelLevel = 5
+WF.channelLevel = 6
+-- Capability read from the installed addon before writing private ally invitations.
+WF.importAllies = 1
+-- Optional campaign archive, read from the installed addon by the companion.
+WF.importCampaignHistory = 1
 
 local listeners = {}
 local registrations = {}
@@ -28,8 +32,42 @@ function WF.Epoch()
   return 0
 end
 
+-- Serial-number epochs (decision 0083, RFC 1982). Capture, stock and garrison
+-- epochs live in 0..MAX and wrap, so no value is terminal. Two epochs less
+-- than half the space apart compare exactly as numbers; at exactly half, the
+-- larger number wins, so for two different epochs exactly one is newer.
+WF.Serial = { M = 1000000, H = 500000, MAX = 999999 }
+
+function WF.Serial.Newer(a, b)
+  local d = (a - b) % 1000000
+  if d == 0 then return false end
+  if d == 500000 then return a > b end
+  return d < 500000
+end
+
+function WF.Serial.Next(epoch)
+  return (epoch + 1) % 1000000
+end
+
+-- Counters where 0 means "none yet", such as a garrison version (decision
+-- 0084): 0 is older than any other value and never comes back, so 999,999 is
+-- followed by 1.
+function WF.Serial.NewerCount(a, b)
+  if b == 0 then return a ~= 0 end
+  if a == 0 then return false end
+  return WF.Serial.Newer(a, b)
+end
+
+function WF.Serial.NextCount(count)
+  local nextCount = (count + 1) % 1000000
+  if nextCount == 0 then return 1 end
+  return nextCount
+end
+-- End of serial-number epochs.
+
 function WF.Print(message)
-  local text = "|cfff5ae0aWarfront:|r " .. tostring(message)
+  local translated = WF.L and WF.L(message) or tostring(message)
+  local text = "|cfff5ae0aWarfront:|r " .. translated
   if DEFAULT_CHAT_FRAME and DEFAULT_CHAT_FRAME.AddMessage then
     DEFAULT_CHAT_FRAME:AddMessage(text)
   end
@@ -97,7 +135,7 @@ function WF.RecordError(scope, errorText)
   end
 end
 
--- Live, unpersisted counters of what the dispatcher receives (shown by /wf capture).
+-- Live, unpersisted counters of what the dispatcher receives (shown by /wfd capture).
 WF.eventCounts = {}
 WF.unresolvedEvents = 0
 

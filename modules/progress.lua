@@ -24,13 +24,6 @@ local MAX_VALUE = 1000000000
 Progress.DEFAULT_CAMPAIGN = DEFAULT_CAMPAIGN
 Progress.MAX_ACHIEVEMENTS = MAX_ACHIEVEMENTS
 
-local function Realm()
-  if type(GetRealmName) ~= "function" then return "unknown" end
-  local ok, realm = pcall(GetRealmName)
-  if ok and type(realm) == "string" and realm ~= "" then return realm end
-  return "unknown"
-end
-
 local function Record(kind, fields)
   if WF.Record then WF.Record(kind, fields) end
 end
@@ -50,18 +43,17 @@ local function Count(t)
   return n
 end
 
--- "Name@Realm" of the player, as Capture.Identity builds it.
+-- The player's realm-free identity, as Capture.Identity builds it.
 function Progress:Me()
   if WF.Capture and WF.Capture.Me then return WF.Capture:Me() end
-  local name = WF.Names and WF.Names.Mine()
-  if name then return name .. "@" .. Realm() end
-  return nil
+  return WF.Names and WF.Names.Mine() or nil
 end
 
 -- The character table of `char` in this ruleset scope (decision 0072: the realm
 -- never partitions it), or nil when SavedVariables are read-only or come from a
 -- newer schema (left untouched), or the ruleset is not supported.
 function Progress:Bucket(char)
+  if WF.Names and not WF.Names.Complete(char) then return nil end
   local bucket = WF.Ruleset and WF.Ruleset:Module("progress")
   if not bucket then return nil end
   if type(bucket.schema) == "number" and bucket.schema > SCHEMA then

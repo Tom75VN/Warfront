@@ -26,7 +26,8 @@ local UNIT_FIELDS = { FOOTMAN = "f", RIFLEMAN = "r", MORTAR = "m" }
 local UNIT_ORDER = { "FOOTMAN", "RIFLEMAN", "MORTAR" }
 local CHEST_KINDS = { gold = true, wood = true }
 local MAX_UNITS = 50
-local MAX_NUMBER = 1000000
+-- The capture generation a garrison belongs to, bounded as in S lines (decision 0089).
+local MAX_NUMBER = 999999999
 local MAX_OP = 1000000000
 -- Post-combat lock bound (decision 0047), carried in G and AR (decision 0052).
 local LOCK_MAX = 1200
@@ -57,8 +58,10 @@ local RESULTS = {
   O = "the keeper does not see you inside, or this place is not held by your faction",
   G = "this place changed hands",
   B = "invalid pledge",
-  L = "reinforcements are blocked by an attack (final approach, battle or post-combat lock)",
+  L = "reinforcements are blocked by an attack (enemies inside, final approach, battle or post-combat lock)",
 }
+-- Attackers inside a held Settlement that block unit pledges during its siege.
+local SIEGE_ATTACKERS = 2
 local PLACE_NAMES = { OUTPOST = "Outpost", SETTLEMENT = "Settlement" }
 
 Garrison.OUTPOST_CAPACITY = OUTPOST_CAPACITY
@@ -167,6 +170,27 @@ local function Defense(st)
   return st.f * units.FOOTMAN.def + st.r * units.RIFLEMAN.def + st.m * units.MORTAR.def
 end
 
+-- Capture-time preview for a unit pledge. It is deliberately derived from the
+-- same occupied-capacity formula as the capture authority, so the confirmation
+-- shows the exact duration that will be published after acceptance.
+function Garrison:CapturePreview(kind, count, id)
+  local field = UNIT_FIELDS[kind]
+  local unit = WF.Army and WF.Army.UNITS and WF.Army.UNITS[kind]
+  local capture = WF.Capture
+  local area = self:Area(id or (WF.Presence and WF.Presence.current and WF.Presence.current.id))
+  if not field or not unit or not capture or not capture.DurationFor or not area then return nil end
+  if type(count) ~= "number" or count < 1 or math.floor(count) ~= count then return nil end
+  local st = self:GetState(area.id)
+  local capacity = self:Capacity(area, st.gold, st.wood)
+  local used = Size(st.f, st.r, st.m)
+  local addedSize = count * unit.size
+  if used + addedSize > capacity then return nil end
+  local before = capture.DurationFor(area, used, capacity)
+  local after = capture.DurationFor(area, used + addedSize, capacity)
+  return { before = before, after = after, added = after - before, used = used,
+    afterUsed = used + addedSize, capacity = capacity }
+end
+
 -- The garrison of a POI at its current ownership generation. A newer
 -- generation (a capture) starts empty, at level 1, with an empty War Chest.
 function Garrison:GetState(id)
@@ -196,8 +220,8 @@ local CONTENT = { "f", "r", "m", "gold", "wood" }
 -- applied, then the later keeper epoch, then the larger content. Within a
 -- generation a garrison only grows in V1, so the larger state is the newer.
 local function Beats(a, b)
-  if a.ver ~= b.ver then return a.ver > b.ver end
-  if a.epoch ~= b.epoch then return a.epoch > b.epoch end
+  if a.ver ~= b.ver then return WF.Serial.NewerCount(a.ver, b.ver) end
+  if a.epoch ~= b.epoch then return WF.Serial.Newer(a.epoch, b.epoch) end
   for index = 1, #CONTENT do
     local key = CONTENT[index]
     if a[key] ~= b[key] then return a[key] > b[key] end
@@ -209,23 +233,30 @@ local function Same(a, b)
   return not Beats(a, b) and not Beats(b, a)
 end
 
+-- The latest epoch seen, in serial order (decision 0083). Before the first
+-- one, top's 0 only means "none seen", so the first epoch is taken as it is.
+local function RaiseTop(st, epoch)
+  if not st.topSeen or WF.Serial.Newer(epoch, st.top) then st.top = epoch end
+  st.topSeen = true
+end
+
 -- A post-combat lock is taken only from a state of a higher version: repeats
 -- and relays of the same state never extend it (decision 0052).
 local function Adopt(st, f, now)
-  if now and (f.lock or 0) > 0 and f.ver > st.ver then
+  if now and (f.lock or 0) > 0 and WF.Serial.NewerCount(f.ver, st.ver) then
     local finish = now + f.lock
     if not st.lockEnd or finish > st.lockEnd then st.lockEnd = finish end
   end
   st.ver, st.epoch = f.ver, f.epoch
   st.f, st.r, st.m, st.gold, st.wood = f.f, f.r, f.m, f.gold, f.wood
-  if f.epoch > st.top then st.top = f.epoch end
+  RaiseTop(st, f.epoch)
 end
 
 -- The keeper signs what it publishes with its own epoch, raised above any
 -- epoch seen: an older keeper's copy then never outranks the keeper's own.
 local function Sign(st)
-  if st.authEpoch < st.top then
-    st.top = st.top + 1
+  if WF.Serial.Newer(st.top, st.authEpoch) then
+    st.top = WF.Serial.Next(st.top)
     st.authEpoch = st.top
   end
   st.epoch = st.authEpoch
@@ -249,6 +280,30 @@ end
 function Garrison:Contested(id, owner, now)
   local view = WF.Capture:GetView(id, now)
   return view ~= nil and view.challenger ~= "-" and view.challenger ~= owner
+end
+
+-- What an enemy capture attempt closes (decision 0082): everything at an
+-- Outpost; at a Settlement only the War Chest, since unit pledges follow
+-- Garrison:SiegePressure and the battle locks instead.
+function Garrison:ContestedFor(area, units, now)
+  if not self:Contested(area.id, self:GetState(area.id).owner, now) then return false end
+  return area.type ~= "SETTLEMENT" or not units
+end
+
+-- During a Settlement's three-hour siege (decision 0082), unit pledges are
+-- blocked while the attackers it requires stand inside: two against a held
+-- Settlement, so one alone never blocks. Outside the window enemy presence
+-- changes nothing. Returns the reason or nil.
+function Garrison:SiegePressure(id, owner, now)
+  local front, capture = WF.Front, WF.Capture
+  if not front or not capture or not front:HasRoutes() then return nil end
+  if owner ~= "H" and owner ~= "A" then return nil end
+  local attacker = owner == "H" and "A" or "H"
+  if not front:SiegeOpen(id, attacker, now) then return nil end
+  local nH, nA = capture:Count(id, now)
+  local inside = attacker == "H" and nH or nA
+  if inside >= SIEGE_ATTACKERS then return "enemy attackers inside block reinforcements" end
+  return nil
 end
 
 -- Sending -------------------------------------------------------------------
@@ -296,7 +351,7 @@ end
 -- Keeper --------------------------------------------------------------------
 
 function Garrison:TakeOver(st, now)
-  st.top = st.top + 1
+  st.top, st.topSeen = WF.Serial.Next(st.top), true
   st.authority, st.authEpoch = Me(), st.top
   -- The keeper signs what it publishes with its own epoch: the same content,
   -- ordered after the copies of earlier keepers (Beats compares ver first).
@@ -327,10 +382,12 @@ function Garrison:Judge(st, pledger, f, now)
   local area = self:Area(st.id)
   if f.gen ~= st.gen then return "G" end
   if PresentFaction(st.id, pledger, now) ~= st.owner then return "O" end
-  if self:Contested(st.id, st.owner, now) then return "C" end
+  local units = f.f + f.r + f.m > 0
+  if self:ContestedFor(area, units, now) then return "C" end
   if f.f + f.r + f.m + f.gold + f.wood <= 0 then return "B" end
   -- Units only: the War Chest ignores armies and battles (decision 0052).
-  if f.f + f.r + f.m > 0 and WF.Attack and WF.Attack:Freeze(st.id, now) then return "L" end
+  if units and WF.Attack and WF.Attack:Freeze(st.id, now) then return "L" end
+  if units and area.type == "SETTLEMENT" and self:SiegePressure(st.id, st.owner, now) then return "L" end
   if area.type ~= "SETTLEMENT" and f.gold + f.wood > 0 then return "B" end
   local gold, wood = st.gold + f.gold, st.wood + f.wood
   if gold > LEVEL_GOLD[3] or wood > LEVEL_WOOD[3] then return "X" end
@@ -349,7 +406,7 @@ function Garrison:Apply(st, pledger, f, now)
       local before = Garrison.Level(st.gold, st.wood)
       st.f, st.r, st.m = st.f + f.f, st.r + f.r, st.m + f.m
       st.gold, st.wood = st.gold + f.gold, st.wood + f.wood
-      st.ver = st.ver + 1
+      st.ver = WF.Serial.NextCount(st.ver)
       st.epoch = st.authEpoch
       st.repeatAt = now + REPEAT_AFTER
       self.dirty = true
@@ -456,8 +513,8 @@ function Garrison:ParseState(parts, area)
   local f = {
     id = parts[1],
     gen = Int(parts[2], MAX_NUMBER),
-    ver = Int(parts[3], MAX_NUMBER),
-    epoch = Int(parts[4], MAX_NUMBER),
+    ver = Int(parts[3], WF.Serial.MAX),
+    epoch = Int(parts[4], WF.Serial.MAX),
     f = Int(parts[5], MAX_UNITS),
     r = Int(parts[6], MAX_UNITS),
     m = Int(parts[7], MAX_UNITS),
@@ -532,7 +589,7 @@ function Garrison:OnStateMessage(sender, f, now)
   end
   st.seenAt = now
   -- Only accepted states raise the epochs a takeover must exceed.
-  if f.epoch > st.top then st.top = f.epoch end
+  RaiseTop(st, f.epoch)
   local me = Me()
   local later = Beats(st, f)
   if Beats(f, st) then
@@ -546,7 +603,8 @@ function Garrison:OnStateMessage(sender, f, now)
   end
   -- Keeper: the later epoch, then the smallest name (as an outpost's timer).
   local holder = st.authority
-  if not holder or holder == sender or not self:KeeperAlive(st, now) or f.epoch > (st.authEpoch or 0)
+  if not holder or holder == sender or not self:KeeperAlive(st, now)
+    or WF.Serial.Newer(f.epoch, st.authEpoch or 0)
     or (f.epoch == st.authEpoch and sender < holder) then
     if holder and holder == me and sender ~= me then
       Record("GARRISON_STEP_DOWN", { id = f.id, winner = sender })
@@ -572,7 +630,7 @@ end
 function Garrison:ApplyBattle(st, kills, lock, now)
   if kills.f + kills.r + kills.m <= 0 then return false end
   st.f, st.r, st.m = st.f - kills.f, st.r - kills.r, st.m - kills.m
-  st.ver = st.ver + 1
+  st.ver = WF.Serial.NextCount(st.ver)
   if lock > 0 and (not st.lockEnd or now + lock > st.lockEnd) then st.lockEnd = now + lock end
   if st.authority and st.authority == Me() then
     st.epoch = st.authEpoch
@@ -677,7 +735,11 @@ function Garrison:Closed(area, now)
   if not here or here.id ~= area.id or not here.status then
     return "you are not counted inside: " .. tostring(here and here.reason or "presence unknown")
   end
-  if self:Contested(area.id, st.owner, now) then return "an enemy capture is in progress" end
+  -- A Settlement under capture stays open to units (decision 0082); Check
+  -- closes its War Chest and applies the siege blocks.
+  if area.type ~= "SETTLEMENT" and self:Contested(area.id, st.owner, now) then
+    return "an enemy capture is in progress"
+  end
   if self:Pending() then return "your previous pledge is still waiting for an answer" end
   local me = Me()
   if not self:KeeperAlive(st, now) then return "no garrison keeper yet: wait a few seconds" end
@@ -706,6 +768,7 @@ function Garrison:Check(kind, count, now)
   local st = self:GetState(area.id)
   if CHEST_KINDS[kind] then
     if area.type ~= "SETTLEMENT" then return nil, "only Settlements have a War Chest" end
+    if self:ContestedFor(area, false, now) then return nil, "an enemy capture is in progress" end
     if wallet[kind] < count then return nil, "not enough " .. kind .. ": you have " .. wallet[kind] end
     local cap = kind == "gold" and LEVEL_GOLD[3] or LEVEL_WOOD[3]
     if st[kind] + count > cap then
@@ -718,6 +781,10 @@ function Garrison:Check(kind, count, now)
   end
   local frozen = WF.Attack and WF.Attack:Freeze(area.id, now)
   if frozen then return nil, frozen end
+  if area.type == "SETTLEMENT" then
+    local pressed = self:SiegePressure(area.id, st.owner, now)
+    if pressed then return nil, pressed end
+  end
   local add = { f = 0, r = 0, m = 0 }
   add[UNIT_FIELDS[kind]] = count
   local used = Size(st.f, st.r, st.m)
@@ -742,6 +809,10 @@ end
 
 function Garrison:Finish(p, ok, text)
   self.last = { ok = ok, text = text, at = Now() }
+  -- War effort (decision 0088): War Chest resources the keeper accepted.
+  if ok and CHEST_KINDS[p.kind] and WF.WarRecord then WF.WarRecord:Add("chest", p.kind, p.count) end
+  -- Units placed by an accepted pledge (decision 0105 § 3); a refund never counts.
+  if ok and UNIT_FIELDS[p.kind] and WF.WarRecord then WF.WarRecord:Add("garrison", p.kind, p.count) end
   Record(ok and "GARRISON_PLEDGED" or "GARRISON_REFUNDED",
     { id = p.id, kind = p.kind, count = p.count, op = p.op, reason = text })
   Print(text)
@@ -854,8 +925,16 @@ function Garrison:PledgeCommand(text)
   end
   local name = self:Name(kind, st.owner)
   if not confirm then
-    Print("Irreversible: " .. count .. " " .. name .. " can never be taken back. Type /wf pledge "
-      .. string.lower(kind) .. " " .. count .. " confirm")
+    local preview = self:CapturePreview(kind, count, st.id)
+    local timing = ""
+    if preview then
+      timing = " Capture time: +" .. math.floor(preview.added / 60) .. "m "
+        .. string.format("%02ds", preview.added % 60) .. " ("
+        .. math.floor(preview.before / 60) .. "m " .. string.format("%02ds", preview.before % 60)
+        .. " to " .. math.floor(preview.after / 60) .. "m " .. string.format("%02ds", preview.after % 60) .. ")."
+    end
+    Print("Irreversible: " .. count .. " " .. name .. " can never be taken back." .. timing
+      .. " Type /wf pledge " .. string.lower(kind) .. " " .. count .. " confirm")
     return false
   end
   local ok, result = self:Pledge(kind, count, reason.gop)
@@ -922,7 +1001,22 @@ function Garrison:Store()
   return bucket.levels[level]
 end
 
+-- Campaign end (decision 0102 § 4): garrisons, War Chests and Settlement
+-- upgrades are lost; a pledge still waiting for its keeper comes back.
+function Garrison:ResetCampaign()
+  local p, reserve = self:Pending()
+  if p and reserve then self:Refund(p, reserve, "the campaign is over") end
+  self.states = {}
+  local pois = self:Store()
+  if pois then
+    for id in pairs(pois) do pois[id] = nil end
+  end
+  self.dirty = nil
+end
+
 function Garrison:Save()
+  if not self.loaded then self:Load() end
+  if not self.loaded then return end
   local pois = self:Store()
   if not pois then return end
   for id in pairs(pois) do pois[id] = nil end
@@ -939,26 +1033,62 @@ function Garrison:Save()
 end
 
 function Garrison:Load()
-  self.loaded = true
   local pois = self:Store()
   if not pois then return end
   local now, wall = Now(), WF.Epoch and WF.Epoch() or 0
-  for id, entry in pairs(pois) do
+  if pois then
+    for id, entry in pairs(pois) do
+      local area = self:Area(id)
+      if area and type(entry) == "table" then
+        -- The lock goes on running while offline.
+        local lock = math.floor(tonumber(entry.lock) or 0)
+        local away = math.max(0, wall - (tonumber(entry.at) or wall))
+        lock = math.max(0, math.min(LOCK_MAX, lock - Floor(away)))
+        local parts = { id, tostring(entry.gen), tostring(entry.ver), tostring(entry.epoch), tostring(entry.f),
+          tostring(entry.r), tostring(entry.m), tostring(entry.gold), tostring(entry.wood), tostring(lock), "0",
+          "0000", "-", "0" }
+        local f = self:ParseState(parts, area)
+        local st = f and self:GetState(id)
+        -- A garrison of an older generation was wiped by a capture meanwhile.
+        if st and f.gen == st.gen and Beats(f, st) then
+          Adopt(st, f, now)
+          st.relayable = true
+        end
+      end
+    end
+  end
+  self:ApplyCloud(WF.Import and WF.Import.data and WF.Import.data.garrisons)
+  self.loaded = true
+end
+
+-- Decision 0078: a cloud row is only a durable baseline for the exact capture
+-- generation already confirmed locally. It never creates an owner or generation.
+function Garrison:ApplyCloud(rows)
+  if type(rows) ~= "table" or not WF.Capture then return end
+  -- Generations restart with each campaign (decision 0103 § 3).
+  if WF.Campaign and not WF.Campaign:CloudAllowed(WF.Import and WF.Import.data) then return end
+  local now = Now()
+  for id, entry in pairs(rows) do
     local area = self:Area(id)
-    if area and type(entry) == "table" then
-      -- The lock goes on running while offline.
-      local lock = math.floor(tonumber(entry.lock) or 0)
-      local away = math.max(0, wall - (tonumber(entry.at) or wall))
-      lock = math.max(0, math.min(LOCK_MAX, lock - Floor(away)))
-      local parts = { id, tostring(entry.gen), tostring(entry.ver), tostring(entry.epoch), tostring(entry.f),
-        tostring(entry.r), tostring(entry.m), tostring(entry.gold), tostring(entry.wood), tostring(lock), "0",
-        "0000", "-", "0" }
-      local f = self:ParseState(parts, area)
-      local st = f and self:GetState(id)
-      -- A garrison of an older generation was wiped by a capture meanwhile.
-      if st and f.gen == st.gen and Beats(f, st) then
-        Adopt(st, f, now)
-        st.relayable = true
+    local owner, generation = WF.Capture:GetOwner(id)
+    if area and (owner == "H" or owner == "A") and type(entry) == "table" and entry.g == generation then
+      local f = { id = id, gen = entry.g, ver = entry.v, epoch = entry.e, f = entry.f, r = entry.r, m = entry.m,
+        gold = entry.gold, wood = entry.wood, lock = 0 }
+      -- The import still allows v and e = 1,000,000; no client produces them
+      -- (decisions 0083, 0084).
+      local valid = f.ver and f.ver > 0 and f.ver <= WF.Serial.MAX and f.epoch and f.epoch <= WF.Serial.MAX
+        and f.f and f.r and f.m
+        and f.gold and f.wood
+        and (area.type == "SETTLEMENT" or f.gold + f.wood == 0)
+        and Size(f.f, f.r, f.m) <= self:Capacity(area, f.gold, f.wood)
+      if valid then
+        local st = self:GetState(id)
+        if Beats(f, st) then
+          Adopt(st, f, now)
+          st.relayable = true
+          self.dirty = true
+          Record("GARRISON_CLOUD", { id = id, generation = f.gen, ver = f.ver })
+        end
       end
     end
   end
@@ -968,6 +1098,7 @@ end
 
 function Garrison:Tick(now)
   if not self.loaded then self:Load() end
+  if not self.loaded then return end
   for id, st in pairs(self.states) do
     self:GetState(id)
     self:Maintain(id, st, now)
@@ -994,6 +1125,9 @@ function Garrison:View(id, now)
     defense = Defense(st), settlement = area.type == "SETTLEMENT",
     keeper = self:KeeperAlive(st, now) and st.authority or nil, lock = self:LockLeft(st, now),
   }
+  if WF.Capture and WF.Capture.DurationFor then
+    view.captureDuration = WF.Capture.DurationFor(area, view.used, view.capacity)
+  end
   if level < 3 then
     view.nextGold, view.nextWood = LEVEL_GOLD[level + 1], LEVEL_WOOD[level + 1]
     view.nextCapacity = SETTLEMENT_CAPACITY[level + 1]
@@ -1022,7 +1156,9 @@ function Garrison:PrintStatus()
     local key = UNIT_ORDER[index]
     text = text .. " " .. view[key] .. " " .. self:Name(key, view.owner)
   end
-  Print(text .. " - defense " .. view.defense .. " - " .. view.source)
+  Print(text .. " - defense " .. view.defense .. " - capture time "
+    .. (view.captureDuration and math.floor(view.captureDuration / 60) .. "m "
+      .. string.format("%02ds", view.captureDuration % 60) or "unknown") .. " - " .. view.source)
   if view.settlement then
     Print("level " .. view.level .. "/3, War Chest gold " .. view.gold .. " wood " .. view.wood
       .. (view.nextGold and (" (level " .. (view.level + 1) .. " at " .. view.nextGold .. " gold and "
@@ -1032,7 +1168,14 @@ function Garrison:PrintStatus()
   local closed = self:Closed(self:Area(view.id), now)
   Print(closed and ("pledges closed: " .. closed) or "pledges open: /wf pledge <unit|gold|wood> [count] confirm")
   local frozen = not closed and WF.Attack and WF.Attack:Freeze(view.id, now)
+  local area = self:Area(view.id)
+  if not closed and not frozen and area and area.type == "SETTLEMENT" then
+    frozen = self:SiegePressure(view.id, self:GetState(view.id).owner, now)
+  end
   if frozen then Print("units cannot be given right now: " .. frozen) end
+  if not closed and area and area.type == "SETTLEMENT" and self:ContestedFor(area, false, now) then
+    Print("the War Chest is closed during an enemy capture")
+  end
   local p = self:Pending()
   if p then Print("waiting for the keeper to answer your pledge of " .. p.count .. " " .. self:Name(p.kind, p.owner)) end
 end

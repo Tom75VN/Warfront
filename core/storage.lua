@@ -56,7 +56,8 @@ end
 
 local function MakeSessionId()
   local value = math.floor((WF.Now() * 1000) + WF.Epoch())
-  local playerName = UnitName and UnitName("player") or "unknown"
+  -- Full name (decision 0070): characters sharing a first name hash apart.
+  local playerName = WF.Names and WF.Names.Mine() or (UnitName and UnitName("player")) or "unknown"
   for i = 1, #(playerName or "") do
     value = (((value * 33) + string.byte(playerName, i)) % 65536)
   end
@@ -67,6 +68,9 @@ function Storage:Initialize()
   if self.initialized then return not self.readOnly end
   self.initialized = true
 
+  -- Transient first-profile marker. It is sampled before this initializer
+  -- writes any defaults, so addon updates never look like a new profile.
+  self.newProfile = type(WarfrontDB) ~= "table" or next(WarfrontDB) == nil
   if type(WarfrontDB) ~= "table" then WarfrontDB = {} end
   local db = WarfrontDB
   local existingVersion = tonumber(db.schemaVersion) or 0
@@ -84,6 +88,10 @@ function Storage:Initialize()
   db.addonVersion = WF.version
   db.channelLevel = WF.channelLevel
   db.importSchema = WF.Import and WF.Import.SCHEMA or nil
+  -- The import may carry the latest released version (decision 0108).
+  db.importRelease = 1
+  -- The import may carry the Worker-signed board copy (decision 0110).
+  db.importBoards = 1
   db.sequence = tonumber(db.sequence) or 0
   db.session = {
     id = MakeSessionId(),
@@ -198,11 +206,25 @@ function Storage:AddError(scope, errorText)
     return
   end
   if not db or self.readOnly then return end
+  local cleanScope, cleanError = WF.Sanitize(scope, 100), WF.Sanitize(errorText, 240)
+  local now = WF.Now()
+  -- Alternating failures belong to the same burst too. Scan at most 50 rows;
+  -- preserve chronological arrays and start a new episode after 10 s of quiet.
+  for index = #db.errors, 1, -1 do
+    local previous = db.errors[index]
+    local at = previous.lastElapsed or previous.elapsed
+    if previous.scope == cleanScope and previous.error == cleanError
+      and type(at) == "number" and now >= at and now - at <= 10 then
+      previous.count = (tonumber(previous.count) or 1) + 1
+      previous.lastAt, previous.lastElapsed = WF.Epoch(), now
+      return
+    end
+  end
   local entry = {
     at = WF.Epoch(),
     elapsed = WF.Now(),
-    scope = WF.Sanitize(scope, 100),
-    error = WF.Sanitize(errorText, 240),
+    scope = cleanScope,
+    error = cleanError,
   }
   AppendBounded(db.errors, entry, MAX_ERRORS)
   self:AddLog("ERROR", entry)

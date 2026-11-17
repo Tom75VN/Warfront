@@ -30,7 +30,8 @@ WF.Companion = Companion
 --   importSeq 0 until the launch snapshot is written, then raised per rewrite
 --   cloud     ok | offline | pending (informative: offline never locks)
 -- Import file: warfront_import_<crc>.txt, <crc> = 8 lowercase hex digits of
--- the CRC-32 of the import's char ("Name@Realm"); content "WFI1 <check>\n" then
+-- the CRC-32 of the import's realm-free char ("First Surname"); content
+-- "WFI1 <check>\n" then
 -- the decision 0032 canonical form of the import without its check field.
 local STATUS_FILE = "warfront_status.txt"
 local IMPORT_PREFIX = "warfront_import_"
@@ -275,10 +276,10 @@ end
 function Companion:HintReason(now, epoch)
   now = now or Now()
   if self:Helping(epoch) then return nil end
-  local catchup, capture = WF.Catchup, WF.Capture
-  if catchup and catchup.joinedAt and now - catchup.joinedAt >= HINT_ALONE and capture
-      and (not capture.heardAt or now - capture.heardAt >= HINT_ALONE) then
-    return "alone"
+  local catchup = WF.Catchup
+  if catchup and catchup.onlineAt and now - catchup.onlineAt >= HINT_ALONE and catchup.NewsAge then
+    local age = catchup:NewsAge(now)
+    if not age or age >= HINT_ALONE then return "alone" end
   end
   if catchup and catchup.HintAge and catchup:HintAge(now) ~= nil then return "unconfirmed" end
   local Import = WF.Import

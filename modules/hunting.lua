@@ -29,7 +29,11 @@ local STEP = 1000 / KILLS_REQUIRED
 -- than a respawn timer; it only has to absorb the same kill reported by a group.
 local SEEN_TTL = 30
 local MAX_SEEN = 256
-local MAX_VERSION = 100000
+-- Versions wrap in 1..999,999 after 0, so none is terminal (decision 0085).
+local MAX_VERSION = WF.Serial.MAX
+-- Generation bound, as in S lines (decision 0089): one capturing kill per step
+-- would take decades to reach it.
+local MAX_GENERATION = 999999999
 local REPLY_DELAY = 0.5
 local REPLY_SPREAD = 2.5
 local MAP_INTERVAL = 1
@@ -167,16 +171,22 @@ local function Apply(st, side)
       return "CAPTURED", true
     end
   end
-  st.ver = st.ver + 1
+  st.ver = WF.Serial.NextCount(st.ver)
   return event, true
 end
 
 Hunting.Apply = Apply
 
--- (generation, version) order: higher wins, so a peer that saw more kills is adopted.
+-- (generation, version) order: higher wins, so a peer that saw more kills is
+-- adopted. At an equal version the higher owner wins (H first, as the owner
+-- registry's OwnerWins), then challenger, then progress, so two bars split by
+-- concurrent kills settle (decision 0085).
 local function Newer(f, st)
   if f.generation ~= st.generation then return f.generation > st.generation end
-  return f.ver > st.ver
+  if f.ver ~= st.ver then return WF.Serial.NewerCount(f.ver, st.ver) end
+  if f.owner ~= st.owner then return f.owner > st.owner end
+  if f.challenger ~= st.challenger then return f.challenger > st.challenger end
+  return f.progress > st.progress
 end
 
 local function Validate(f)
@@ -343,7 +353,7 @@ end
 -- Fields shared by K and H once the state starts at `index`.
 local function ParseClaim(parts, index)
   local f = {
-    generation = Int(parts[index], 1000000),
+    generation = Int(parts[index], MAX_GENERATION),
     owner = parts[index + 1],
     challenger = parts[index + 2],
     progress = Int(parts[index + 3], 1000),

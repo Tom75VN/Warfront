@@ -1,47 +1,96 @@
 ## Interface: 16001
 ## Title: |cfff5ae0aWarfront|r
 ## Notes: Alliance vs Horde conquest, armies, garrisons, and shared map objectives.
+## Notes-frFR: Conquête Alliance contre Horde, armées, garnisons et objectifs partagés sur la carte.
+## Notes-esES: Conquista entre Alianza y Horda, ejércitos, guarniciones y objetivos compartidos en el mapa.
+## Notes-ruRU: Завоевание Альянса и Орды, армии, гарнизоны и общие цели на карте.
+## Notes-zhCN: 联盟与部落的征服战争、军队、驻军和共享地图目标。
+## Category: PvP
+## IconTexture: Interface\AddOns\Warfront\media\Textures\UI\WarfrontMinimapIcon
 ## Author: Warfront contributors
 ## Version: 0.1.0
-## SavedVariables: WarfrontDB
+## SavedVariables: WarfrontDB, WarfrontJournal
 ## SavedVariablesPerCharacter: WarfrontImport
 
 core\init.lua
 core\compat.lua
 core\names.lua
 core\storage.lua
+core\preferences.lua
+core\locale.lua
+locales\enUS.lua
+locales\frFR.lua
+locales\esES.lua
+locales\ruRU.lua
+locales\zhCN.lua
+core\alerts.lua
+core\alert_history.lua
 core\ruleset.lua
 core\send_queue.lua
 core\version.lua
 data\pois.lua
+data\fronts.lua
 data\ui_atlas.lua
+data\scoreboard_art.lua
+data\gold_alphabet.lua
 data\ticket_keys.lua
 modules\ui_skin.lua
 modules\area_contours.lua
 modules\map.lua
+modules\map_routes.lua
+modules\map_hover.lua
 modules\minimap_areas.lua
 modules\presence.lua
+modules\layer.lua
 modules\witness.lua
 modules\progress.lua
+modules\war_record.lua
 modules\import.lua
 modules\companion.lua
 modules\ed25519.lua
+modules\x25519.lua
+modules\allies.lua
+modules\allies_mesh.lua
+modules\allies_match.lua
+modules\allies_ui.lua
 modules\ticket.lua
+modules\campaign.lua
+modules\front.lua
 modules\capture.lua
-modules\hunting.lua
+modules\front_network.lua
 modules\catchup.lua
 modules\economy.lua
 modules\stock.lua
+modules\professions.lua
 modules\army.lua
 modules\garrison.lua
 modules\scout.lua
 modules\attack.lua
 modules\capture_hud.lua
+modules\scoreboard.lua
+modules\score_float.lua
+modules\boards.lua
 modules\main_window_classic.lua
 modules\players.lua
 modules\main_window.lua
+modules\main_window_territory.lua
+modules\main_window_economy.lua
+modules\main_window_war.lua
+modules\main_window_info.lua
+modules\main_window_journal.lua
+modules\main_window_campaigns.lua
+modules\main_window_wiki.lua
+modules\main_window_drawers.lua
 modules\minimap_button.lua
+modules\settings.lua
 modules\file_probe.lua
 modules\p2ptest.lua
 modules\relay.lua
-
+modules\relay_bnet.lua
+modules\transport.lua
+modules\layer_jump.lua
+modules\directory.lua
+modules\nearby.lua
+modules\chain.lua
+modules\channel_watch.lua
+modules\traffic.lua

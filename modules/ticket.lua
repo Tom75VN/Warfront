@@ -5,7 +5,8 @@ local Ticket = {
   -- OBSERVE: tickets are checked and shown, a sender without a valid one is
   -- never ignored; only characters on the cloud's revocation list are
   -- (decision 0061 as accepted on 2026-10-22: no key may block a player).
-  -- Ignoring unticketed senders is a later decision, after an in-game measure.
+  -- Never enforced on Forever (decision 0116): only companion users can hold
+  -- a ticket, and the companion stays optional.
   MODE = "OBSERVE",
   own = { status = "NONE" },
   peers = {},
@@ -237,7 +238,7 @@ function Ticket:Enqueue(key, text, sig, done)
   return true
 end
 
--- Runs every queued verification now, in one go (tests, and /wf ticket drain).
+-- Runs every queued verification now, in one go (tests, and /wfd ticket drain).
 function Ticket:Drain()
   while #self.queue > 0 do
     local job = table.remove(self.queue, 1)
@@ -261,6 +262,7 @@ end
 -- own ticket. The list of the latest Worker reading replaces the older one.
 function Ticket:OnImport(data)
   if type(data) ~= "table" then return end
+  self.retryImport = nil
   local db = DB()
   local stored = db and tonumber(db.ticketEpoch) or 0
   local e = tonumber(data.ticketEpoch) or 0
@@ -280,7 +282,7 @@ function Ticket:OnImport(data)
     return
   end
   local stamp = Ticket.Text(me, t) .. t.s
-  if self.own.stamp == stamp then return end
+  if self.own.stamp == stamp and not self.own.retry then return end
   self.own = { status = "PENDING", ticket = t, stamp = stamp }
   local pre = self:Precheck(t)
   if not pre and t.f ~= MyFaction() then pre = "FACTION" end
@@ -294,7 +296,7 @@ function Ticket:OnImport(data)
     self.own.status = "INVALID"
     return
   end
-  self:Enqueue(KeyBytes(t.k), Ticket.Text(me, t), sig, function(valid)
+  local queued = self:Enqueue(KeyBytes(t.k), Ticket.Text(me, t), sig, function(valid)
     if Ticket.own.stamp ~= stamp then return end
     Ticket.own.status = valid and "VALID" or "INVALID"
     Record("TICKET_OWN", { status = Ticket.own.status, from = t.a, to = t.b })
@@ -303,6 +305,7 @@ function Ticket:OnImport(data)
       if Ticket.sliceStart then requestAfterWorker = true else Ticket:RequestIfNeeded() end
     end
   end)
+  if not queued then self.own.retry, self.retryImport = true, data end
 end
 
 function Ticket:Expiring()
@@ -332,6 +335,7 @@ function Ticket:SaveFaction()
   local factions = WF.Ruleset and WF.Ruleset:Module("factions")
   local me, f = Me(), MyFaction()
   if not factions or not me or not f then return end
+  if WF.Names and not WF.Names.Complete(me) then return end
   if WF.Names then WF.Names.Adopt(factions, me) end
   if factions[me] == f then return end
   if not factions[me] then
@@ -432,8 +436,8 @@ end
 -- TQ: only the named player answers, with its own T.
 function Ticket:OnQuestion(parts, sender, now)
   if #parts ~= 1 then return false, "bad TQ" end
-  local target = parts[1]
-  if type(target) ~= "string" or #target > 64 or not string.find(target, "^[^@,:|]+@[^@,:|]+$") then
+  local target, names = parts[1], WF.Names
+  if not names or not names.Valid(target) or not names.Complete(target) then
     return false, "bad TQ"
   end
   if target == Me() then self:Announce(now) end
@@ -449,14 +453,15 @@ end
 -- Step 4b of the reception chain (p2ptest.lua § 3, rule R18 proposed in 0061):
 -- false drops the message as if it had been lost. In OBSERVE mode only a
 -- character on the revocation list is dropped; an unknown sender is asked for
--- its ticket, later, at most once per ASK_GAP.
-function Ticket:Admit(sender, kind, now)
+-- its ticket, later, at most once per ASK_GAP. A relayed origin is never asked:
+-- tickets never cross factions, and forged origins would spend the ask budget.
+function Ticket:Admit(sender, kind, now, relayed)
   if kind == "T" or kind == "TQ" then return true end
   if self:Revoked(sender) then
     self.counts.revokedIgnored = self.counts.revokedIgnored + 1
     return false
   end
-  if not self.peers[sender] then self:Ask(sender, now) end
+  if not relayed and not self.peers[sender] then self:Ask(sender, now) end
   return true
 end
 
@@ -485,6 +490,7 @@ end
 -- Sends the due TQ, one every ASK_EVERY seconds at most; a T meanwhile cancels it.
 function Ticket:Tick(now)
   now = now or Now()
+  if self.retryImport and #self.queue < MAX_QUEUE then self:OnImport(self.retryImport) end
   if not self.asks or (self.lastAskAt and now - self.lastAskAt < ASK_EVERY) then return end
   for who, ask in pairs(self.asks) do
     if ask.due and now >= ask.due then

@@ -3,13 +3,18 @@ Warfront = Warfront or {}
 local WF = Warfront
 
 -- Who plays Warfront right now: the members of the hidden Warfront channel,
--- read from the client's channel roster (C_ChatInfo.GetChannelRosterInfo).
--- Selecting the channel as the display channel asks the server for its roster;
--- CHANNEL_ROSTER_UPDATE / CHANNEL_COUNT_UPDATE then say it changed. Nothing is
--- sent on the channel, so it costs nothing to its budget (rule R17). Names
--- come from the server roster, never from a message body. The local character
--- is listed as soon as the channel is joined, before any roster answer, under
--- its full Forever name (core/names.lua), as the roster writes it.
+-- read from the client's channel roster (C_ChatInfo.GetChannelRosterInfo),
+-- plus the Warfront players this client already knows elsewhere (decision
+-- 0080): guild mates and group mates heard sending Warfront lines, and
+-- contacts made through a Battle.net friendship or near us. The roster is
+-- loaded by the directory's guarded fetch (modules/directory.lua: another
+-- display channel, then ours, never in combat, an instance or with the Channels
+-- window open, off after a blocked action); this module never selects a display
+-- channel itself. CHANNEL_ROSTER_UPDATE / CHANNEL_COUNT_UPDATE say it changed.
+-- Nothing is sent, so it costs nothing (rule R17). Names come from the server
+-- roster or the chat event sender, never from a message body. The local
+-- character is listed as soon as the channel is joined, under its full Forever
+-- name (core/names.lua), as the roster writes it.
 local Players = {
   CHANNEL = "Warfront",
   -- A new request while the tab is open; never more than one per MIN_GAP.
@@ -17,8 +22,12 @@ local Players = {
   MIN_GAP = 5,
   -- A roster read waiting for missing entries retries at most this often.
   READ_GAP = 1,
+  -- The other sources are read again this often while the tab is open.
+  MERGE_GAP = 5,
   MAX_NAMES = 500,
   names = {},
+  -- name -> "near" | "group" | "guild" | "friend" for players known beyond the roster.
+  tags = {},
   me = nil,
   count = 0,
   updatedAt = nil,
@@ -107,7 +116,35 @@ function Players:FindDisplay()
   return nil
 end
 
--- Rebuilds names from the roster. Returns true when the list was read.
+-- Warfront players known beyond the roster, as { name, tag }, the strongest tag
+-- kept per name: near us, then group, guild, friend (decision 0080).
+local TAG_RANK = { near = 4, group = 3, guild = 2, friend = 1 }
+
+local function KnownElsewhere(now)
+  local found = {}
+  local function Add(name, tag)
+    name = Players.CleanName(name)
+    if not name then return end
+    if not found[name] or TAG_RANK[tag] > TAG_RANK[found[name]] then found[name] = tag end
+  end
+  local transport, directory = WF.Transport, WF.Directory
+  if transport and type(transport.KnownPlayers) == "function" then
+    local ok, list = pcall(transport.KnownPlayers, transport, now)
+    if ok and type(list) == "table" then
+      for i = 1, #list do Add(list[i].name, list[i].tag) end
+    end
+  end
+  if directory and type(directory.KnownPlayers) == "function" then
+    local ok, list = pcall(directory.KnownPlayers, directory, now)
+    if ok and type(list) == "table" then
+      for i = 1, #list do Add(list[i].name, list[i].tag) end
+    end
+  end
+  return found
+end
+
+-- Rebuilds names from the roster and the other sources. Returns true when
+-- anything was read.
 function Players:Read(now)
   now = now or Now()
   self.readAt = now
@@ -118,16 +155,30 @@ function Players:Read(now)
     table.remove(names)
     index = index - 1
   end
-  if not self:Joined() then
-    self.count, self.displayIndex = 0, nil
-    return false
-  end
+  local tags = {}
+  self.tags = tags
   local seen = {}
   local me = MyName()
   self.me = me
+  local elsewhere = KnownElsewhere(now)
+  for name, tag in pairs(elsewhere) do
+    if name ~= me and #names < self.MAX_NAMES then
+      seen[name] = true
+      names[#names + 1] = name
+      tags[name] = tag
+    end
+  end
+  if not self:Joined() then
+    self.displayIndex = nil
+    if me and #names > 0 then names[#names + 1] = me end
+    table.sort(names, function(a, b) return string.lower(a) < string.lower(b) end)
+    self.count = #names
+    self.updatedAt = #names > 0 and now or self.updatedAt
+    return #names > 0
+  end
   if me then
     seen[me] = true
-    names[1] = me
+    names[#names + 1] = me
   end
   local display, count = self:FindDisplay()
   self.displayIndex = display
@@ -159,18 +210,8 @@ function Players:Read(now)
   return true
 end
 
--- Selecting a display channel changes the Chat Channels window's selection:
--- never do it while the player has that window open.
-local function CanSelect()
-  local frame = GetGlobal("ChannelFrame")
-  if type(frame) == "table" and type(frame.IsShown) == "function" then
-    local ok, shown = pcall(frame.IsShown, frame)
-    if ok and shown then return false end
-  end
-  return true
-end
-
--- Asks the server for the member list. False when too soon or not joined.
+-- Asks for a fresh member list through the directory's guarded fetch. False
+-- when too soon or not joined.
 function Players:Request(now)
   now = now or Now()
   if self.requestedAt and now - self.requestedAt < self.MIN_GAP then return false end
@@ -179,10 +220,10 @@ function Players:Request(now)
     return false
   end
   self.requestedAt = now
-  local display = self:FindDisplay()
-  local selectChannel = GetGlobal("SetSelectedDisplayChannel")
-  if display and type(selectChannel) == "function" and CanSelect() then
-    if pcall(selectChannel, display) then self.requests = self.requests + 1 end
+  local directory = WF.Directory
+  if directory and type(directory.RequestFetch) == "function" then
+    local ok, asked = pcall(directory.RequestFetch, directory, now)
+    if ok and asked then self.requests = self.requests + 1 end
   end
   self:Read(now)
   return true
@@ -193,7 +234,8 @@ function Players:Tick(now)
   now = now or Now()
   local last = self.requestedAt
   if not last or now - last >= self.REFRESH then return self:Request(now) end
-  if self.dirty and (not self.readAt or now - self.readAt >= self.READ_GAP) then
+  if (self.dirty and (not self.readAt or now - self.readAt >= self.READ_GAP))
+      or not self.readAt or now - self.readAt >= self.MERGE_GAP then
     self:Read(now)
   end
   return false

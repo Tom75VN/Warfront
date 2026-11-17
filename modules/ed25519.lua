@@ -410,7 +410,8 @@ local function Sum(hs, ls)
 end
 
 -- bytes: 0-based list of byte values; returns the 64-byte digest, 0-based.
-local function Sha512(bytes, n)
+-- pause, when given, is called every 8 blocks (a long message spread over frames).
+local function Sha512(bytes, n, pause)
   local msg = {}
   local i, t
   for i = 0, n - 1 do msg[i] = bytes[i] end
@@ -430,6 +431,7 @@ local function Sha512(bytes, n)
   for i = 1, 16 do H[i] = H0[i] end
   local Wh, Wl = {}, {}
   for start = 0, total - 1, 128 do
+    if pause and start % 1024 == 0 and start > 0 then pause() end
     for t = 0, 15 do
       local o = start + t * 8
       Wh[t] = ((msg[o] * 256 + msg[o + 1]) * 256 + msg[o + 2]) * 256 + msg[o + 3]
@@ -593,7 +595,7 @@ function Ed25519.Verify(publicKey, message, signature, pause)
   end
   local n = #message
   for i = 1, n do bytes[63 + i] = string.byte(message, i) end
-  local digest = Sha512(bytes, 64 + n)
+  local digest = Sha512(bytes, 64 + n, pause)
   local h = {}
   ModL(h, digest)
   if pause then pause() end
@@ -622,3 +624,10 @@ function Ed25519.Verify(publicKey, message, signature, pause)
   end
   return true
 end
+
+-- Field helpers shared with modules/x25519.lua (decision 0127), which loads
+-- after this file. Aliases only: no new top-level local here.
+Ed25519.Kit = {
+  Gf = Gf, Set = Set, A = A, Z = Z, M = M, S = S,
+  Inv25519 = Inv25519, Pack25519 = Pack25519, Unpack25519 = Unpack25519,
+}

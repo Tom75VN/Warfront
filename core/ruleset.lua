@@ -5,31 +5,40 @@ local WF = Warfront
 WF.Ruleset = WF.Ruleset or {}
 local Ruleset = WF.Ruleset
 
--- Ruleset scope (decision 0072). Shared gameplay has exactly two partitions,
--- PVP and NORMAL, chosen by the client's game-mode record
+-- Ruleset scope (decision 0072) and map (decision 0120). The scope, PVP or
+-- NORMAL, is chosen by the client's game-mode record
 -- (C_GameRules.GetCurrentGameModeRecordID(), measured 14 = PvP and
--- 15 = Normal/PvE on 2026-11-07). The realm name, realm id, region and the
--- character's surname never decide it: they are bounded diagnostic metadata
--- recorded next to the scope for the companion and the cloud. Any other record
--- (RP, RP-PvP, Hardcore, unknown) disables Warfront with one notice.
+-- 15 = Normal/PvE on 2026-11-07); any other record (RP, RP-PvP, Hardcore,
+-- unknown) disables Warfront with one notice. Shared gameplay is partitioned by
+-- map: the scope and the commercial region (GetCurrentRegion()). While the
+-- region is unknown the scope stays unresolved: nothing is written, sent or
+-- imported. The realm name, realm id and the character's surname never decide
+-- anything: they are bounded diagnostic metadata for the companion and the cloud.
 --
 -- SavedVariables, read by the companion (contract v2, docs/companion.md):
---   WarfrontDB.scopeSchema = 1
---   WarfrontDB.scopes[scope] = { context = { scope, rulesetRecord, regionId,
---     regionName, realmId, realmName, normalizedRealmName, clientVersion,
---     build, interface }, <module> = { ... } }
--- Realm-keyed buckets of older builds stay in their module tables as an
--- archive; nothing is deleted or merged (rule R7).
+--   WarfrontDB.scopeSchema = 2
+--   WarfrontDB.scopes["<region>:<SCOPE>"] = { context = { scope, rulesetRecord,
+--     regionId, regionName, realmId, realmName, normalizedRealmName,
+--     clientVersion, build, interface }, <module> = { ... } }
+-- scopeSchema 1 kept one bucket per scope, scopes[SCOPE]. It is copied once
+-- into the map of its recorded region, in a session of that region, and kept
+-- untouched as an archive; a bucket without a valid recorded region is never
+-- copied. Realm-keyed buckets of older builds stay in their module tables as an
+-- archive too; nothing is deleted or merged (rule R7).
 
-local SCHEMA = 1
+local SCHEMA = 2
+local LEGACY_SCHEMA = 1
 local RECORDS = { [14] = "PVP", [15] = "NORMAL" }
 local MAX_REGION = 1000
 local MAX_TEXT = 48
 
 Ruleset.SCHEMA = SCHEMA
+Ruleset.LEGACY_SCHEMA = LEGACY_SCHEMA
 Ruleset.RECORDS = RECORDS
 Ruleset.NOTICE = "Warfront is available only on the Normal and PvP rulesets."
 Ruleset.scope = nil
+Ruleset.region = nil
+Ruleset.copyFailed = false
 Ruleset.record = nil
 Ruleset.context = nil
 Ruleset.unsupported = false
@@ -84,6 +93,18 @@ function Ruleset.Clean(text)
   return clean
 end
 
+-- The bucket key of a map: "<region>:<SCOPE>" (decision 0120), nil without both.
+function Ruleset.BucketKey(scope, region)
+  if scope ~= "PVP" and scope ~= "NORMAL" then return nil end
+  region = Whole(region, 1, MAX_REGION)
+  if not region then return nil end
+  return string.format("%d:%s", region, scope)
+end
+
+local function ReadRegion()
+  return Whole(Call(Global("GetCurrentRegion")), 1, MAX_REGION)
+end
+
 -- The scope of a record: only the exact measured ids count.
 function Ruleset.ScopeOf(record)
   if type(record) ~= "number" then return nil end
@@ -98,9 +119,9 @@ function Ruleset:ReadRecord()
   return record
 end
 
-local function ReadContext(scope, record)
+local function ReadContext(scope, record, region)
   local context = { scope = scope, rulesetRecord = record }
-  context.regionId = Whole(Call(Global("GetCurrentRegion")), 1, MAX_REGION)
+  context.regionId = region
   context.regionName = Ruleset.Clean(Call(Global("GetCurrentRegionName")))
   context.realmId = Whole(Call(Global("GetRealmID")), 1, 4294967295)
   context.realmName = Ruleset.Clean(Call(Global("GetRealmName")))
@@ -118,16 +139,18 @@ local function Notice(self)
   if WF.Print then WF.Print(Ruleset.NOTICE) end
 end
 
--- Reads the record again. The first supported record fixes the scope for the
--- whole session; a different record afterwards (or a later unsupported one) is a
--- conflict: Warfront stops rather than move data between scopes. An API that
--- does not answer yet changes nothing. Returns the scope or nil.
+-- Reads the record and the region again. The first supported record with a
+-- known region fixes the map for the whole session; a different record or
+-- region afterwards (or a later unsupported record) is a conflict: Warfront
+-- stops rather than move data between maps. An API that does not answer yet
+-- changes nothing. Returns the scope or nil.
 function Ruleset:Refresh()
   local record = self:ReadRecord()
   if record == nil then return self:Scope(true) end
   local scope = Ruleset.ScopeOf(record)
+  local region = ReadRegion()
   if self.scope then
-    if scope ~= self.scope then
+    if scope ~= self.scope or (region and region ~= self.region) then
       if not self.conflict then
         self.conflict = true
         Record("RULESET_CONFLICT", { from = self.record, to = record })
@@ -145,13 +168,16 @@ function Ruleset:Refresh()
       Notice(self)
       return nil
     end
+    -- No region yet: the map is unknown, nothing is decided (decision 0120).
+    if not region then return nil end
     self.scope = scope
+    self.region = region
     self.record = record
     self.unsupported = false
   end
   if self.scope and not self.conflict then
-    -- Region and realm are diagnostics: refreshed as the game gives them.
-    self.context = ReadContext(self.scope, self.record)
+    -- Realm and client details are diagnostics: refreshed as the game gives them.
+    self.context = ReadContext(self.scope, self.record, self.region)
     self:Persist()
   end
   return self:Scope(true)
@@ -178,10 +204,10 @@ function Ruleset:Context()
   return self.context
 end
 
--- The commercial region (actor identity and diagnostics), nil when unknown.
+-- The commercial region of the session's map, nil when unknown.
 function Ruleset:Region()
-  local context = self:Context()
-  return context and context.regionId or nil
+  if not self:Scope() then return nil end
+  return self.region
 end
 
 local function Db()
@@ -192,24 +218,63 @@ local function Db()
   return db
 end
 
--- WarfrontDB.scopes[scope], or nil without storage, for a newer scopes schema
--- (left untouched) or without a supported scope.
+-- A deep copy of saved data (a tree of plain values), nil past MAX_COPY_DEPTH.
+local MAX_COPY_DEPTH = 64
+local function Copy(value, depth)
+  if type(value) ~= "table" then return value end
+  if depth > MAX_COPY_DEPTH then return nil end
+  local out = {}
+  for key, item in pairs(value) do
+    local copied = Copy(item, depth + 1)
+    if copied == nil then return nil end
+    out[Copy(key, depth + 1)] = copied
+  end
+  return out
+end
+
+-- The pre-0120 bucket scopes[SCOPE], copied once into its recorded region's map
+-- (decision 0120 § 6), or nil: only in a session of that region, only when its
+-- context records this scope and a valid region. The original stays as it is.
+-- A bucket that should be copied but cannot be returns nil, true: no map is
+-- created, so a later build can still copy it (nothing starts empty over it).
+local function AdoptLegacy(scopes, scope, region)
+  local legacy = scopes[scope]
+  local context = type(legacy) == "table" and legacy.context
+  if type(context) ~= "table" or context.scope ~= scope then return nil end
+  if Whole(context.regionId, 1, MAX_REGION) ~= region then return nil end
+  local copy = Copy(legacy, 1)
+  if not copy then
+    Record("RULESET_MAP_COPY_FAILED", { scope = scope, region = region })
+    return nil, true
+  end
+  Record("RULESET_MAP_ADOPTED", { scope = scope, region = region })
+  return copy
+end
+
+-- WarfrontDB.scopes["<region>:<SCOPE>"], or nil without storage, for a newer
+-- scopes schema (left untouched) or without a resolved map.
 function Ruleset:Bucket()
   local scope = self:Scope()
-  local db = scope and Db()
+  local key = scope and not self.copyFailed and Ruleset.BucketKey(scope, self.region)
+  local db = key and Db()
   if not db then return nil end
   if type(db.scopeSchema) == "number" and db.scopeSchema > SCHEMA then return nil end
-  db.scopeSchema = SCHEMA
   if type(db.scopes) ~= "table" then db.scopes = {} end
-  local bucket = db.scopes[scope]
+  local bucket = db.scopes[key]
   if type(bucket) ~= "table" then
-    bucket = {}
-    db.scopes[scope] = bucket
+    local copy, failed = AdoptLegacy(db.scopes, scope, self.region)
+    if failed then
+      self.copyFailed = true
+      return nil
+    end
+    bucket = copy or {}
+    db.scopes[key] = bucket
   end
+  db.scopeSchema = SCHEMA
   return bucket
 end
 
--- One module's table of the current scope: scopes[scope][name].
+-- One module's table of the current map: scopes["<region>:<SCOPE>"][name].
 function Ruleset:Module(name)
   local bucket = type(name) == "string" and self:Bucket()
   if not bucket then return nil end
