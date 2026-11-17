@@ -13,3 +13,7 @@ The addon manifest targets Forever Interface `16001`. Open the main window with 
 ## Status
 
 Captures, the conquest map, the capture HUD, resources, armies, garrisons, scouting and attacks are in place. Warfront is still being tested in the WoW: Forever client, with more players needed.
+
+## Licence
+
+All rights reserved. See [LICENSE](LICENSE).
