@@ -1245,7 +1245,7 @@ function Relay.HeardBy(list, me, audience, now)
   local chatType = audience == "own" and "PARTY" or audience
   local heard = {}
   local transport = WF.Transport
-  if (chatType == "GUILD" or chatType == "PARTY" or chatType == "RAID")
+  if (chatType == "CHANNEL" or chatType == "GUILD" or chatType == "PARTY" or chatType == "RAID")
       and transport and type(transport.Hearers) == "function" then
     local ok, names = pcall(transport.Hearers, transport, chatType, now)
     if ok and type(names) == "table" then
@@ -1415,12 +1415,13 @@ function Relay:NoteBeacon(identity, count, now, ttl)
   now = now or Now()
   local name = ElectName(identity)
   if not name then return end
-  if count <= 0 or not Admitted(identity, now) then
+  local admitted = Admitted(identity, now)
+  if count <= 0 or not admitted then
     if holders[name] then
       holders[name] = nil
       holderCount = holderCount - 1
     end
-    return
+    return admitted and count == 0
   end
   if not holders[name] then
     if holderCount >= K.MAX_HOLDERS then
@@ -1438,6 +1439,7 @@ function Relay:NoteBeacon(identity, count, now, ttl)
   -- A presence never shortens what a fresher B line promised.
   if previous and previous.expireAt > expireAt then expireAt = previous.expireAt end
   holders[name] = { links = mathMin(count, K.MAX_LINKS), at = now, expireAt = expireAt }
+  return true
 end
 
 -- Our live link count while we are a bridge, else 0: the NP presence carries it.

@@ -68,6 +68,16 @@ local function Finish(entry, ok, err, skipped)
 end
 
 local function Dispatch(entry, now)
+  -- Queuing is not permission to send later: the route may have disappeared or
+  -- entered backoff/lockdown. A cancelled entry never spends a client call.
+  if entry.guard then
+    local checked, allowed = pcall(entry.guard)
+    if not checked or allowed ~= true then
+      SendQueue.cancelled = (SendQueue.cancelled or 0) + 1
+      Finish(entry, false, "route unavailable", true)
+      return false, "route unavailable"
+    end
+  end
   if SendQueue.lastSentAt and now - SendQueue.lastSentAt < SendQueue.FLOOD_GAP then
     SendQueue.floodChain = SendQueue.floodChain + 1
   else
@@ -118,7 +128,8 @@ end
 SendQueue.DropRank = DropRank
 
 -- entry = { fn, n (argument count, so a probe can omit trailing arguments),
--- a1..a4, done, key, priority, live }. A queued entry with the same key is
+-- a1..a4, done, key, priority, live, guard }. guard must return true at dispatch.
+-- A queued entry with the same key is
 -- superseded: removed and replaced by the new one at the tail (the live tail for
 -- a live entry), which keeps sequence order. Returns accepted, error, queued; an immediate send reports
 -- its own result.

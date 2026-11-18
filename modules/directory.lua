@@ -1,8 +1,8 @@
 local WF = Warfront
 
 -- The Warfront channel's member list as a directory of contacts (decision 0077
--- step 4a). The server refuses sends on the channel, but its member list stays
--- readable: every Warfront player of our faction who joined it, "First Surname"
+-- step 4a). Hidden addon lines also discover candidates (0134); visible sends
+-- stay off. The list names players of our faction who joined it, "First Surname"
 -- without a realm. An addon whisper reaches such a name (observed on Forever,
 -- sources in docs/decisions/0077-same-faction-transport.md).
 --   * The list is read every REFRESH s. When the game holds none, it fetches one
@@ -38,6 +38,7 @@ local Directory = {
   failed = {}, rows = {}, rowCount = 0, replies = { at = -1000, count = 0 },
   locals = {}, localCount = 0, joinedAt = {}, noticedAt = nil, lastGreetAt = nil,
   quiet = {}, quietCount = 0,
+  observed = {}, roster = {}, -- recent addon speakers, and the last roster/notices
   disabled = nil, lastSelectAt = nil, state = "starting",
   reads = 0, fetches = 0, fetchFailed = 0, greeted = 0, answered = 0, greetedUs = 0,
   repliesSent = 0, repliesCapped = 0, silent = 0, unreachable = 0, refreshes = 0,
@@ -204,13 +205,41 @@ local function Upgrade(directory, now)
   end
 end
 
+local function PruneObserved(directory, now)
+  for identity, entry in pairs(directory.observed) do
+    if now - entry.at > CONTACT_TTL then
+      directory.observed[identity] = nil
+      if not directory.roster[identity] and directory.names[identity] then
+        directory.names[identity] = nil
+        directory.nameCount = directory.nameCount - 1
+        directory.joinedAt[identity] = nil
+      end
+    end
+  end
+end
+
 function Directory:Take(index, members, now)
   local names, count = ReadList(index, members)
   if not names then
     self.state = "member list unreadable"
     return false
   end
-  self.names, self.nameCount, self.readAt, self.state = names, count, now, "listed"
+  PruneObserved(self, now)
+  self.roster = names
+  -- Directly heard addon speakers win over a partial/stale roster snapshot.
+  local merged, mergedCount = {}, 0
+  for identity, entry in pairs(self.observed) do
+    merged[identity], mergedCount = entry.name, mergedCount + 1
+  end
+  for identity, name in pairs(names) do
+    if not merged[identity] and mergedCount < MAX_NAMES then
+      merged[identity], mergedCount = name, mergedCount + 1
+    end
+  end
+  for identity in pairs(self.roster) do
+    if not merged[identity] then self.roster[identity] = nil end
+  end
+  self.names, self.nameCount, self.readAt, self.state = merged, mergedCount, now, "listed"
   self.nextReadAt = now + (self.noticedAt and REFRESH_NOTICED or REFRESH)
   self.reads = self.reads + 1
   Upgrade(self, now)
@@ -563,6 +592,31 @@ local function GreetSoon(directory, now)
   if at < (directory.nextGreetAt or 0) then directory.nextGreetAt = at end
 end
 
+-- A validated hidden-channel sender is a candidate, not a contact yet. Reuse
+-- the notice greeting budget; no roster read, immediate reply or new timer.
+function Directory:OnChannelPeer(playerName, now)
+  if type(playerName) ~= "string" or not Plain(playerName) then return false end
+  local identity, target = Identity(playerName), ChatName(playerName)
+  if not identity or not target or identity == Me() then return false end
+  local fresh = not self.names[identity]
+  local quiet = Quiet(self, identity, now)
+  if fresh then
+    if self.nameCount >= MAX_NAMES then return false end
+    self.names[identity], self.nameCount = target, self.nameCount + 1
+  end
+  self.observed[identity] = { name = target, at = now }
+  if not fresh and not quiet then return false end
+  DropLocal(self, identity)
+  Unquiet(self, identity)
+  local row = self.rows[identity]
+  if row then row.silentUntil = nil end
+  self.joinedAt[identity] = now
+  self.channelPeers = (self.channelPeers or 0) + 1
+  Upgrade(self, now)
+  GreetSoon(self, now)
+  return true
+end
+
 -- `joined`: true for CHAT_MSG_CHANNEL_JOIN, false for CHAT_MSG_CHANNEL_LEAVE.
 -- Names come from the server; a secret or unreadable field drops the notice.
 function Directory:OnChannelNotice(joined, playerName, channelName, zoneChannelID, baseName, now)
@@ -583,12 +637,14 @@ function Directory:OnChannelNotice(joined, playerName, channelName, zoneChannelI
         self.names[identity] = target
         self.nameCount = self.nameCount + 1
       end
+      self.roster[identity] = target
       DropLocal(self, identity)
       self.joinedAt[identity] = now
       self.joins = self.joins + 1
       Upgrade(self, now)
       GreetSoon(self, now)
     else
+      self.observed[identity], self.roster[identity] = nil, nil
       if self.names[identity] then
         self.names[identity] = nil
         self.nameCount = self.nameCount - 1
@@ -714,6 +770,7 @@ end
 function Directory:Tick(now)
   if now < nextTickAt then return end
   nextTickAt = now + TICK
+  PruneObserved(self, now)
   if InInstance() then
     fetching = nil
     return

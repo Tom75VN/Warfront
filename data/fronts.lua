@@ -16,7 +16,7 @@ Warfront = Warfront or {}
 --              later campaign starts when the previous one ends (decision 0103).
 Warfront.FrontData = {
   schema = 2,
-  firstStart = 1794182400,
+  firstStart = 1794960000,
   rotations = {
     { from = 0, sets = { "C1" } },
   },

@@ -164,16 +164,20 @@ local recentTargets, recentTargetCount = {}, 0
 local chain = { tokens = CHAIN_BURST, at = nil, killAt = nil }
 local addon = { tokens = ADDON_BURST, at = nil }
 local seen, seenKeys, seenHead, seenTail = {}, {}, 1, 0
+-- Exact admitted facts and their routing metadata share the seen FIFO bounds.
+-- A later channel/fallback copy grants no permission to a changed body.
+local seenFacts = {}
 local nextTickAt = 0
 local groupPeers, groupPeerCount = {}, 0
 local answered = {}        -- kind -> { last = { target -> at }, times = { at, ... }, count }
 local startAt, pullFirstAt, pullRound = nil, nil, 0
 
 Transport.channelConfirmed = false
-Transport.channelAcked = false
 Transport.channelSent = 0
 Transport.channelRemote = 0
 Transport.channelAcks = 0
+Transport.channelCanaries = 0
+Transport.channelAckCancelled = 0
 
 -- Small helpers ---------------------------------------------------------------------
 
@@ -301,6 +305,7 @@ local function PurgeSeen(now)
     local key = seenKeys[seenHead]
     if seenTail - seenHead + 1 <= DEDUP_MAX and now - seen[key] <= DEDUP_TTL then break end
     seen[key] = nil
+    seenFacts[key] = nil
     seenKeys[seenHead] = nil
     seenHead = seenHead + 1
   end
@@ -315,6 +320,29 @@ local function MarkSeen(key, now)
 end
 
 -- Sending -----------------------------------------------------------------------------
+
+local canary = {
+  RETRY_FIRST = 60, RETRY_MAX = 1800, RETRIES = 6, ACK_DELAY = 1, ACK_SPREAD = 4, ACK_GAP = 30,
+  retryAt = nil, wait = nil, retries = 0, ackAt = nil, lastAckAt = nil,
+  target = nil, generation = 0, hearers = {}, hearerCount = 0,
+}
+
+local function ChannelTarget()
+  local p2p = WF.P2PTest
+  local target, name
+  if p2p and type(p2p.ChannelTarget) == "function" then
+    local ok, value, label = pcall(p2p.ChannelTarget)
+    if ok and type(value) == "string" and value ~= "" then target, name = value, label end
+  end
+  if target ~= canary.target then
+    canary.target, canary.generation = target, canary.generation + 1
+    canary.ackAt, canary.retryAt, canary.wait = nil, nil, nil
+    canary.hearers, canary.hearerCount = {}, 0
+    Transport.channelConfirmed = false
+    -- Retry count and acknowledgement gap remain session-wide, even on rejoin.
+  end
+  return target, name
+end
 
 -- The client call, made by WF.SendQueue. A refusal raises, so the send gate
 -- reports a failure (its result is otherwise not passed on).
@@ -353,16 +381,30 @@ local function Submit(chatType, line, key, priority, onDone, target, live)
     if key then return false, "addon message budget" end
   end
   if chatType == "WHISPER" and target then NoteTarget(target, now) end
+  local channelGeneration = chatType == "CHANNEL" and canary.generation or nil
   local ok, err, delayed = queue:Submit({
     fn = AddonCall, n = target and 4 or 3, a1 = PREFIX, a2 = line, a3 = chatType, a4 = target,
     key = key and (chatType .. "|" .. key) or nil, priority = priority, live = live or nil,
+    guard = function()
+      if not Usable() or Paused(chatType, Now()) then return false end
+      if chatType == "CHANNEL" then
+        return ChannelTarget() == target and canary.generation == channelGeneration
+      end
+      if GROUP_TYPES[chatType] then return GroupType() == chatType end
+      if chatType == "GUILD" then return InGuild() end
+      return true
+    end,
     done = function(ok, err, skipped)
       local at = Now()
       if ok then
         Transport.sent = Transport.sent + 1
         NoteSuccess(chatType)
       elseif skipped then
-        Transport.superseded = Transport.superseded + 1
+        if err == "route unavailable" then
+          Transport.routeCancelled = (Transport.routeCancelled or 0) + 1
+        else
+          Transport.superseded = Transport.superseded + 1
+        end
       elseif type(err) == "string" and strFind(err, "refused", 1, true) then
         Transport.refused = Transport.refused + 1
         local result = tonumber(string.match(err, "refused (%d+)"))
@@ -398,20 +440,12 @@ local function Submit(chatType, line, key, priority, onDone, target, live)
   return ok, err, delayed
 end
 
-local function ChannelTarget()
-  local p2p = WF.P2PTest
-  if not p2p or type(p2p.ChannelTarget) ~= "function" then return nil end
-  local ok, target, name = pcall(p2p.ChannelTarget)
-  if not ok or type(target) ~= "string" or target == "" then return nil end
-  return target, name
-end
-
 local function SubmitChannel(line, key, priority, live, canary)
+  local target = ChannelTarget()
+  if not target then return false end
   if not canary and not Transport.channelConfirmed then return false end
   local now = Now()
   if Paused("CHANNEL", now) then return false end
-  local target = ChannelTarget()
-  if not target then return false end
   local ok = Submit("CHANNEL", line, key and ("channel:" .. key) or nil, priority, nil, target, live)
   if ok then Transport.channelSent = Transport.channelSent + 1 end
   return ok and true or false
@@ -428,19 +462,55 @@ end
 
 local Wire
 
-local function AcknowledgeChannel()
-  if Transport.channelAcked then return end
+-- Hidden-channel canary (decision 0134 § 2, amended 2026-11-17): while no peer
+-- confirmed the lane, V,A is retried 60 s after the join, then at doubling
+-- waits up to 1,800 s, 6 retries a session. A remote V,A draws one V,R 1-5 s
+-- later, cancelled by any other V,R heard meanwhile, at most one per 30 s.
+local function SendCanary(flag)
   local storage = WF.Storage
   local db = storage and type(storage.GetDB) == "function" and storage:GetDB() or nil
   local sequence = storage and type(storage.NextSequence) == "function" and storage:NextSequence() or nil
   local session = db and db.session and db.session.id or nil
-  if type(session) ~= "string" or type(sequence) ~= "number" then return end
-  local line = Wire("V", session, sequence, "R")
-  if not line or #line > MAX_BYTES then return end
-  if SubmitChannel(line, nil, nil, nil, true) then
-    Transport.channelAcked = true
-    Transport.channelAcks = Transport.channelAcks + 1
+  if type(session) ~= "string" or type(sequence) ~= "number" then return false end
+  local line = Wire("V", session, sequence, flag)
+  if not line or #line > MAX_BYTES then return false end
+  return SubmitChannel(line, nil, nil, nil, true)
+end
+
+-- A remote V heard on the hidden channel.
+local function NoteChannelVersion(flag, now)
+  if flag == "R" then
+    if canary.ackAt then
+      canary.ackAt = nil
+      Transport.channelAckCancelled = Transport.channelAckCancelled + 1
+    end
+    return
   end
+  if flag ~= "A" or canary.ackAt then return end
+  if canary.lastAckAt and now - canary.lastAckAt < canary.ACK_GAP then return end
+  canary.ackAt = now + canary.ACK_DELAY + mathRandom() * canary.ACK_SPREAD
+end
+
+local function ChannelCanaryTick(now)
+  local target = ChannelTarget()
+  if canary.ackAt and now >= canary.ackAt then
+    canary.ackAt, canary.lastAckAt = nil, now
+    if SendCanary("R") then Transport.channelAcks = Transport.channelAcks + 1 end
+  end
+  if Transport.channelConfirmed or not target then
+    canary.retryAt = nil
+    return
+  end
+  if not canary.retryAt then
+    canary.wait = canary.wait or canary.RETRY_FIRST
+    canary.retryAt = now + canary.wait
+    return
+  end
+  if now < canary.retryAt or canary.retries >= canary.RETRIES then return end
+  canary.retries = canary.retries + 1
+  canary.wait = mathMin(canary.wait * 2, canary.RETRY_MAX)
+  canary.retryAt = now + canary.wait
+  if SendCanary("A") then Transport.channelCanaries = Transport.channelCanaries + 1 end
 end
 
 Wire = function(id, session, sequence, body)
@@ -975,7 +1045,17 @@ end
 function Transport:Hearers(chatType, now)
   now = now or Now()
   local list = {}
-  if chatType == "GUILD" then
+  if chatType == "CHANNEL" then
+    ChannelTarget()
+    for identity, at in pairs(canary.hearers) do
+      if now - at <= GROUP_PEER_TTL then
+        list[#list + 1] = identity
+      else
+        canary.hearers[identity] = nil
+        canary.hearerCount = canary.hearerCount - 1
+      end
+    end
+  elseif chatType == "GUILD" then
     for identity, at in pairs(guild.peers) do
       if now - at <= GUILD.PEER_TTL then list[#list + 1] = identity end
     end
@@ -1119,6 +1199,35 @@ local function OnOwnGuildCopy(text)
   return false
 end
 
+local function DiscoverChannelPeer(sender, identity, now)
+  local ticket, directory = WF.Ticket, WF.Directory
+  if ticket and ticket.Admit and not ticket:Admit(identity, "V", now, true) then return false end
+  Transport.channelConfirmed = true
+  if not canary.hearers[identity] then
+    if canary.hearerCount >= GUILD.MAX_PEERS then Transport:Hearers("CHANNEL", now) end
+    if canary.hearerCount < GUILD.MAX_PEERS then
+      canary.hearerCount = canary.hearerCount + 1
+      canary.hearers[identity] = now
+    end
+  else
+    canary.hearers[identity] = now
+  end
+  if directory and type(directory.OnChannelPeer) == "function" then
+    local ok, err = pcall(directory.OnChannelPeer, directory, sender, now)
+    if not ok and WF.RecordError then WF.RecordError("channel peer", err) end
+  end
+  return true
+end
+
+local function PassDirect(identity, parsed, chatType, now)
+  local chainModule = WF.Chain
+  if chatType == "CHANNEL" or not chainModule or type(chainModule.OnDirect) ~= "function"
+      or RelayClass(parsed.id, parsed.data) ~= "C" then return end
+  local hearers = Transport:Hearers(chatType, now)
+  local ok, err = pcall(chainModule.OnDirect, chainModule, identity, parsed, chatType, hearers, now)
+  if not ok and WF.RecordError then WF.RecordError("chain direct", err) end
+end
+
 function Transport:OnAddonMessage(prefix, text, chatType, sender, target, zoneChannelID, localID, channelName, instanceID)
   if IsSecret(prefix) or IsSecret(text) or IsSecret(chatType) or IsSecret(sender) then return end
   if prefix ~= PREFIX or type(text) ~= "string" or strSub(text, 1, 2) ~= "WF" then return end
@@ -1158,8 +1267,6 @@ function Transport:OnAddonMessage(prefix, text, chatType, sender, target, zoneCh
   if chatType == "CHANNEL" then
     if not CHANNEL_CAPTURE_LINES[parsed.id] and not GROUP_LINES[parsed.id] then return Reject("channel kind") end
     self.channelRemote = self.channelRemote + 1
-    self.channelConfirmed = true
-    AcknowledgeChannel()
   end
   -- A line of another campaign is never applied (decision 0103 § 4b).
   if type(p2p.AdmitCampaign) == "function" and not p2p.AdmitCampaign(parsed.id, parsed.campaign) then
@@ -1269,6 +1376,16 @@ function Transport:OnAddonMessage(prefix, text, chatType, sender, target, zoneCh
   -- The version announce from our group or confirmed hidden channel.
   if parsed.id == "V" then
     if not GROUP_TYPES[chatType] and chatType ~= "CHANNEL" then return Reject("version line kind") end
+    if chatType == "CHANNEL" then
+      if parsed.data ~= "A" and parsed.data ~= "R" then return Reject("channel version flag") end
+      PurgeSeen(now)
+      if not MarkSeen(SeenKey(identity, parsed.session, parsed.sequence, parsed.id), now) then
+        self.duplicates = self.duplicates + 1
+        return false
+      end
+      if not DiscoverChannelPeer(sender, identity, now) then return false end
+      NoteChannelVersion(parsed.data, now)
+    end
     local version = WF.Version
     if version and type(version.OnAnnounce) == "function" then
       local okV, versionError = pcall(version.OnAnnounce, version, parsed.version, parsed.data, now)
@@ -1283,6 +1400,7 @@ function Transport:OnAddonMessage(prefix, text, chatType, sender, target, zoneCh
     if relay and type(relay.OnChannelLine) == "function" then
       local okLine, lineError = pcall(relay.OnChannelLine, relay, parsed.id, parsed.data, sender, false)
       if not okLine and WF.RecordError then WF.RecordError("relay group line", lineError) end
+      if okLine and lineError == true and chatType == "CHANNEL" then DiscoverChannelPeer(sender, identity, now) end
     end
     return true
   end
@@ -1291,8 +1409,24 @@ function Transport:OnAddonMessage(prefix, text, chatType, sender, target, zoneCh
     return false
   end
   PurgeSeen(now)
-  if not MarkSeen(SeenKey(identity, parsed.session, parsed.sequence, parsed.id), now) then
+  local seenKey = SeenKey(identity, parsed.session, parsed.sequence, parsed.id)
+  if not MarkSeen(seenKey, now) then
     self.duplicates = self.duplicates + 1
+    -- A faster channel copy must not swallow the group/guild/whisper's
+    -- existing onward route. Never apply twice or start a chain from CHANNEL.
+    local fact = seenFacts[seenKey]
+    if fact and fact.text == text then
+      local ticket = WF.Ticket
+      if not ticket or not ticket.Admit or ticket:Admit(identity, parsed.id, now, true) then
+        if chatType == "CHANNEL" and not fact.channelHeard then
+          fact.channelHeard = true
+          DiscoverChannelPeer(sender, identity, now)
+        elseif chatType ~= "CHANNEL" and fact.pending then
+          fact.pending = nil
+          PassDirect(identity, parsed, chatType, now)
+        end
+      end
+    end
     return false
   end
   -- The channel's chain: the relay's duplicate check and bridge, then capture.
@@ -1320,14 +1454,14 @@ function Transport:OnAddonMessage(prefix, text, chatType, sender, target, zoneCh
   -- still help another client without counting as local delivery.
   if err == false and not capture.forwardable then return false end
   if err ~= false then self.delivered = self.delivered + 1 end
-  -- A critical fact heard first-hand may go further hand to hand (step 4b).
-  local chainModule = WF.Chain
-  if chatType ~= "CHANNEL" and capture.forwardable ~= false and chainModule and type(chainModule.OnDirect) == "function"
-    and RelayClass(parsed.id, parsed.data) == "C" then
-    -- The Warfront clients known to hear it there, not every group member.
-    local hearers = self:Hearers(chatType, now)
-    local passed, passError = pcall(chainModule.OnDirect, chainModule, identity, parsed, chatType, hearers, now)
-    if not passed and WF.RecordError then WF.RecordError("chain direct", passError) end
+  if capture.forwardable ~= false then
+    seenFacts[seenKey] = { text = text, channelHeard = chatType == "CHANNEL",
+      pending = chatType == "CHANNEL" and RelayClass(parsed.id, parsed.data) == "C" }
+  end
+  if chatType == "CHANNEL" then
+    DiscoverChannelPeer(sender, identity, now)
+  elseif capture.forwardable ~= false then
+    PassDirect(identity, parsed, chatType, now)
   end
   return true
 end
@@ -1345,6 +1479,7 @@ function Transport:Tick(now)
   nextTickAt = now + TICK
   startAt = startAt or now
   if not Usable() then return end
+  ChannelCanaryTick(now)
   local groupType = GroupType()
   if groupType and not lastGroupType then
     -- Entering a group starts an owner catch-up series there (decision 0077
@@ -1503,7 +1638,10 @@ function Transport:PrintStatus()
     .. " oversize=" .. self.oversize .. (#pauses > 0 and (" paused " .. table.concat(pauses, ", ")) or "")
     .. (self.lastError and (" lastError=" .. self.lastError) or ""))
   print("transport: channel confirmed=" .. (self.channelConfirmed and "yes" or "no")
-    .. " sent=" .. self.channelSent .. " remote=" .. self.channelRemote .. " acks=" .. self.channelAcks)
+    .. " sent=" .. self.channelSent .. " remote=" .. self.channelRemote .. " acks=" .. self.channelAcks
+    .. " retries=" .. self.channelCanaries .. " ackCancelled=" .. self.channelAckCancelled)
+  print("transport: channel hearers=" .. #self:Hearers("CHANNEL", now)
+    .. " routeCancelled=" .. (self.routeCancelled or 0))
   print("transport: addressed out=" .. self.addressed .. " in=" .. self.addressedIn .. " presences=" .. self.presencesWhispered
     .. " fanned=" .. self.fanned .. " fanSkipped=" .. self.fanSkipped .. " hiddenOffline=" .. self.hiddenOffline
     .. " offline=" .. (self.offline or 0)
