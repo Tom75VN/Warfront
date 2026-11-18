@@ -188,6 +188,13 @@ function WF.RegisterEvent(eventName, callback)
   return true
 end
 
+-- Login line: the name in the accent colour, the version in grey.
+WF.RegisterEvent("PLAYER_LOGIN", function()
+  if DEFAULT_CHAT_FRAME and DEFAULT_CHAT_FRAME.AddMessage then
+    DEFAULT_CHAT_FRAME:AddMessage("|cfff5ae0aWarfront|r |cff999999" .. WF.version .. "|r")
+  end
+end)
+
 function WF.GetEventRegistration(eventName)
   return registrations[eventName]
 end

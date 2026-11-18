@@ -528,5 +528,10 @@ local C = {
   ["Waiting for the garrison keeper to accept "] = "Donación pendiente: ",
   ["Garrison data: "] = "Guarnición: ",
   [" once both are reached: garrison capacity "] = " al alcanzar ambos objetivos: capacidad de guarnición ",
+  ["Get the Companion"] = "Obtener Companion",
+  ["Download"] = "Descargar",
+  ["Windows"] = "Windows",
+  ["Mac (Apple Silicon)"] = "Mac (Apple Silicon)",
+  ["Click a link, then press Ctrl+C (Cmd+C on Mac) and paste it into your browser."] = "Haz clic en un enlace, pulsa Ctrl+C (Cmd+C en Mac) y pégalo en tu navegador.",
 }
 Warfront.Locale:Register("esES", C)

@@ -528,5 +528,10 @@ local C = {
   ["Waiting for the garrison keeper to accept "] = "Ожидается передача: ",
   ["Garrison data: "] = "Гарнизон: ",
   [" once both are reached: garrison capacity "] = " при достижении обоих порогов: вместимость гарнизона ",
+  ["Get the Companion"] = "Скачать Companion",
+  ["Download"] = "Скачать",
+  ["Windows"] = "Windows",
+  ["Mac (Apple Silicon)"] = "Mac (Apple Silicon)",
+  ["Click a link, then press Ctrl+C (Cmd+C on Mac) and paste it into your browser."] = "Щёлкните по ссылке, нажмите Ctrl+C (Cmd+C на Mac) и вставьте её в браузер.",
 }
 Warfront.Locale:Register("ruRU", C)

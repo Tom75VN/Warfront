@@ -528,5 +528,10 @@ local C = {
   ["Waiting for the garrison keeper to accept "] = "等待接收捐赠：",
   ["Garrison data: "] = "驻军：",
   [" once both are reached: garrison capacity "] = "，两项达标后：驻军容量 ",
+  ["Get the Companion"] = "获取配套程序",
+  ["Download"] = "下载",
+  ["Windows"] = "Windows",
+  ["Mac (Apple Silicon)"] = "Mac（Apple 芯片）",
+  ["Click a link, then press Ctrl+C (Cmd+C on Mac) and paste it into your browser."] = "点击链接，按 Ctrl+C（Mac 上按 Cmd+C）复制，然后粘贴到浏览器中。",
 }
 Warfront.Locale:Register("zhCN", C)

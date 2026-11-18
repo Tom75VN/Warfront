@@ -448,6 +448,12 @@ function Territory:Build()
   panel.header.R:Hide()
   self.balancePanel = panel
   self.banner = FRONT.Banner(panel)
+  -- Companion download (decision 0046), left of the banner while it would help.
+  self.companionGet = NewButton(panel, "red", 150, 22, "Get the Companion", function()
+    if WF.CompanionDownload then WF.CompanionDownload:Toggle() end
+  end)
+  Place(self.companionGet, panel, 10, -5)
+  self.companionGet:Hide()
   self.siegeDriver = NewFrame(panel, 1, 1)
   self.siegeDriver.textures = {}
   self.siegeDriver:SetScript("OnUpdate", FRONT.AnimateSieges)
@@ -544,8 +550,13 @@ function SyncDrawer:BuildPanel(parent)
   self.version = NewText(panel, "GameFontHighlightSmall", 334, -48, 260)
   -- Optional companion (decision 0046): its state, and a tip when it would help.
   self.companion = NewText(panel, "GameFontHighlightSmall", 334, -68, 260)
+  self.companionGet = NewButton(panel, "red", 84, 18, "Download", function()
+    if WF.CompanionDownload then WF.CompanionDownload:Toggle() end
+  end)
+  Place(self.companionGet, panel, CONTENT_WIDTH - 92, -65)
+  self.companionGet:Hide()
   local companionHit = GetGlobal("CreateFrame")("Frame", nil, panel)
-  companionHit:SetWidth(260)
+  companionHit:SetWidth(176)
   companionHit:SetHeight(16)
   companionHit:SetPoint("TOPLEFT", panel, "TOPLEFT", 334, -66)
   companionHit:EnableMouse(true)
@@ -1007,6 +1018,8 @@ function Territory:Update(now)
     return true
   end)
   SortByPlayerDistance(self.poiIds, count, PlayerDistanceContext())
+  local download, companion = WF.CompanionDownload, WF.Companion
+  Show(self.companionGet, download ~= nil and download.Wanted() and not companion:HintHidden())
   self:UpdateFronts(now)
   self:UpdateNetwork()
   -- Two sections, each still sorted by distance: this zone, then the others.
@@ -1146,13 +1159,18 @@ function SyncDrawer:Update(now)
     SetText(self.version, "Addon version: " .. tostring(WF.version) .. Paint("DIM", ", no newer version seen"))
   end
   local companion = WF.Companion
+  local download = WF.CompanionDownload
+  local wanted = download ~= nil and download.Wanted()
+  Show(self.companionGet, wanted)
+  -- Room left of the Download button while it shows.
+  local room = wanted and 176 or 260
   if companion and companion.Helping then
     if companion:Helping() then
-      SetText(self.companion, "Companion: " .. Paint("GOOD", "in use"))
+      FitText(self.companion, "Companion: " .. Paint("GOOD", "in use"), room)
     elseif companion:ShownHint(now) then
-      SetText(self.companion, "Companion: " .. Paint("GOLD", "recommended") .. Paint("DIM", " (optional)"))
+      FitText(self.companion, "Companion: " .. Paint("GOLD", "recommended") .. Paint("DIM", " (optional)"), room)
     else
-      SetText(self.companion, "Companion: " .. Paint("DIM", "optional, not in use"))
+      FitText(self.companion, "Companion: " .. Paint("DIM", "optional, not in use"), room)
     end
   else
     SetText(self.companion, "")

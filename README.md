@@ -2,13 +2,17 @@
 
 Warfront is an Alliance-versus-Horde conquest addon for **World of Warcraft: Forever**.
 
-## Installation
+## Download and installation
 
-Place this directory at:
+1. Download `Warfront-<version>.zip` from the [latest release](https://github.com/Tom75VN/Warfront/releases/latest).
+2. Extract it into `Interface\AddOns`, so that the addon ends up in `Interface\AddOns\Warfront`.
+3. Start the game and open the main window with `/wf` or `/warfront`.
 
-`Interface\AddOns\Warfront`
+The addon manifest targets Forever Interface `16001`. The interface is available in English, French, Spanish, Russian and Simplified Chinese.
 
-The addon manifest targets Forever Interface `16001`. Open the main window with `/wf` or `/warfront`.
+## Warfront Companion (optional)
+
+Warfront works without anything else. The optional [Warfront Companion](https://github.com/Tom75VN/Warfront-Companion/releases/latest) for Windows and Mac adds complete scoreboards and keeps the map up to date between sessions.
 
 ## Status
 

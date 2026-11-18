@@ -47,6 +47,7 @@ modules\progress.lua
 modules\war_record.lua
 modules\import.lua
 modules\companion.lua
+modules\companion_download.lua
 modules\ed25519.lua
 modules\x25519.lua
 modules\allies.lua

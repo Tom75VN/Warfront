@@ -605,6 +605,11 @@ local C = {
   ["Waiting for the garrison keeper to accept "] = "Waiting for the garrison keeper to accept ",
   ["Garrison data: "] = "Garrison data: ",
   [" once both are reached: garrison capacity "] = " once both are reached: garrison capacity ",
+  ["Get the Companion"] = "Get the Companion",
+  ["Download"] = "Download",
+  ["Windows"] = "Windows",
+  ["Mac (Apple Silicon)"] = "Mac (Apple Silicon)",
+  ["Click a link, then press Ctrl+C (Cmd+C on Mac) and paste it into your browser."] = "Click a link, then press Ctrl+C (Cmd+C on Mac) and paste it into your browser.",
 }
 
 Warfront.Locale:Register("enUS", C)
