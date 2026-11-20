@@ -13,7 +13,7 @@ Capture outposts and settlements across Eastern Kingdoms and Kalimdor, raise arm
 <em>Watch the trailer on YouTube</em>
 </p>
 
-<p align="center"><strong><a href="https://github.com/Tom75VN/Warfront/releases/latest">Download the latest release</a></strong>, then type <code>/wf</code> in game.</p>
+<p align="center"><strong><a href="https://www.curseforge.com/wow/addons/warfront">Download the latest release</a></strong>, then type <code>/wf</code> in game.</p>
 
 ## Conquer
 
@@ -90,7 +90,7 @@ Territory, PvP and War effort rankings, for players and for guilds, campaign aft
 
 ## Get started
 
-1. Download `Warfront-<version>.zip` from the [latest release](https://github.com/Tom75VN/Warfront/releases/latest).
+1. Download the latest release from [CurseForge](https://www.curseforge.com/wow/addons/warfront).
 2. Extract it into `Interface\AddOns`, so that the addon ends up in `Interface\AddOns\Warfront`.
 3. Start the game and type `/wf`. The in-game guide explains the rest.
 
