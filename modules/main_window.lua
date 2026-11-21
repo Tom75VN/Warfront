@@ -797,17 +797,68 @@ function Window:SendScout(id)
   return ok
 end
 
+-- Pledge basket (user, 2026-11-20): each +1/+5 adds to what Yes gives, so
+-- 2 Footmen and 1 Rifleman go out together. Local only until Yes.
+-- Returns the basket as { kind, count } in unit order, then gold and wood.
+function Window.PledgeItems(confirm)
+  local items, kinds = {}, {}
+  local garrison = WF.Garrison
+  for _, key in ipairs(garrison and garrison.UNIT_ORDER or {}) do kinds[#kinds + 1] = key end
+  kinds[#kinds + 1], kinds[#kinds + 2] = "gold", "wood"
+  for _, kind in ipairs(kinds) do
+    local count = confirm and confirm.items[kind]
+    if count and count > 0 then items[#items + 1] = { kind = kind, count = count } end
+  end
+  return items
+end
+
+-- Unit Size of the basket's units (modules/army.lua sizes).
+function Window.PledgeSize(confirm)
+  local units, size = WF.Army and WF.Army.UNITS or {}, 0
+  for _, item in ipairs(Window.PledgeItems(confirm)) do
+    local unit = units[item.kind]
+    if unit and unit.size then size = size + item.count * unit.size end
+  end
+  return size
+end
+
 function Window:AskPledge(kind, count)
   local area = WF.Presence and WF.Presence.current
   local garrison = WF.Garrison
-  local valid, reason = garrison and garrison:Check(kind, count)
+  local basket = self.confirm
+  if not area or not basket or basket.id ~= area.id then basket = nil end
+  local already = basket and basket.items[kind] or 0
+  -- War Chest picks stop at the next level's goal (user, 2026-11-20): +500
+  -- adds only what is still needed; the next goal shows once it is reached.
+  local chest = (kind == "gold" or kind == "wood") and garrison and area and garrison:View(area.id)
+  local goal = chest and (kind == "gold" and chest.nextGold or chest.nextWood)
+  if goal then count = math.min(count, goal - chest[kind] - already) end
+  if count < 1 then
+    self:SetStatus("Pledge refused: " .. "the War Chest needs only " .. 0 .. " more " .. kind, "BAD")
+    self:Refresh()
+    return false
+  end
+  local total = count + already
+  local valid, reason = garrison and garrison:Check(kind, total)
+  local view = valid and garrison:View(area.id)
+  if valid and view and WF.Army and WF.Army.UNITS and WF.Army.UNITS[kind] then
+    -- Check sees one kind only: the whole basket must fit the garrison too.
+    local after = { id = area.id, items = {} }
+    for key, value in pairs(basket and basket.items or {}) do after.items[key] = value end
+    after.items[kind] = total
+    local size = Window.PledgeSize(after)
+    if view.used + size > view.capacity then
+      valid, reason = nil, "garrison full: needs " .. size .. " Unit Size, " .. view.used .. "/" .. view.capacity .. " used"
+    end
+  end
   if not area or not valid then
-    self.confirm = nil
     self:SetStatus("Pledge refused: " .. tostring(reason or "you are not inside a garrison"), "BAD")
     self:Refresh()
     return false
   end
-  self.confirm = area and { id = area.id, kind = kind, count = count } or nil
+  basket = basket or { id = area.id, items = {} }
+  basket.items[kind] = total
+  self.confirm = basket
   self:SetStatus(nil)
   self:Refresh()
   return true
@@ -819,29 +870,82 @@ function Window:CancelPledge()
   self:Refresh()
 end
 
--- Pledges with the reserve's current pledge number, so one confirmation
--- pledges once (modules/garrison.lua, Garrison:Pledge).
+-- Sends the basket one kind at a time: a character has one pledge waiting
+-- for the keeper at most (modules/garrison.lua, Garrison:Pledge), so the next
+-- kind leaves once the keeper answered the previous one (WatchPledges).
 function Window:Pledge()
   local confirm = self.confirm
   self.confirm = nil
-  local garrison = WF.Garrison
   local area = WF.Presence and WF.Presence.current
-  local reserve = WF.Army and WF.Army:Reserve()
-  local ok, result = false, "no saved data or identity yet"
+  local ok = false
   if not confirm or not area or area.id ~= confirm.id then
-    result = "you are no longer in the same place"
-  elseif garrison and reserve then
-    ok, result = garrison:Pledge(confirm.kind, confirm.count, reserve.gop)
-  end
-  if ok and result == "sent" then
-    self:SetStatus("Pledge sent: waiting for the garrison keeper", "GOOD")
-  elseif ok then
-    self:SetStatus("Pledged " .. confirm.count .. " " .. garrison:Name(confirm.kind, garrison:View(confirm.id).owner), "GOOD")
+    self:SetStatus("Pledge refused: " .. "you are no longer in the same place", "BAD")
   else
-    self:SetStatus("Pledge refused: " .. tostring(result), "BAD")
+    self.pledgeQueue = { id = confirm.id, items = Window.PledgeItems(confirm) }
+    ok = self:NextPledge()
   end
   self:Refresh()
   return ok
+end
+
+-- Pledges the queue's next kinds with the reserve's current pledge number, so
+-- one confirmation pledges each kind once. Stops at the first refusal.
+function Window:NextPledge()
+  local queue = self.pledgeQueue
+  local garrison = WF.Garrison
+  while queue and queue.items[1] do
+    local item = table.remove(queue.items, 1)
+    local area = WF.Presence and WF.Presence.current
+    local reserve = WF.Army and WF.Army:Reserve()
+    local ok, result = false, "no saved data or identity yet"
+    if not area or area.id ~= queue.id then
+      result = "you are no longer in the same place"
+    elseif garrison and reserve then
+      ok, result = garrison:Pledge(item.kind, item.count, reserve.gop)
+    end
+    if not ok then
+      self.pledgeQueue = nil
+      self:SetStatus("Pledge refused: " .. tostring(result), "BAD")
+      return false
+    end
+    if result == "sent" then
+      self:SetStatus("Pledge sent: waiting for the garrison keeper", "GOOD")
+      queue.before = garrison.last
+      if queue.items[1] then self:WatchPledges() else self.pledgeQueue = nil end
+      return true
+    end
+    self:SetStatus("Pledged " .. item.count .. " " .. garrison:Name(item.kind, garrison:View(queue.id).owner), "GOOD")
+  end
+  self.pledgeQueue = nil
+  return true
+end
+
+-- Runs only while a basket waits for a keeper's answer, even with the window
+-- closed; a refused or returned pledge drops the rest of the basket.
+function Window:WatchPledges()
+  local watcher = self.pledgeWatcher
+  if not watcher then
+    watcher = GetGlobal("CreateFrame")("Frame")
+    self.pledgeWatcher = watcher
+  end
+  local wait = 0
+  watcher:SetScript("OnUpdate", function(_, elapsed)
+    wait = wait - (elapsed or 0)
+    if wait > 0 then return end
+    wait = 0.25
+    local queue, garrison = Window.pledgeQueue, WF.Garrison
+    if queue and garrison and garrison:Pending() then return end
+    watcher:SetScript("OnUpdate", nil)
+    if not queue or not garrison then return end
+    local last = garrison.last
+    if last and last ~= queue.before and not last.ok then
+      Window.pledgeQueue = nil
+      Window:SetStatus(last.text, "BAD")
+    else
+      Window:NextPledge()
+    end
+    if Window.frame and Window.frame:IsShown() then Window:Refresh() end
+  end)
 end
 
 -- Recruits through WF.Army with the reserve's current operation number, so one

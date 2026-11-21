@@ -2062,6 +2062,7 @@ end
 local function PrintHelp()
   WF.Print("/wf or /wf ui (open or close the Warfront window); /wf help (this list)")
   WF.Print("/wf classic (open or close the classic text window)")
+  WF.Print("/wf welcome (show the welcome window again)")
   WF.Print("/wf tab (reopen the Warfront chat tab after closing it)")
   WF.Print("/wf where (your position and the place you stand in)")
   WF.Print("/wf layerhelp on|off (invite players who ask to join your layer's fight)")
@@ -2185,6 +2186,12 @@ local function SlashCommand(message)
       return
     end
     WF.ClassicWindow:Toggle()
+    return
+  end
+  if string.lower(scope) == "welcome" then
+    if not WF.Welcome or not WF.Welcome.Toggle or not WF.Welcome:Toggle() then
+      WF.Print("the welcome window is unavailable (restart the client after an update)")
+    end
     return
   end
   if string.lower(scope) == "tab" then

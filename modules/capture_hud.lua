@@ -1051,6 +1051,14 @@ function HUD:ShowAlert(text, title, side, playSound, category)
   return shown, waits
 end
 
+-- Banner and journal titles by POI type: { captured by us, lost by us }.
+local CAPTURE_TITLES = {
+  OUTPOST = { "Outpost captured", "Outpost lost" },
+  WAR_CAMP = { "War Camp captured", "War Camp lost" },
+  SETTLEMENT = { "Settlement captured", "Settlement lost" },
+  CAPITAL = { "Capital captured", "Capital lost" },
+}
+
 function HUD:OnCaptureEvent(kind, id, side, previousOwner)
   local area = Capture:Capturable(id)
   if not area then return end
@@ -1061,10 +1069,11 @@ function HUD:OnCaptureEvent(kind, id, side, previousOwner)
   elseif kind == "CAPTURED" then
     local text = "The " .. FactionName(side) .. " captured " .. where .. "."
     local mine = Capture:MyFaction()
+    local titles = CAPTURE_TITLES[area.type]
     if side == mine then
-      WF.Alerts:Push("captures", text, { title = "Territory captured", side = side })
+      WF.Alerts:Push("captures", text, { title = titles and titles[1] or "Territory captured", side = side, historyTitle = true })
     elseif previousOwner == mine then
-      WF.Alerts:Push("captures", text, { title = "Territory lost", side = side, sound = true })
+      WF.Alerts:Push("captures", text, { title = titles and titles[2] or "Territory lost", side = side, sound = true, historyTitle = true })
     elseif WF.Print then
       WF.Print(text)
     end

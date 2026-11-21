@@ -572,12 +572,31 @@ local ONLINE_COLUMNS = 3
 local ONLINE_FOOTER = 30
 -- Where we know a player from, beyond the Warfront channel.
 local ONLINE_TAGS = { near = "(near you)", group = "(group)", guild = "(guild)", friend = "(friend)" }
+-- A cell: faction emblem (the map's front emblems), name, then region and
+-- ruleset at the right edge, dropped when the name needs the room.
+Online.CELL = { ICON = 12, NAME_X = 22, PAD = 6, GAP = 4 }
+Online.FACTION_ICONS = {
+  Alliance = "Interface\\AddOns\\Warfront\\media\\Textures\\UI\\Front\\FactionAlliance",
+  Horde = "Interface\\AddOns\\Warfront\\media\\Textures\\UI\\Front\\FactionHorde",
+}
+
+-- Width of a text as drawn, on an unbounded string of the cells' font.
+function Online:Measure(text)
+  local measure = self.measure
+  if not measure or text == "" then return 0 end
+  measure:SetText(text)
+  return measure:GetStringWidth() or 0
+end
 
 function Online:Build()
   local height = CONTENT_HEIGHT - ONLINE_FOOTER
   local panel = NewPanel(self, "Players Online", 0, 0, CONTENT_WIDTH, height)
   self.panel = panel
+  self.measure = Skin():Text(panel, "GameFontHighlightSmall")
+  self.measure:Hide()
+  local layout = self.CELL
   local cell = math.floor((panel.width - 12 - Scroll.GUTTER) / ONLINE_COLUMNS)
+  self.nameRoom = cell - 4 - layout.NAME_X - layout.PAD
   local slots = math.floor((height - 26) / 22)
   self.list = NewList(panel, slots, (height - 26) / slots, -24, function(row)
     row.cells = {}
@@ -593,7 +612,17 @@ function Online:Build()
       row.hovers = row.hovers or {}
       row.hovers[column] = Skin():RowStripe(box, Skin().HOVER_ALPHA)
       row.cellHover = true
-      row.cells[column] = NewText(box, "GameFontHighlightSmall", 8, -4, cell - 16)
+      row.icons = row.icons or {}
+      local icon = box:CreateTexture(nil, "OVERLAY")
+      icon:SetWidth(layout.ICON)
+      icon:SetHeight(layout.ICON)
+      Place(icon, box, layout.PAD, -4)
+      icon:Hide()
+      row.icons[column] = icon
+      row.cells[column] = NewText(box, "GameFontHighlightSmall", layout.NAME_X, -4, self.nameRoom)
+      row.realms = row.realms or {}
+      row.realms[column] = NewText(box, "GameFontHighlightSmall", cell - 4 - layout.PAD, -4, nil, "RIGHT")
+      Place(row.realms[column], box, cell - 4 - layout.PAD, -4, "TOPRIGHT")
       column = column + 1
     end
   end, true)
@@ -605,6 +634,21 @@ function Online:Build()
     if WF.Allies then WF.Allies:Command("") end
   end)
   Place(self.allies, self.frame, CONTENT_WIDTH - 234, -(height + 4))
+  -- Same short tooltip as the Synchronization panel button; the skin's own
+  -- hover scripts keep running (wrapped).
+  local skinEnter, skinLeave = self.allies:GetScript("OnEnter"), self.allies:GetScript("OnLeave")
+  self.allies:SetScript("OnEnter", function(frame, ...)
+    if skinEnter then skinEnter(frame, ...) end
+    GameTooltip:SetOwner(frame, "ANCHOR_TOP")
+    GameTooltip:AddLine("Allies", 1, 1, 1)
+    GameTooltip:AddLine("Become Battle.net friends with a player of the other faction to help Warfront share data between factions.", 0.8, 0.8, 0.8, 1)
+    Window.LocalizeTooltip(GameTooltip)
+    GameTooltip:Show()
+  end)
+  self.allies:SetScript("OnLeave", function(frame, ...)
+    if skinLeave then skinLeave(frame, ...) end
+    GameTooltip:Hide()
+  end)
 end
 
 function Online:Update(now)
@@ -613,14 +657,36 @@ function Online:Update(now)
   players:Tick(now)
   local names, me = players.names, players.me
   local count = players.count
+  local room, gap = self.nameRoom or 0, self.CELL.GAP
   FillList(self.list, math.ceil(count / ONLINE_COLUMNS), function(row, item)
     local column = 1
     while column <= ONLINE_COLUMNS do
       local name = names[(item - 1) * ONLINE_COLUMNS + column]
       local tag = name and players.tags and players.tags[name]
+      local info = name and players.info and players.info[name] or nil
+      local icon = row.icons[column]
+      local path = info and info.faction and self.FACTION_ICONS[info.faction] or nil
+      if path then
+        icon:SetTexture(path)
+        icon:SetTexCoord(0, 1, 0, 1)
+        icon:Show()
+      else
+        icon:Hide()
+      end
+      local realm = ""
+      if info and (info.region or info.ruleset) then
+        realm = (info.region or "") .. ((info.region and info.ruleset) and " " or "") .. (info.ruleset or "")
+      end
       if name == me then name = Paint("GOLD", name .. " (you)")
       elseif tag then name = name .. " " .. Paint("DIM", ONLINE_TAGS[tag] or "") end
       SetText(row.cells[column], name or "")
+      -- The name and its tag keep their room: the label only fills what is left.
+      local realmWidth = name and self:Measure(realm) or 0
+      if realmWidth > 0 and self:Measure(row.cells[column].value or "") + gap + realmWidth > room then
+        realm, realmWidth = "", 0
+      end
+      row.cells[column]:SetWidth(realmWidth > 0 and room - realmWidth - gap or room)
+      SetText(row.realms[column], realm ~= "" and Paint("DIM", realm) or "")
       if name then row.boxes[column]:Show() else row.boxes[column]:Hide() end
       column = column + 1
     end

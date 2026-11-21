@@ -238,6 +238,12 @@ function Army:Build()
     Place(row.portrait, box, 10, -11)
     local frame = Skin():Icon(box, "portrait", 48, 48, "OVERLAY")
     Place(frame, box, 6, -7)
+    -- Reserve count on the portrait's bottom-right corner (2026-11-20, user);
+    -- a child frame keeps it above the OVERLAY border.
+    local badge = NewFrame(box, 40, 40)
+    Place(badge, box, 10, -11)
+    row.count = badge:CreateFontString(nil, "OVERLAY", "NumberFontNormal")
+    row.count:SetPoint("BOTTOMRIGHT", badge, "BOTTOMRIGHT", -1, 2)
     row.name = NewText(box, "GameFontHighlight", 64, -12, 150)
     row.size = NewText(box, "GameFontHighlightSmall", 64, -32, 150)
     row.counter = NewText(box, "GameFontHighlightSmall", 64, -46, 320)
@@ -307,7 +313,8 @@ function Army:Update(now)
     local unit = key and army.UNITS[key]
     if unit then
       UnitIcon(row.portrait, key, faction)
-      SetText(row.name, army:Name(key) .. Paint("GOLD", "  x" .. reserve[key]))
+      SetText(row.count, tostring(reserve[key] or 0))
+      SetText(row.name, army:Name(key))
       SetText(row.size, Paint("DIM", "Size: " .. unit.size))
       SetText(row.costs[1], tostring(unit.gold))
       SetText(row.costs[2], tostring(unit.wood))

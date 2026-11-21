@@ -37,6 +37,53 @@ local ArmyTab = Kit.ArmyTab
 local ArmySwitch = Kit.ArmySwitch
 local RefreshArmySwitch = Kit.RefreshArmySwitch
 
+-- Confirmation strip (user, 2026-11-20): a dark fill inside the chamfered
+-- gold section frame of the Territory front boxes (WFSectionBorder, nine-slice
+-- of 16 / 128 drawn with 6 px corners). `back`, when given, is the plain
+-- strip the frame replaces while hidden.
+local GoldNotice = {
+  TEXTURE = "Interface\\AddOns\\Warfront\\media\\Textures\\UI\\Border\\WFSectionBorder",
+  SLICE = 16 / 128, CORNER = 6,
+}
+
+function GoldNotice.New(frame, back)
+  local c, u = GoldNotice.CORNER, GoldNotice.SLICE
+  local fill = frame:CreateTexture(nil, "BACKGROUND")
+  fill:SetTexture("Interface\\Buttons\\WHITE8X8")
+  fill:SetVertexColor(0.07, 0.085, 0.095, 1)
+  fill:SetPoint("TOPLEFT", frame, "TOPLEFT", 2, -2)
+  fill:SetPoint("BOTTOMRIGHT", frame, "BOTTOMRIGHT", -2, 2)
+  local box = { back = back, pieces = { fill } }
+  -- Per column / row: offset and frame side of the piece's two edges.
+  local xL, sL, xR, sR = { 0, c, -c }, { "LEFT", "LEFT", "RIGHT" }, { c, -c, 0 }, { "LEFT", "RIGHT", "RIGHT" }
+  local yT, vT, yB, vB = { 0, -c, c }, { "TOP", "TOP", "BOTTOM" }, { -c, c, 0 }, { "TOP", "BOTTOM", "BOTTOM" }
+  local uv = { 0, u, 1 - u, 1 }
+  for row = 1, 3 do
+    for column = 1, 3 do
+      if row ~= 2 or column ~= 2 then
+        local piece = frame:CreateTexture(nil, "BORDER")
+        piece:SetTexture(GoldNotice.TEXTURE)
+        piece:SetTexCoord(uv[column], uv[column + 1], uv[row], uv[row + 1])
+        piece:SetPoint("TOPLEFT", frame, vT[row] .. sL[column], xL[column], yT[row])
+        piece:SetPoint("BOTTOMRIGHT", frame, vB[row] .. sR[column], xR[column], yB[row])
+        box.pieces[#box.pieces + 1] = piece
+      end
+    end
+  end
+  return box
+end
+
+function GoldNotice.Show(box, gold)
+  for _, piece in ipairs(box.pieces) do
+    if gold then piece:Show() else piece:Hide() end
+  end
+  if box.back then
+    for _, key in ipairs({ "L", "M", "R" }) do
+      if gold then box.back[key]:Hide() else box.back[key]:Show() end
+    end
+  end
+end
+
 -- Garrison --------------------------------------------------------------------
 
 local Garrison = {}
@@ -71,8 +118,20 @@ function Garrison:Build()
 
   local notice = NewFrame(self.frame, CONTENT_WIDTH, 26)
   Place(notice, self.frame, 0, -66 - ArmyTab.SHIFT)
-  self.noticeBack = Skin():Slice3(notice, "row", 26, "BACKGROUND")
+  self.noticeBack = GoldNotice.New(notice, Skin():Slice3(notice, "row", 26, "BACKGROUND"))
+  GoldNotice.Show(self.noticeBack, false)
   self.noticeText = NewText(notice, "GameFontHighlightSmall", 24, -7, 430)
+  -- The pledge basket as pictures with counts (user, 2026-11-20): "Give",
+  -- then one icon and count per kind (unit order, then gold and wood). No
+  -- "? Irreversible." tail (user): the War Chest line already says it.
+  self.give = NewText(notice, "GameFontHighlightSmall", 24, -7, 90)
+  self.picks = {}
+  index = 1
+  while index <= 5 do
+    self.picks[index] = { icon = Skin():Icon(notice, nil, 16, 16),
+      text = NewText(notice, "GameFontHighlightSmall", 0, -7, 44) }
+    index = index + 1
+  end
   self.yes = NewButton(notice, "red", 56, 22, "Yes", Window.Pledge)
   Place(self.yes, notice, 470, -2)
   self.no = NewButton(notice, "dark", 56, 22, "No", Window.CancelPledge)
@@ -114,15 +173,21 @@ function Garrison:Build()
     row.hover = Skin():RowStripe(row, Skin().HOVER_ALPHA)
     local box = NewFrame(row, cellWidth, 54)
     Place(box, row, 0, -6)
-    row.portrait = Skin():Icon(box, nil, 28, 28)
-    Place(row.portrait, box, 6, -13)
-    row.name = NewText(box, "GameFontHighlight", 40, -11, cellWidth - 90)
-    row.count = NewText(box, "GameFontHighlight", cellWidth - 50, -11, 44, "RIGHT")
-    row.have = NewText(box, "GameFontHighlightSmall", 40, -32, 70)
-    row.one = NewButton(box, "red", 40, 20, "+1")
-    Place(row.one, box, cellWidth - 90, -26)
-    row.five = NewButton(box, "red", 40, 20, "+5")
-    Place(row.five, box, cellWidth - 48, -26)
+    -- The Army tab's framed portrait with the reserve on its corner (user,
+    -- 2026-11-20: a "you have" line overlapped the buttons); dark buttons.
+    row.portrait = Skin():Icon(box, nil, 40, 40, "ARTWORK")
+    Place(row.portrait, box, 8, -7)
+    Place(Skin():Icon(box, "portrait", 48, 48, "OVERLAY"), box, 4, -3)
+    local badge = NewFrame(box, 40, 40)
+    Place(badge, box, 8, -7)
+    row.have = badge:CreateFontString(nil, "OVERLAY", "NumberFontNormal")
+    row.have:SetPoint("BOTTOMRIGHT", badge, "BOTTOMRIGHT", -1, 2)
+    row.name = NewText(box, "GameFontHighlight", 58, -9, cellWidth - 62)
+    row.count = NewText(box, "GameFontHighlight", 58, -31, cellWidth - 136)
+    row.one = NewButton(box, "dark", 36, 20, "+1")
+    Place(row.one, box, cellWidth - 78, -28)
+    row.five = NewButton(box, "dark", 36, 20, "+5")
+    Place(row.five, box, cellWidth - 40, -28)
     self.units[index] = row
     index = index + 1
   end
@@ -138,14 +203,26 @@ function Garrison:Build()
   while index <= 2 do
     local cell = NewFrame(panel, width, 30)
     Place(cell, panel, 6 + (index - 1) * width, -25)
-    cell.icon = Skin():Icon(cell, "icon." .. kindsChest[index][1], 24, 24)
-    Place(cell.icon, cell, 4, -3)
-    cell.value = NewText(cell, "GameFontHighlightSmall", 34, -2, 160)
-    cell.bar = Skin():Bar(cell, 150, 10, kindsChest[index][1] == "gold" and "gold" or "brown")
+    cell.icon = Skin():Icon(cell, "icon." .. kindsChest[index][1], 26, 26)
+    Place(cell.icon, cell, 4, -2)
+    -- The wallet on the icon's corner, as the reserve on unit portraits.
+    local badge = NewFrame(cell, 26, 26)
+    Place(badge, cell, 4, -2)
+    cell.have = badge:CreateFontString(nil, "OVERLAY", "NumberFontNormal")
+    cell.have:SetPoint("BOTTOMRIGHT", badge, "BOTTOMRIGHT", 3, -2)
+    cell.value = NewText(cell, "GameFontHighlightSmall", 36, -2, 150)
+    local colour = kindsChest[index][1] == "gold" and "gold" or "brown"
+    cell.bar = Skin():Bar(cell, 150, 10, colour)
     Place(cell.bar, cell, 34, -17)
-    cell.small = NewButton(cell, "red", 52, 20, "+" .. kindsChest[index][2])
+    -- The basket's share, a lighter segment after the War Chest's fill.
+    cell.ghost = cell.bar:CreateTexture(nil, "ARTWORK")
+    Skin():Apply(cell.ghost, "fill." .. colour)
+    cell.ghost:SetAlpha(0.45)
+    cell.ghost:SetHeight(cell.bar.fill:GetHeight())
+    cell.ghost:Hide()
+    cell.small = NewButton(cell, "dark", 52, 20, "+" .. kindsChest[index][2])
     Place(cell.small, cell, 190, -5)
-    cell.large = NewButton(cell, "red", 52, 20, "+" .. kindsChest[index][3])
+    cell.large = NewButton(cell, "dark", 52, 20, "+" .. kindsChest[index][3])
     Place(cell.large, cell, 244, -5)
     cell.kind, cell.smallCount, cell.largeCount = kindsChest[index][1], kindsChest[index][2], kindsChest[index][3]
     self.chest[index] = cell
@@ -174,30 +251,58 @@ function Garrison:Update(now)
   Skin():Apply(self.badge, view.owner == "A" and "badge.alliance" or view.owner == "H" and "badge.horde" or "badge.neutral")
   SetText(self.owner, FactionText(view.owner))
   SetText(self.columns[1], view.settlement and (view.level .. " / 3") or Paint("DIM", "-"))
-  SetText(self.columns[2], view.used .. " / " .. view.capacity .. Paint("DIM", " Unit Size")
-    .. (view.used >= view.capacity and Paint("BAD", " full") or ""))
-  SetText(self.columns[3], view.captureDuration and Duration(view.captureDuration) or Paint("DIM", "-"))
+  -- The pledge basket of this place (Window.confirm): a green "+N" after
+  -- every number it would change (user, 2026-11-20).
+  local confirm = Window.confirm
+  if confirm and confirm.id ~= view.id then confirm = nil end
+  local size, during = confirm and Window.PledgeSize(confirm) or 0, WF.Capture and WF.Capture.DurationFor
+  local added = 0
+  if size > 0 and during and view.captureDuration and view.used + size <= view.capacity then
+    added = during(view.area, view.used + size, view.capacity) - view.captureDuration
+  end
+  SetText(self.columns[2], view.used .. (size > 0 and Paint("GOOD", " +" .. size) or "") .. " / " .. view.capacity
+    .. Paint("DIM", " Unit Size") .. (view.used >= view.capacity and Paint("BAD", " full") or ""))
+  SetText(self.columns[3], view.captureDuration and (Duration(view.captureDuration)
+    .. (added > 0 and Paint("GOOD", " +" .. Duration(added)) or "")) or Paint("DIM", "-"))
 
   -- Confirmation, pending pledge or nothing.
-  local confirm = Window.confirm
   local pending = garrison:Pending()
-  if confirm and confirm.id == view.id then
-    Skin():SetSlice3(self.noticeBack, "strip.gold")
-    local preview = garrison:CapturePreview(confirm.kind, confirm.count, confirm.id)
-    local timing = preview and (" Capture +" .. Duration(preview.added) .. " ("
-      .. Duration(preview.before) .. " to " .. Duration(preview.after) .. ").") or ""
-    SetText(self.noticeText, Paint("GOLD", "Give " .. confirm.count .. " " .. garrison:Name(confirm.kind, view.owner)
-      .. "?" .. timing .. " Irreversible."))
+  local items = confirm and Window.PledgeItems(confirm) or {}
+  Show(self.noticeText, not confirm)
+  Show(self.give, confirm)
+  local x = 24
+  if confirm then
+    SetText(self.give, Paint("GOLD", "Give "))
+    x = x + (self.give:GetStringWidth() or 0) + 2
+  end
+  for index = 1, #self.picks do
+    local pick, item = self.picks[index], items[index]
+    Show(pick.icon, item)
+    Show(pick.text, item)
+    if item then
+      if WF.Army and WF.Army.UNITS and WF.Army.UNITS[item.kind] then
+        UnitIcon(pick.icon, item.kind, view.owner == "H" and "H" or view.owner == "A" and "A" or mine)
+      else
+        Skin():Apply(pick.icon, "icon." .. item.kind)
+      end
+      Place(pick.icon, self.notice, x, -5)
+      SetText(pick.text, Paint("GOLD", item.count))
+      Place(pick.text, self.notice, x + 18, -7)
+      x = x + 18 + (pick.text:GetStringWidth() or 0) + 8
+    end
+  end
+  if confirm then
+    GoldNotice.Show(self.noticeBack, true)
     self.yes:Show()
     self.no:Show()
   elseif pending and pending.id == view.id then
-    Skin():SetSlice3(self.noticeBack, "strip.gold")
+    GoldNotice.Show(self.noticeBack, true)
     SetText(self.noticeText, Paint("DIM", "Waiting for the garrison keeper to accept " .. pending.count .. " "
       .. garrison:Name(pending.kind, pending.owner)))
     self.yes:Hide()
     self.no:Hide()
   else
-    Skin():SetSlice3(self.noticeBack, "row")
+    GoldNotice.Show(self.noticeBack, false)
     SetText(self.noticeText, Paint("DIM", "Garrison data: " .. view.source .. "."))
     self.yes:Hide()
     self.no:Hide()
@@ -247,8 +352,10 @@ function Garrison:Update(now)
     local key = garrison.UNIT_ORDER[index]
     UnitIcon(row.portrait, key, view.owner == "H" and "H" or view.owner == "A" and "A" or mine)
     SetText(row.name, garrison:Name(key, view.owner))
-    SetText(row.count, "x" .. view[key])
-    SetText(row.have, reserve and Paint("DIM", "you have " .. reserve[key]) or "")
+    local picked = confirm and confirm.items[key] or 0
+    SetText(row.count, "x" .. view[key] .. (picked > 0 and Paint("GOOD", " +" .. picked) or ""))
+    -- What stays in the reserve once the basket is given.
+    SetText(row.have, reserve and (picked > 0 and Paint("GOLD", reserve[key] - picked) or tostring(reserve[key])) or "")
     local open = not closed and not frozen
     Show(row.one, open)
     Show(row.five, open)
@@ -262,13 +369,27 @@ function Garrison:Update(now)
     local cell = self.chest[index]
     if view.settlement then
       local value, goal = view[cell.kind], cell.kind == "gold" and view.nextGold or view.nextWood
-      SetText(cell.value, RESOURCE_NAMES[cell.kind] .. "  " .. value .. (goal and (" / " .. goal) or "")
-        .. (wallet and Paint("DIM", "   you have " .. wallet[cell.kind]) or ""))
-      Skin():SetBar(cell.bar, goal and goal > 0 and value / goal or 1, cell.kind == "gold" and "gold" or "brown")
+      local picked = confirm and confirm.items[cell.kind] or 0
+      SetText(cell.value, RESOURCE_NAMES[cell.kind] .. "  " .. value .. (picked > 0 and Paint("GOOD", " +" .. picked) or "")
+        .. (goal and (" / " .. goal) or ""))
+      SetText(cell.have, wallet and (picked > 0 and Paint("GOLD", wallet[cell.kind] - picked)
+        or tostring(wallet[cell.kind])) or "")
+      local filled = goal and goal > 0 and math.min(value / goal, 1) or 1
+      Skin():SetBar(cell.bar, filled, cell.kind == "gold" and "gold" or "brown")
+      local extra = goal and goal > 0 and math.min((value + picked) / goal, 1) - filled or 0
+      if extra > 0 then
+        local inset = (cell.bar:GetWidth() - cell.bar.inner) / 2
+        cell.ghost:SetWidth(cell.bar.inner * extra)
+        cell.ghost:ClearAllPoints()
+        cell.ghost:SetPoint("TOPLEFT", cell.bar, "TOPLEFT", inset + cell.bar.inner * filled, -inset)
+      end
+      Show(cell.ghost, extra > 0)
       Show(cell.small, not closed)
       Show(cell.large, not closed)
-      SetAction(cell.small, "+" .. cell.smallCount, not closed and Window.AskPledge or nil, cell.kind, cell.smallCount)
-      SetAction(cell.large, "+" .. cell.largeCount, not closed and Window.AskPledge or nil, cell.kind, cell.largeCount)
+      -- Greyed once the basket reaches the next level's goal (Window:AskPledge caps it).
+      local room = not goal or value + picked < goal
+      SetAction(cell.small, "+" .. cell.smallCount, not closed and Window.AskPledge or nil, cell.kind, cell.smallCount, room)
+      SetAction(cell.large, "+" .. cell.largeCount, not closed and Window.AskPledge or nil, cell.kind, cell.largeCount, room)
       cell:Show()
     else
       cell:Hide()
@@ -374,7 +495,7 @@ function War:Build()
   Place(self.send, panel, 520, -86)
   local confirm = NewFrame(panel, CONTENT_WIDTH - 12, 26)
   Place(confirm, panel, 6, -86)
-  Skin():Slice3(confirm, "strip.gold", 26, "BACKGROUND")
+  GoldNotice.New(confirm)
   confirm:SetFrameLevel((panel:GetFrameLevel() or 0) + 3)
   self.confirmText = NewText(confirm, "GameFontHighlightSmall", 24, -7, 400)
   local yes = NewButton(confirm, "red", 56, 22, "Yes", Window.Launch)

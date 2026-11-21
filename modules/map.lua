@@ -388,6 +388,7 @@ local function HideEntry(entry)
   if entry and entry.stockLabel then HideObject(entry.stockLabel) end
   if entry and entry.stockBarBack then HideObject(entry.stockBarBack) end
   if entry and entry.stockBarFill then HideObject(entry.stockBarFill) end
+  if entry and entry.siegeIcon then HideObject(entry.siegeIcon) end
   if entry and entry.frame then HideObject(entry.frame) end
   if entry then
     entry.active = false
@@ -451,6 +452,10 @@ end
 function Map:SetCaptureView(id, ownerKey, halfKey, unconfirmed)
   local area = type(id) == "string" and self.areas[id] or nil
   if not area then return false end
+  local sim = self.simFront
+  if sim and sim.owners and sim.owners[id] ~= nil then
+    ownerKey, halfKey, unconfirmed = sim.owners[id] or nil, sim.halves and sim.halves[id] or nil, nil
+  end
   if area.baseColorKey == nil then
     area.baseColorKey = area.colorKey or false
     area.baseColor = area.color
@@ -1045,8 +1050,10 @@ local function SettlementLevel(area)
   return garrison.Level(st.gold, st.wood)
 end
 
+-- Every reader goes through Map.SettlementLevel (window, HUD, minimap, map
+-- icons and tooltips), so one replacement (WarfrontDev's demo) reaches them all.
 local function LevelText(area)
-  local level = SettlementLevel(area)
+  local level = Map.SettlementLevel(area)
   return level and ("Level " .. level) or nil
 end
 
@@ -1057,7 +1064,7 @@ Map.LevelText = LevelText
 -- level does (the layout itself sets it in PlaceIcon).
 local function RefreshLevelIcon(entry, area)
   if area.type ~= "SETTLEMENT" or not entry.iconShown or not entry.icon then return end
-  local level = SettlementLevel(area)
+  local level = Map.SettlementLevel(area)
   if entry.icon.WarfrontLevel == level then return end
   local path, left, right, top, bottom = Map.GetIcon(area.type, area.colorKey, area.iconColumn, level)
   if not path then return end
@@ -1110,12 +1117,13 @@ local function PlaceStockLabel(entry, area)
 end
 
 local function PlaceIcon(entry, area, width, height, stitchedAPI, hostID)
-  local level = SettlementLevel(area)
+  local level = Map.SettlementLevel(area)
   local path, left, right, top, bottom, pw, ph = Map.GetIcon(area.type, area.colorKey, area.iconColumn, level)
   entry.iconShown = false
   if not path then
     if entry.icon then HideObject(entry.icon) end
     if entry.stockLabel then HideObject(entry.stockLabel) end
+    if entry.siegeIcon then HideObject(entry.siegeIcon) end
     HideStockBar(entry)
     return true
   end
@@ -1151,6 +1159,7 @@ local function PlaceIcon(entry, area, width, height, stitchedAPI, hostID)
   end)
   entry.iconShown = ok and true or false
   PlaceStockLabel(entry, area)
+  Map.PaintZoneSiege(entry, area)
   return entry.iconShown
 end
 
@@ -1192,6 +1201,13 @@ function Map:ApplyIconZoom()
       pcall(function()
         icon:SetWidth(icon.WarfrontWidth * factor)
         icon:SetHeight(icon.WarfrontHeight * factor)
+      end)
+    end
+    local siege = entry.siegeIcon
+    if siege then
+      pcall(function()
+        siege:SetWidth(Map.ZONE_SIEGE_SIZE * factor)
+        siege:SetHeight(Map.ZONE_SIEGE_SIZE * factor)
       end)
     end
     if entry.labelFrame then pcall(entry.labelFrame.SetScale, entry.labelFrame, factor) end
@@ -1319,6 +1335,21 @@ function Map:StepBuildQueue()
   return true
 end
 
+-- Open map: build steps under a small per-frame time budget, and a refresh as
+-- soon as the queue drains, so a zone's areas show within a few frames. Closed
+-- map (or no clock): one step per frame as before, never felt in play.
+function Map:StepBuilds(open)
+  if self:BuildCount() <= 0 then return end
+  local clock = open and GetGlobal("debugprofilestop") or nil
+  local start = type(clock) == "function" and clock() or nil
+  local steps, completed = 0, false
+  repeat
+    if self:StepBuildQueue() then completed = true end
+    steps = steps + 1
+  until not start or steps >= 32 or self:BuildCount() <= 0 or clock() - start >= 4
+  if completed and self:BuildCount() <= 0 then self.refreshNow = true end
+end
+
 -- Records of an area for the minimap (modules/minimap_areas.lua), whatever
 -- zone the world map shows: the world map's own records, the shared cache, or
 -- nil while its build is queued. Re-keyed only when the revision changes.
@@ -1385,6 +1416,10 @@ Map.zoneBars = { slots = {}, count = 0 }
 -- War Camp icons on the continent and world maps (Points of interest filter).
 Map.warCamps = { icons = {}, records = {}, count = 0 }
 
+-- Per displayed uiMapID: rects[mapKey] is the zone's rectangle, or false when
+-- the zone is not beneath that map; children is the set of its descendants'
+-- uiMapIDs, read once. Map data is static, so a zone off the displayed
+-- continent no longer rescans every descendant on each refresh.
 local foreverZoneRects = {}
 
 local function ForeverZoneRect(mapKey)
@@ -1394,25 +1429,37 @@ local function ForeverZoneRect(mapKey)
   if not frame or type(frame.GetMapID) ~= "function" then return nil end
   local ok, topMapID = pcall(frame.GetMapID, frame)
   if not ok or type(topMapID) ~= "number" then return nil end
-  foreverZoneRects[topMapID] = foreverZoneRects[topMapID] or {}
-  local cached = foreverZoneRects[topMapID][mapKey]
+  local top = foreverZoneRects[topMapID]
+  if not top then
+    top = { rects = {} }
+    foreverZoneRects[topMapID] = top
+  end
+  local cached = top.rects[mapKey]
   if cached then return cached[1], cached[2], cached[3], cached[4] end
+  if cached == false then return nil end
   local zoneID = FOREVER_ZONE_IDS[mapKey]
   if not zoneID then return nil end
-  local children = C_Map.GetMapChildrenInfo(topMapID, nil, true)
-  local index = 1
-  while type(children) == "table" and index <= #children do
-    local child = children[index]
-    if child and child.mapID == zoneID then
-      local minX, maxX, minY, maxY = C_Map.GetMapRectOnMap(child.mapID, topMapID)
-      if type(minX) == "number" and type(maxX) == "number"
-          and type(minY) == "number" and type(maxY) == "number" then
-        local rect = { minX, maxX, minY, maxY }
-        foreverZoneRects[topMapID][mapKey] = rect
-        return rect[1], rect[2], rect[3], rect[4]
-      end
+  if not top.children then
+    local children = C_Map.GetMapChildrenInfo(topMapID, nil, true)
+    -- An empty answer is not trusted as "no zone here": asked again next time.
+    if type(children) ~= "table" or #children == 0 then return nil end
+    local set = {}
+    for index = 1, #children do
+      local child = children[index]
+      if child and type(child.mapID) == "number" then set[child.mapID] = true end
     end
-    index = index + 1
+    top.children = set
+  end
+  if not top.children[zoneID] then
+    top.rects[mapKey] = false
+    return nil
+  end
+  local minX, maxX, minY, maxY = C_Map.GetMapRectOnMap(zoneID, topMapID)
+  if type(minX) == "number" and type(maxX) == "number"
+      and type(minY) == "number" and type(maxY) == "number" then
+    local rect = { minX, maxX, minY, maxY }
+    top.rects[mapKey] = rect
+    return rect[1], rect[2], rect[3], rect[4]
   end
   return nil
 end
@@ -1526,12 +1573,13 @@ function Map:FrontZones(continentKey)
     return {}
   end
   local capture = WF.Capture
-  local playerSide = capture and type(capture.MyFaction) == "function" and capture:MyFaction()
+  local playerSide = not self.simFront and capture and type(capture.MyFaction) == "function"
+    and capture:MyFaction()
   local active, owners, anchors, targets = {}, {}, {}, {}
   local routes = front.routes or {}
   for r = 1, #routes do
     local route = routes[r]
-    local forward, rear = front:Targets(route)
+    local forward, rear = self:FrontTargets(front, route)
     local advancing = FRONT_OWNER_KEYS[route.advancing]
     local defending = route.advancing == "H" and "ALLIANCE" or "HORDE"
     local mine = playerSide == route.advancing
@@ -1752,9 +1800,10 @@ local CAMPAIGN_NODE_SIZE = 20
 local CAMPAIGN_ACTIVE_SIZE = 25
 local CAMPAIGN_NUMBER_SIZE = 18
 local CAMPAIGN_CHEVRON_SIZE = 14
--- Defending faction emblem (UI/Front) on a capital node not yet attacked.
--- Same size as a secured zone's emblem (both draw the whole 64 x 64 texture).
-local CAMPAIGN_CAPITAL_EMBLEM_SIZE = ZONE_OWNER_ICON_SIZE * ZONE_BAR_SCALE
+-- Capital crown (POI atlas cell, ink 68 of 72 px wide) on a capital node not
+-- yet attacked, a little wider than a secured zone's emblem ink; once the
+-- capital is the target, the crown fills this share of the disc (2026-11-20).
+local CAMPAIGN_CAPITAL_CROWN_SIZE, CAMPAIGN_CAPITAL_CROWN_IN_DISC = 24, 0.72
 -- Arrow tint of the faction moving.
 local CAMPAIGN_ROUTE_COLORS = {
   H = Map.COLORS.HORDE,
@@ -1893,6 +1942,37 @@ local function CampaignNodeTexture(list, index, frame, layer, sublevel, path)
   return texture
 end
 
+-- Zone maps: the same catapult flipbook up and right of a besieged
+-- Settlement's (or capital's) POI icon (user, 2026-11-19), kept by area id in
+-- Map.zoneSiegeIcons and stepped with the continent ones by Map:AnimateSieges.
+Map.ZONE_SIEGE_SIZE = CAMPAIGN_SIEGE_ICON_SIZE
+Map.zoneSiegeIcons = {}
+
+function Map.PaintZoneSiege(entry, area)
+  local front = WF.Front
+  local node = entry.iconShown and entry.icon and front and type(front.HasRoutes) == "function"
+    and front:HasRoutes()
+    and (front.bySettlement and front.bySettlement[area.id] or front.byCapital and front.byCapital[area.id])
+  if not node or not Map:SiegeRunning(node.route, area.id) then
+    if entry.siegeIcon then HideObject(entry.siegeIcon) end
+    return
+  end
+  local catapult = CampaignNodeTexture(Map.zoneSiegeIcons, area.id, entry.frame, "OVERLAY", 1,
+    CAMPAIGN_SIEGE_CATAPULT_TEXTURE)
+  if not catapult then return end
+  pcall(function()
+    if entry.siegeIcon ~= catapult then
+      entry.siegeIcon = catapult
+      catapult:ClearAllPoints()
+      catapult:SetPoint("BOTTOMLEFT", entry.icon, "TOPRIGHT", -4, -4)
+    end
+    if not catapult.WarfrontFlip then catapult:SetTexCoord(0, 0.25, 0, 0.25) end
+    catapult:SetWidth(Map.ZONE_SIEGE_SIZE * Map.iconZoom)
+    catapult:SetHeight(Map.ZONE_SIEGE_SIZE * Map.iconZoom)
+    catapult:Show()
+  end)
+end
+
 -- Draws the arc from angle from to angle to (radians, clockwise from the top)
 -- of a complete painted ring, centred on cx, cy (canvas pixels, y down) at
 -- size: wedge quads placed with SetVertexOffset, each sampling the ring image
@@ -1988,6 +2068,18 @@ function Map.PaintLockIcon(routes, index, record, frame, x, y, nodeSize)
   icon:Show()
 end
 
+-- The capital POI's crown, in its holder's colour (user, 2026-11-20): alone
+-- before the capital is attacked, inside the disc once it is the target.
+function Map.PaintCapitalCrown(routes, index, record, frame, x, y, size)
+  local path, left, right, top, bottom =
+    Map.GetIcon("CAPITAL", FRONT_OWNER_KEYS[record.owner] or "ALLIANCE")
+  local crown = CampaignNodeTexture(routes.capitalBadges, index, frame, "OVERLAY", 2, path)
+  if not crown then return end
+  crown:SetTexCoord(left, right, top, bottom)
+  crown:SetVertexColor(1, 1, 1, 1)
+  PlaceCampaignTexture(crown, frame, x, -y, size)
+end
+
 local function PaintCampaignNode(routes, index, record)
   if not record then return end
   local frame = routes.frame
@@ -1999,7 +2091,7 @@ local function PaintCampaignNode(routes, index, record)
   local active = record.state == "active"
   -- A faction emblem stands alone: no disc, ring or number under it. Secured
   -- zones get theirs from the zone markers; a capital not yet attacked shows
-  -- its defender's emblem (UI/Front) here.
+  -- its holder's capital crown here.
   local capitalEmblem = record.capital and not active
   if record.emblem or capitalEmblem then
     HideObject(shadow)
@@ -2012,17 +2104,10 @@ local function PaintCampaignNode(routes, index, record)
     HideObject(label)
     HideObject(routes.siegeCatapults[index])
     HideObject(routes.lockIcons[index])
-    local badge = routes.capitalBadges[index]
     if capitalEmblem then
-      local path = ZONE_FACTION_TEXTURES[record.owner == "H" and "HORDE" or "ALLIANCE"]
-      badge = CampaignNodeTexture(routes.capitalBadges, index, frame, "OVERLAY", 2, path)
-      if badge then
-        badge:SetTexCoord(0, 1, 0, 1)
-        badge:SetVertexColor(1, 1, 1, 1)
-      end
-      PlaceCampaignTexture(badge, frame, record.cx, -record.cy, CAMPAIGN_CAPITAL_EMBLEM_SIZE)
+      Map.PaintCapitalCrown(routes, index, record, frame, record.cx, record.cy, CAMPAIGN_CAPITAL_CROWN_SIZE)
     else
-      HideObject(badge)
+      HideObject(routes.capitalBadges[index])
     end
     return
   end
@@ -2065,7 +2150,11 @@ local function PaintCampaignNode(routes, index, record)
     full * (1 - math.min(1, horde)), full)
   for arc = used + 1, #arcs do HideObject(arcs[arc]) end
 
-  HideObject(routes.capitalBadges[index])
+  if record.capital then
+    Map.PaintCapitalCrown(routes, index, record, frame, x, y, nodeSize * CAMPAIGN_CAPITAL_CROWN_IN_DISC)
+  else
+    HideObject(routes.capitalBadges[index])
+  end
   Map.PaintSiegeIcons(routes, index, record, frame, x, y)
   Map.PaintLockIcon(routes, index, record, frame, x, y, nodeSize)
 
@@ -2704,6 +2793,22 @@ function Map:SetSimulatedSiege(windows)
   self.simSiege = type(windows) == "table" and windows or nil
 end
 
+-- Display-only front preview (WarfrontDev /wfd video): route targets, POI
+-- owners, half-captured icons (halves) and fallen capitals (capitals, by
+-- route id: the winner's emblem) drawn instead of the live ones, seen
+-- from neither faction. Gameplay never reads it; nothing is saved nor sent.
+-- nil restores the live view.
+function Map:SetSimulatedFront(sim)
+  self.simFront = type(sim) == "table" and sim or nil
+  self.refreshNow = true
+end
+
+function Map:FrontTargets(front, route)
+  local sim = self.simFront and self.simFront.targets and self.simFront.targets[route.id]
+  if sim then return sim[1], sim[2] end
+  return front:Targets(route)
+end
+
 -- The siege window running on this node of the route now (real or simulated),
 -- or nil.
 function Map:SiegeRunning(route, id)
@@ -2724,12 +2829,19 @@ function Map:AnimateSieges()
   if step == self.siegeStep then return end
   self.siegeStep = step
   local column, row = step % 4, mathFloor(step / 4)
-  local list = routes.siegeCatapults
-  for index = 1, #list do
-    local texture = list[index]
+  -- The list has holes (only besieged nodes get a catapult): # can stop
+  -- before a capital's catapult and freeze it on its first frame.
+  local left, right, top, bottom = column / 4, (column + 1) / 4, row / 4, (row + 1) / 4
+  for _, texture in pairs(routes.siegeCatapults) do
     if texture and texture:IsShown() then
       texture.WarfrontFlip = true
-      texture:SetTexCoord(column / 4, (column + 1) / 4, row / 4, (row + 1) / 4)
+      texture:SetTexCoord(left, right, top, bottom)
+    end
+  end
+  for _, texture in pairs(self.zoneSiegeIcons) do
+    if texture:IsShown() then
+      texture.WarfrontFlip = true
+      texture:SetTexCoord(left, right, top, bottom)
     end
   end
 end
@@ -2747,7 +2859,8 @@ function Map:RefreshCampaignRoutes(continentKey, width, height)
   if not frame then return 0 end
   local lineUsed, arrowUsed, nodeUsed, segmentUsed = 0, 0, 0, 0
   local capture = WF.Capture
-  local playerSide = capture and type(capture.MyFaction) == "function" and capture:MyFaction()
+  local playerSide = not self.simFront and capture and type(capture.MyFaction) == "function"
+    and capture:MyFaction()
   -- Live capture shares of the Active Front zones, shown by their node's ring.
   -- Secured zones show their faction emblem on the node's spot instead.
   local fronts, emblems = {}, {}
@@ -2761,7 +2874,7 @@ function Map:RefreshCampaignRoutes(continentKey, width, height)
   for routeIndex = 1, #(front.routes or {}) do
     local route = front.routes[routeIndex]
     local total = #route.nodes
-    local forward, rear = front:Targets(route)
+    local forward, rear = self:FrontTargets(front, route)
     local points = {}
     for index = 1, total do
       local area = self.areas[route.nodes[index].id]
@@ -2777,11 +2890,14 @@ function Map:RefreshCampaignRoutes(continentKey, width, height)
     local capital = self.areas[route.endpoint or ""]
     local capitalX, capitalY = CampaignPoint(capital, continentKey)
     if capitalX then
+      -- A fallen capital exists only in the display-only preview.
+      local fallen = self.simFront and self.simFront.capitals and self.simFront.capitals[route.id]
       points[total + 1] = {
         x = capitalX, y = capitalY, id = capital.id, area = capital, route = route,
         index = total + 1, forward = forward, rear = rear, capital = true,
-        owner = route.advancing == "H" and "A" or "H",
-        state = CampaignNodeState(route, total + 1, forward, rear, total, true, playerSide),
+        owner = fallen or (route.advancing == "H" and "A" or "H"),
+        state = fallen and "locked"
+          or CampaignNodeState(route, total + 1, forward, rear, total, true, playerSide),
       }
     end
     -- Decision 0111: each faction's chevron points at its own target in that
@@ -2899,6 +3015,7 @@ local function ReapplyVisibleGroups()
       if area then
         RefreshLevelIcon(entry, area)
         PlaceStockLabel(entry, area)
+        Map.PaintZoneSiege(entry, area)
       end
     end
   end
@@ -3363,6 +3480,15 @@ if mapFrame and type(hookSecure) == "function"
   pcall(hookSecure, mapFrame, "OnCanvasScaleChanged", function()
     local zoomOk, zoomError = pcall(Map.ApplyIconZoom, Map)
     if not zoomOk and WF.RecordError then WF.RecordError("map icon zoom", zoomError) end
+  end)
+end
+-- A continent, zone or world map change refreshes on the next frame instead
+-- of waiting up to REFRESH_INTERVAL; the hook only sets a flag.
+if mapFrame and type(hookSecure) == "function"
+    and type(mapFrame.OnMapChanged) == "function" then
+  pcall(hookSecure, mapFrame, "OnMapChanged", function()
+    Map.refreshNow = true
+    Map:WakeDriver()
   end)
 end
 

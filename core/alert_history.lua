@@ -57,9 +57,11 @@ function History:Insert(entry)
   self.revision = self.revision + 1
 end
 
-function History:Add(category, text, side)
+function History:Add(category, text, side, title)
   if self.loaded then self:Initialize() end
-  local entry = { category = category, text = WF.L and WF.L(text) or text, at = WF.Epoch(), read = false }
+  text = WF.L and WF.L(text) or text
+  if title then text = (WF.L and WF.L(title) or title) .. " - " .. text end
+  local entry = { category = category, text = text, at = WF.Epoch(), read = false }
   entry.side = (side == "A" or side == "H") and side or nil
   if not Valid(entry) then return end
   if not self.store then

@@ -6,7 +6,7 @@ local Button = {}
 WF.MinimapButton = Button
 
 -- Minimap button opening the main window (modules/main_window.lua). Dragged
--- around the minimap edge (circle or square, following PandaUI's setting);
+-- around the minimap edge (circle or square, following Button:IsSquare);
 -- its angle in degrees is saved in
 -- WarfrontDB.settings.minimapAngle. The 1.12 globals cos, sin and atan2
 -- work in degrees.
@@ -46,15 +46,21 @@ function Button:Angle()
   return angle
 end
 
--- PandaUI owns the optional circle/square minimap setting; the standard
--- GetMinimapShape() hook of other minimap addons is the fallback. Anything
--- unknown stays round.
+-- FlareUI (formerly PandaUI) owns the optional circle/square minimap style;
+-- the standard GetMinimapShape() hook of other minimap addons is the
+-- fallback. Anything unknown stays round. Also read by MinimapAreas.
+local function AddonSquare(owner, method)
+  if type(owner) ~= "table" or type(owner[method]) ~= "function" then return nil end
+  local ok, square = pcall(owner[method])
+  if ok then return square == true end
+  return nil
+end
+
 function Button:IsSquare()
-  local pandaUI = GetGlobal("PandaUI")
-  if type(pandaUI) == "table" and type(pandaUI.MinimapIsSquare) == "function" then
-    local ok, square = pcall(pandaUI.MinimapIsSquare)
-    if ok then return square == true end
-  end
+  local flareUI = GetGlobal("FlareUI")
+  local square = AddonSquare(type(flareUI) == "table" and flareUI.Minimap or nil, "IsSquare")
+  if square == nil then square = AddonSquare(GetGlobal("PandaUI"), "MinimapIsSquare") end
+  if square ~= nil then return square end
   local shape = GetGlobal("GetMinimapShape")
   if type(shape) == "function" then
     local ok, name = pcall(shape)

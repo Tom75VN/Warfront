@@ -49,7 +49,7 @@ end
 -- Chat remains the durable local fallback; settings control banners and sounds.
 function Alerts:Push(category, text, options)
   options = type(options) == "table" and options or {}
-  if WF.AlertHistory then WF.AlertHistory:Add(category, text, options.side) end
+  if WF.AlertHistory then WF.AlertHistory:Add(category, text, options.side, options.historyTitle and options.title or nil) end
   if options.chat ~= false and WF.Print then WF.Print(text) end
   if not self:Enabled(category) then return false end
   if #self.queue >= MAX_QUEUE then table.remove(self.queue, 1) end

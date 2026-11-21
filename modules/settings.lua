@@ -67,7 +67,8 @@ end
 
 -- Every native option is declared here. See docs/settings.md before adding one.
 local SECTIONS = {
-  { key = "general", label = "General" },
+  -- The root entry shows the general options so selecting "Warfront" is never empty.
+  { key = "general", root = true },
   { key = "map", label = "Map" },
   { key = "alerts", label = "Alerts" },
 }
@@ -384,7 +385,9 @@ function Panel:Register()
   for _, descriptor in ipairs(SECTIONS) do
     if not self.sections[descriptor.key] then
       local sectionOk, section
-      if descriptor.key == "alerts" then
+      if descriptor.root then
+        sectionOk, section = true, category
+      elseif descriptor.key == "alerts" then
         if not self.alertCanvas then
           local create = _G and _G.CreateFrame
           if type(create) ~= "function" then return false end

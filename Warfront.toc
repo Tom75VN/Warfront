@@ -8,7 +8,7 @@
 ## Category: PvP
 ## IconTexture: Interface\AddOns\Warfront\media\Textures\UI\WarfrontMinimapIcon
 ## Author: Warfront contributors
-## Version: 0.1.0
+## Version: 0.1.1
 ## SavedVariables: WarfrontDB, WarfrontJournal
 ## SavedVariablesPerCharacter: WarfrontImport
 
@@ -83,6 +83,7 @@ modules\main_window_campaigns.lua
 modules\main_window_wiki.lua
 modules\main_window_drawers.lua
 modules\minimap_button.lua
+modules\welcome.lua
 modules\settings.lua
 modules\file_probe.lua
 modules\p2ptest.lua

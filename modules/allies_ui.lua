@@ -35,6 +35,16 @@ function Allies:ApplyScale()
   end
 end
 
+-- Grow a panel so its wrapped body text never reaches the controls below it,
+-- whatever the language. `below` is the space the controls need under the text.
+local function FitHeight(panel, minHeight, below)
+  local body = panel and panel.body
+  if not body or type(body.GetStringHeight) ~= "function" then return end
+  local textHeight = tonumber(body:GetStringHeight()) or 0
+  local need = WF.Skin.HEADER + 14 + math.ceil(textHeight) + below
+  panel:SetHeight(need > minHeight and need or minHeight)
+end
+
 local function Build()
   local skin = WF.Skin
   local create = _G.CreateFrame
@@ -50,6 +60,7 @@ local function Build()
   body:SetPoint("TOPLEFT", panel, "TOPLEFT", 16, -(skin.HEADER + 14))
   body:SetWidth(348)
   body:SetText(WF.L(TEXT.body))
+  panel.body = body
 
   local check = create("CheckButton", nil, panel, "UICheckButtonTemplate")
   check:SetWidth(24)
@@ -94,6 +105,8 @@ function Allies:ShowPopup()
     self.popup = panel
   end
   self.popup.check:SetChecked(self:PopupHidden())
+  -- Checkbox top sits 64 px above the bottom edge; keep a 12 px gap.
+  FitHeight(self.popup, 206, 76)
   self.popup:Show()
   return true
 end
@@ -183,6 +196,8 @@ function Allies:ShowNextMatch(force)
       local faction = row.faction == 'HORDE' and WF.L("Horde") or WF.L("Alliance")
       panel.body:SetText(string.format(WF.L(row.status == 'ready' and TEXT.ready or TEXT.partner), row.name, faction))
       WF.Skin:SetButton(panel.primary, row.status == 'ready' and TEXT.add or TEXT.accept)
+      -- Buttons top sits 38 px above the bottom edge; keep a 14 px gap.
+      FitHeight(panel, 230, 52)
       panel:Show()
       return true
     end

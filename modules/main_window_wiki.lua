@@ -149,6 +149,7 @@ end }
 P.commands = { title = "Slash commands", build = function()
   return {
     "- /wf: window. /wf help: this list. /wf classic: text window.",
+    "- /wf welcome: the welcome window.",
     "- /wf tab: reopen the Warfront chat tab.",
     "- /wf where: your place and {layers|layer}.",
     "- /wf layerhelp on or off: help allies join your layer.",

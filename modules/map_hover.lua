@@ -1109,10 +1109,11 @@ end
 
 function Map:Tick()
   self.ticks = (self.ticks or 0) + 1
-  self:StepBuildQueue()
+  local open = CanvasVisible()
+  self:StepBuilds(open)
   -- A closed map needs no hover or refresh; one last hover pass clears its
   -- tooltip, and the first tick after reopening refreshes at once.
-  if not CanvasVisible() then
+  if not open then
     if self.canvasWasVisible then
       self.canvasWasVisible = false
       local hoverOk, hoverError = pcall(self.UpdateHover, self)
@@ -1128,7 +1129,7 @@ function Map:Tick()
     self.canvasWasVisible = true
     self.lastRefreshAt, self.fallbackTicks = nil, 15
   end
-  if self.campaignRoutes.nodeCount > 0 then
+  if self.campaignRoutes.nodeCount > 0 or next(self.zoneSiegeIcons) ~= nil then
     local stepOk, stepError = pcall(self.AnimateSieges, self)
     if not stepOk and WF.RecordError then WF.RecordError("map siege flipbook", stepError) end
   end
@@ -1143,14 +1144,17 @@ function Map:Tick()
       if not probeOk and WF.RecordError then WF.RecordError("map hover probe", probeError) end
     end
   end
+  -- refreshNow: the shown map changed or the open map's builds just finished.
   if type(now) == "number" and now > 0 then
-    if not self.lastRefreshAt or now - self.lastRefreshAt >= REFRESH_INTERVAL then
+    if self.refreshNow or not self.lastRefreshAt or now - self.lastRefreshAt >= REFRESH_INTERVAL then
+      self.refreshNow = nil
       self.lastRefreshAt = now
       self:Refresh()
     end
   else
     self.fallbackTicks = (self.fallbackTicks or 0) + 1
-    if self.fallbackTicks >= 15 then
+    if self.refreshNow or self.fallbackTicks >= 15 then
+      self.refreshNow = nil
       self.fallbackTicks = 0
       self:Refresh()
     end

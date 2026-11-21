@@ -47,7 +47,9 @@ local FRONT = {
   ROW_TOP = -32, ROW_H = 83, RAIL_H = 28, RAIL_Y = -16, PANEL_H = 201,
   -- LEFT 66 (was 40, user 2026-11-15): room for the lead-in chevron left of
   -- stop 1; the stops keep even gaps up to the capital at RIGHT.
-  LEAD = 12, LEFT = 66, RIGHT = CONTENT_WIDTH - 30,
+  -- LEFT_PASSED (user, 2026-11-20): stop 1 once the attackers are past it,
+  -- the lead-in then a short fading tail.
+  LEAD = 12, LEFT = 66, LEFT_PASSED = 44, RIGHT = CONTENT_WIDTH - 30,
   -- Front Network strip, y from the row top, x from the panel: label, camp
   -- segments, held/total, divider, then the travel and capture cuts.
   -- NET_CORNER: the strip's frame at half the row frame's thickness (user, 2026-11-15).
@@ -78,8 +80,11 @@ local FRONT = {
   -- mockup's scale; the number on top in a 22 cell.
   -- Held stops and the capital show their faction emblem, 28% under the
   -- disc's size (user, 2026-11-15).
-  DISC = 58, DIGIT = 22, EMBLEM = 41.76, CAPITAL = 41.76,
+  -- CAPITAL: the capital crown's atlas cell (ink 68 of 72), 2026-11-20.
+  DISC = 58, DIGIT = 22, EMBLEM = 41.76, CAPITAL = 32,
   LINE_H = 6, LINK_H = 3, CHEVRON = 20.125, SIEGE = 18,
+  -- Two chevrons on one stretch: each this far from its middle (2026-11-20).
+  CHEVRON_PAIR = 9,
   -- Siege flipbook centre from the stop's centre (up is positive), clear of
   -- the frame's top line; 4 x 4 frames at the map's 12 per second.
   SIEGE_DX = 14, SIEGE_DY = 11, SIEGE_FPS = 12, SIEGE_FRAMES = 16,
@@ -545,6 +550,20 @@ function SyncDrawer:BuildPanel(parent)
     if WF.Allies then WF.Allies:Command("") end
   end)
   Place(self.allies, panel, CONTENT_WIDTH - 120, -22)
+  -- Short tooltip; the skin's own hover scripts keep running (wrapped).
+  local skinEnter, skinLeave = self.allies:GetScript("OnEnter"), self.allies:GetScript("OnLeave")
+  self.allies:SetScript("OnEnter", function(frame, ...)
+    if skinEnter then skinEnter(frame, ...) end
+    GameTooltip:SetOwner(frame, "ANCHOR_CURSOR", 10, 10)
+    GameTooltip:AddLine("Allies", 1, 1, 1)
+    GameTooltip:AddLine("Become Battle.net friends with a player of the other faction to help Warfront share data between factions.", 0.8, 0.8, 0.8, 1)
+    Window.LocalizeTooltip(GameTooltip)
+    GameTooltip:Show()
+  end)
+  self.allies:SetScript("OnLeave", function(frame, ...)
+    if skinLeave then skinLeave(frame, ...) end
+    GameTooltip:Hide()
+  end)
   self.versionIcon = Skin():Icon(panel, "icon.warning", 16, 15)
   Place(self.versionIcon, panel, 312, -46)
   self.version = NewText(panel, "GameFontHighlightSmall", 334, -48, 260)
@@ -763,10 +782,18 @@ function FRONT.PaintNode(row, node, x, index, owner, style, capital)
   if emblem then
     node.disc:Hide()
     node.digit:Hide()
+    -- The capital shows the map's capital crown in its holder's colour
+    -- (user, 2026-11-20); other held stops their faction emblem.
+    local left, right, top, bottom = 0, 1, 0, 1
+    if capital and WF.Map and WF.Map.GetIcon then
+      local crown, l, r, t, b = WF.Map.GetIcon("CAPITAL", owner == "H" and "HORDE" or "ALLIANCE")
+      if crown then emblem, left, right, top, bottom = crown, l, r, t, b end
+    end
     if node.emblem.path ~= emblem then
       node.emblem.path = emblem
       node.emblem:SetTexture(emblem, "CLAMP", "CLAMP", "TRILINEAR")
     end
+    node.emblem:SetTexCoord(left, right, top, bottom)
     FRONT.Place(node.emblem, row.rail, x, capital and FRONT.CAPITAL or FRONT.EMBLEM)
   else
     node.emblem:Hide()
@@ -832,9 +859,27 @@ function FRONT.PaintChevron(row, key, x, side, left)
 end
 
 -- x of a rail stop: 0 is the advancing faction's lead-in, total + 1 the capital.
-function FRONT.X(index, step)
+function FRONT.X(index, step, left)
   if index < 1 then return FRONT.LEAD end
-  return math.floor(FRONT.LEFT + (index - 1) * step + 0.5)
+  return math.floor((left or FRONT.LEFT) + (index - 1) * step + 0.5)
+end
+
+-- Fades a rail piece in from its left end, or shows it whole.
+function FRONT.Fade(texture, faded)
+  if type(texture.SetGradient) ~= "function" or type(CreateColor) ~= "function" then
+    texture:SetAlpha(faded and 0.5 or 1)
+    return
+  end
+  texture:SetGradient("HORIZONTAL", CreateColor(1, 1, 1, faded and 0 or 1), CreateColor(1, 1, 1, 1))
+end
+
+-- A rail piece from x0 to x1, centred on the rail's line.
+function FRONT.Span(texture, rail, x0, x1, height)
+  texture:SetHeight(height)
+  texture:SetWidth(math.max(1, x1 - x0))
+  texture:ClearAllPoints()
+  texture:SetPoint("LEFT", rail, "TOPLEFT", x0, -FRONT.RAIL_H / 2)
+  texture:Show()
 end
 
 function Territory:UpdateFrontRow(row, route, front, capture, now)
@@ -847,17 +892,19 @@ function Territory:UpdateFrontRow(row, route, front, capture, now)
   local rail, total = row.rail, #route.nodes
   if not row.line then
     row.line = FRONT.Texture(rail, "BACKGROUND", 0, FRONT.ROUTE_DIR .. "RouteLine")
+    row.tail = FRONT.Texture(rail, "BACKGROUND", 0, FRONT.ROUTE_DIR .. "RouteLine")
   end
-  local step = (FRONT.RIGHT - FRONT.LEFT) / total
-  row.line:SetHeight(FRONT.LINE_H)
-  row.line:SetWidth(FRONT.X(total + 1, step) - FRONT.LEAD)
-  row.line:ClearAllPoints()
-  row.line:SetPoint("LEFT", rail, "TOPLEFT", FRONT.LEAD, -FRONT.RAIL_H / 2)
-  row.line:Show()
-
   local advancing = route.advancing
   local defender = advancing == "H" and "A" or "H"
   local forward, rear = front:Targets(route)
+  -- Once stop 1 is past, the lead-in holds no chevron: it shrinks to a tail
+  -- fading in from the left and every stop slides left (user, 2026-11-20).
+  local passed = forward ~= 1
+  local left = passed and FRONT.LEFT_PASSED or FRONT.LEFT
+  local step = (FRONT.RIGHT - left) / total
+  FRONT.Span(row.line, rail, FRONT.X(1, step, left), FRONT.X(total + 1, step, left), FRONT.LINE_H)
+  FRONT.Span(row.tail, rail, FRONT.LEAD, FRONT.X(1, step, left), FRONT.LINE_H)
+  FRONT.Fade(row.tail, passed)
   -- A real siege window, or the map's WarfrontDev simulation (/wfd siege).
   local map = WF.Map
   local rec = (map and map.simSiege and map.simSiege[route.id]) or front:Window(route.id)
@@ -868,11 +915,12 @@ function Territory:UpdateFrontRow(row, route, front, capture, now)
   owners[total + 1] = defender
 
   -- The advancing faction's lead-in, then every stretch between two stops.
-  FRONT.PaintLink(row, 1, FRONT.LEAD, FRONT.X(1, step), owners[1] == advancing and advancing or nil)
+  FRONT.PaintLink(row, 1, FRONT.LEAD, FRONT.X(1, step, left), owners[1] == advancing and advancing or nil)
   for index = 1, total do
     local a, b = owners[index], owners[index + 1]
-    FRONT.PaintLink(row, index + 1, FRONT.X(index, step), FRONT.X(index + 1, step), a == b and a or nil)
+    FRONT.PaintLink(row, index + 1, FRONT.X(index, step, left), FRONT.X(index + 1, step, left), a == b and a or nil)
   end
+  if row.links[1] then FRONT.Fade(row.links[1], passed) end
   for index = total + 2, #row.links do row.links[index]:Hide() end
 
   local mine = MyFaction()
@@ -880,7 +928,7 @@ function Territory:UpdateFrontRow(row, route, front, capture, now)
     local node = FRONT.Node(row, index)
     local capital = index > total
     local id = capital and route.endpoint or route.nodes[index].id
-    local x = FRONT.X(index, step)
+    local x = FRONT.X(index, step, left)
     local style
     if index == forward or index == rear then
       local side = index == forward and advancing or defender
@@ -926,15 +974,20 @@ function Territory:UpdateFrontRow(row, route, front, capture, now)
   -- (user, 2026-11-15).
   local ahead
   if forward <= total + 1 then
-    local from = FRONT.X(forward - 1, step)
-    ahead = math.floor(from + (FRONT.X(forward, step) - from) * (forward == 1 and 0.28 or 0.5) + 0.5)
+    local from = FRONT.X(forward - 1, step, left)
+    ahead = math.floor(from + (FRONT.X(forward, step, left) - from) * (forward == 1 and 0.28 or 0.5) + 0.5)
   end
-  FRONT.PaintChevron(row, "ahead", ahead, advancing, false)
   local back
   if rear >= 1 and rear <= total then
-    local from = FRONT.X(rear, step)
-    back = math.floor(from + (FRONT.X(rear + 1, step) - from) * 0.5 + 0.5)
+    local from = FRONT.X(rear, step, left)
+    back = math.floor(from + (FRONT.X(rear + 1, step, left) - from) * 0.5 + 0.5)
   end
+  -- Both factions face each other on one stretch: side by side instead of
+  -- stacked, the advancing one on the left (user, 2026-11-20).
+  if ahead and back and ahead == back then
+    ahead, back = ahead - FRONT.CHEVRON_PAIR, back + FRONT.CHEVRON_PAIR
+  end
+  FRONT.PaintChevron(row, "ahead", ahead, advancing, false)
   FRONT.PaintChevron(row, "back", back, defender, true)
 end
 

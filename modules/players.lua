@@ -28,6 +28,12 @@ local Players = {
   names = {},
   -- name -> "near" | "group" | "guild" | "friend" for players known beyond the roster.
   tags = {},
+  -- name -> { faction, region, ruleset } read from the roster GUID; each field
+  -- nil when not proven. Names without a roster GUID have no entry.
+  info = {},
+  -- guid -> the same entry, so GetPlayerInfoByGUID runs once per member.
+  guidInfo = {},
+  guidCount = 0,
   me = nil,
   count = 0,
   updatedAt = nil,
@@ -116,6 +122,66 @@ function Players:FindDisplay()
   return nil
 end
 
+-- What a roster GUID proves (knowledge base, Chat channels, 2026-11-21
+-- `roster.v1`). Faction only for the classic races: the client's race table
+-- is wrong for neutral and newer ones. Region and ruleset only for the realm
+-- name tokens seen in game (CAMWOWEU4Realm6PvP, ...Realm9RPPvP); any other
+-- token stays unknown.
+local GUID_TABLES = {
+  FACTION = {
+    Human = "Alliance", Dwarf = "Alliance", NightElf = "Alliance", Gnome = "Alliance",
+    Orc = "Horde", Scourge = "Horde", Tauren = "Horde", Troll = "Horde",
+  },
+  REGION = { EU = "EU" },
+  RULESET = { PvP = "PvP", RPPvP = "RP-PvP" },
+}
+
+local function GuidServer(guid)
+  if type(guid) ~= "string" or IsSecret(guid) then return nil end
+  local _, _, server = string.find(guid, "^Player%-(%d+)%-")
+  return server
+end
+
+-- The realm name of a roster member: "" means our own realm, kept only when
+-- the GUID server is ours.
+local function MemberRealm(realm, server)
+  if type(realm) ~= "string" or IsSecret(realm) then return nil end
+  if realm ~= "" then return realm end
+  local unitGuid, realmName = GetGlobal("UnitGUID"), GetGlobal("GetRealmName")
+  if type(unitGuid) ~= "function" or type(realmName) ~= "function" then return nil end
+  local ok, mine = pcall(unitGuid, "player")
+  if not ok or GuidServer(mine) ~= server then return nil end
+  local okRealm, name = pcall(realmName)
+  if okRealm and type(name) == "string" and not IsSecret(name) then return name end
+  return nil
+end
+
+-- The cached entry of a roster GUID, or nil while the client cannot name it yet.
+function Players:GuidInfo(guid)
+  local server = GuidServer(guid)
+  if not server then return nil end
+  local cached = self.guidInfo[guid]
+  if cached then return cached end
+  local read = GetGlobal("GetPlayerInfoByGUID")
+  if type(read) ~= "function" then return nil end
+  local ok, _, _, _, race, _, _, realm = pcall(read, guid)
+  if not ok or IsSecret(race) then return nil end
+  realm = MemberRealm(realm, server)
+  if type(race) ~= "string" and not realm then return nil end
+  local entry = { faction = type(race) == "string" and GUID_TABLES.FACTION[race] or nil }
+  if realm then
+    local _, _, region, ruleset = string.find(string.gsub(realm, "%s", ""), "^CAMWOW(%u%u)%d+Realm%d+(%a+)$")
+    entry.region = region and GUID_TABLES.REGION[region] or nil
+    entry.ruleset = ruleset and GUID_TABLES.RULESET[ruleset] or nil
+  end
+  if self.guidCount >= self.MAX_NAMES * 2 then
+    self.guidInfo, self.guidCount = {}, 0
+  end
+  self.guidInfo[guid] = entry
+  self.guidCount = self.guidCount + 1
+  return entry
+end
+
 -- Warfront players known beyond the roster, as { name, tag }, the strongest tag
 -- kept per name: near us, then group, guild, friend (decision 0080).
 local TAG_RANK = { near = 4, group = 3, guild = 2, friend = 1 }
@@ -157,6 +223,8 @@ function Players:Read(now)
   end
   local tags = {}
   self.tags = tags
+  local info = {}
+  self.info = info
   local seen = {}
   local me = MyName()
   self.me = me
@@ -188,7 +256,7 @@ function Players:Read(now)
   if display and type(roster) == "function" then
     local member = 1
     while member <= count and #names < self.MAX_NAMES do
-      local ok, name = pcall(roster, display, member)
+      local ok, name, _, _, guid = pcall(roster, display, member)
       name = ok and Players.CleanName(name) or nil
       if not name then
         missing = true
@@ -197,6 +265,7 @@ function Players:Read(now)
           seen[name] = true
           names[#names + 1] = name
         end
+        if not info[name] then info[name] = self:GuidInfo(guid) end
       end
       member = member + 1
     end

@@ -88,13 +88,12 @@ local function ReadIndoor(zoom)
   return zoom == inside
 end
 
--- PandaUI owns the optional circle/square setting
--- (minimap.modernwow_circle_square_option_unverified). Missing PandaUI keeps round clipping.
+-- Same shape test as the minimap button (FlareUI, legacy PandaUI, then the
+-- GetMinimapShape hook). Unknown keeps round clipping.
 local function SquareMinimap()
-  local pandaUI = PandaUI
-  if type(pandaUI) ~= "table" or type(pandaUI.MinimapIsSquare) ~= "function" then return false end
-  local ok, square = pcall(pandaUI.MinimapIsSquare)
-  return ok and square == true
+  local button = WF.MinimapButton
+  if type(button) ~= "table" or type(button.IsSquare) ~= "function" then return false end
+  return button:IsSquare() == true
 end
 
 local function Hide(object)
