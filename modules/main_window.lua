@@ -217,6 +217,43 @@ local function SetText(text, value)
   end
 end
 
+-- Matchmaking buttons (Synchronization panel, Players tab): a green dot while
+-- the player volunteers or the Companion manages it, refreshed with their
+-- panel; the label moves aside.
+local function AlliesState()
+  local allies = WF.Allies
+  if not allies or not allies.OptedIn then return nil end
+  if allies:OptedIn() then return "on" end
+  if allies.CloudLocked and allies:CloudLocked() then return "cloud" end
+  return nil
+end
+
+function Window.MarkAllies(button)
+  if not button then return end
+  local on = AlliesState() ~= nil
+  if button.alliesOn == on then return end
+  button.alliesOn = on
+  if on and not button.onDot then
+    button.onDot = Skin():Icon(button, "dot.green", 10, 10, "OVERLAY")
+    button.onDot:SetPoint("LEFT", button, "LEFT", 6, 0)
+  end
+  if button.onDot then
+    if on then button.onDot:Show() else button.onDot:Hide() end
+  end
+  button.label:ClearAllPoints()
+  button.label:SetPoint("CENTER", button, "CENTER", on and 6 or 0, 0)
+end
+
+-- The matchmaking tooltip's state line, only while it is on.
+function Window.AlliesTooltipState(tooltip)
+  local state = AlliesState()
+  if state == "on" then
+    tooltip:AddLine("Matchmaking is on.", 0.25, 1, 0.25)
+  elseif state == "cloud" then
+    tooltip:AddLine("Managed in the Companion", 0.25, 1, 0.25)
+  end
+end
+
 function Window.LocalizeTooltip(tooltip)
   if not tooltip or not WF.L then return end
   local name = tooltip:GetName()

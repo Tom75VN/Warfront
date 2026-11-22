@@ -102,6 +102,15 @@ local function LinkIdentity(link)
   return capture and capture.Identity and capture.Identity(link.name) or link.name
 end
 
+-- The WR campaign field: <N>.<S>.<set> and decision 0139's optional ruleset
+-- marker .<record> of one to three base-36 characters (as P2P.CampaignFieldOk).
+local function CampaignFieldOk(text)
+  if #text > 20 then return false end
+  if strMatch(text, "^[0-9A-Z]+%.[0-9A-Z]+%.[A-Z0-9%-]+$") then return true end
+  local marker = strMatch(text, "^[0-9A-Z]+%.[0-9A-Z]+%.[A-Z0-9%-]+%.([0-9A-Z]+)$")
+  return marker ~= nil and #marker <= 3
+end
+
 -- A packet of another campaign is never delivered (decision 0103 § 4b); a CE
 -- carries its own campaign and passes (modules/campaign.lua).
 local function CampaignOk(id, campaign)
@@ -218,8 +227,8 @@ function Relay:OnGameData(prefix, text, channel, senderID)
   if Lockdown() then return Reject("lockdown") end
   if not BattleNetReady() then return Reject("battle.net") end
   if type(text) ~= "string" or #text > BULK.IN_MAX then return Reject("size") end
-  local proto, level, kind, campaign, rest = strMatch(text, "^WR(%d+):(%d+):(%u):([0-9A-Z]+%.[0-9A-Z]+%.[A-Z0-9%-]+):(.*)$")
-  if not proto then return Reject("format") end
+  local proto, level, kind, campaign, rest = strMatch(text, "^WR(%d+):(%d+):(%u):([0-9A-Z%.%-]+):(.*)$")
+  if not proto or not CampaignFieldOk(campaign) then return Reject("format") end
   if #text > K.WIRE_MAX and kind ~= "Z" and kind ~= "M" then return Reject("size") end
   if tonumber(proto) ~= K.PROTOCOL then return Reject("protocol") end
   if tonumber(level) ~= K.LEVEL then return Reject("level") end
@@ -306,7 +315,8 @@ local function StartScan(now)
   end
   local opposite = OPPOSITE[MyFaction() or ""]
   if not opposite or not MyRecord() then return end
-  -- realmID only for same-faction friends: a whisper stays on our realm.
+  -- realmID only for same-faction friends: a whisper stays on our realm. Nil
+  -- is fine: Relay.SameRealm asks the client first (build 71037).
   local realmID = MyRealmID()
   local ok, total = pcall(BNGetNumFriends)
   if not ok or type(total) ~= "number" then return end
@@ -324,7 +334,7 @@ local function ScanFriend(index)
     if okInfo then
       local account = Candidate(info, scan.opposite)
       if account then scan.found[account.id] = account.name end
-      local ally = scan.realmID and Relay.Ally(info, scan.mine, scan.realmID)
+      local ally = Relay.Ally(info, scan.mine, scan.realmID)
       if ally then scan.allies[#scan.allies + 1] = ally end
     end
   end

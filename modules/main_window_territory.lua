@@ -166,9 +166,8 @@ function SyncDrawer:ActivityTooltip(frame)
     GameTooltip:AddLine("Received: " .. traffic.Rate(totalIn / window), 0.4, 0.65, 1)
     GameTooltip:AddLine("Sent: " .. traffic.Rate(totalOut / window), 1, 0.82, 0)
     GameTooltip:AddLine("Busiest second: " .. traffic.Rate(peak), 0.8, 0.8, 0.8)
-    GameTooltip:AddLine("Averages over the last minute. Blue is received, gold is sent.", 0.6, 0.6, 0.6, 1)
-    GameTooltip:AddLine("Active players: Warfront players heard from in the last "
-      .. math.floor(traffic.ACTIVE / 60) .. " minutes.", 0.8, 0.8, 0.8, 1)
+    GameTooltip:AddLine(WF.L("Active players: Warfront players you received data from in the last %d minutes.",
+      math.floor(traffic.ACTIVE / 60)), 0.8, 0.8, 0.8, 1)
   end
   local queue = WF.SendQueue
   if queue and (queue.dropped or 0) > 0 then
@@ -248,16 +247,11 @@ function SyncDrawer.SetNewsDot(dot, state)
 end
 
 function SyncDrawer:NewsTooltip(frame)
-  local minutes = math.floor(((WF.Catchup and WF.Catchup.NEWS_LIVE) or 600) / 60)
   GameTooltip:SetOwner(frame, "ANCHOR_CURSOR", 10, 10)
   GameTooltip:AddLine("War news", 1, 1, 1)
-  GameTooltip:AddLine("Whether news of captures and battles reaches you from other Warfront players.",
-    0.8, 0.8, 0.8, 1)
-  GameTooltip:AddLine("Green: news arrived in the last " .. minutes .. " minutes.", 0.3, 1, 0.3, 1)
-  GameTooltip:AddLine("Orange: other players can reach you, but nothing new arrived in the last "
-    .. minutes .. " minutes.", 1, 0.6, 0.1, 1)
-  GameTooltip:AddLine("Red: nobody reached you in the last " .. minutes .. " minutes. Your own captures still count; "
-    .. "the map may be behind until other Warfront players are around.", 1, 0.35, 0.35, 1)
+  GameTooltip:AddLine("Green: recent news.", 0.3, 1, 0.3, 1)
+  GameTooltip:AddLine("Orange: connected, no recent news.", 1, 0.6, 0.1, 1)
+  GameTooltip:AddLine("Red: no one reached you; the map may lag.", 1, 0.35, 0.35, 1)
   if self.newsAge then
     GameTooltip:AddLine("Last news: " .. Duration(self.newsAge) .. " ago.", 0.6, 0.6, 0.6, 1)
   else
@@ -369,7 +363,7 @@ function FRONT.NetworkStrip(panel, continent, top)
   view.bar:SetPoint("LEFT", panel, "TOPLEFT", view.barLeft, mid)
   view.empty = Skin():Text(view.bar, "GameFontDisableSmall", "LEFT")
   view.empty:SetPoint("LEFT", view.bar, "LEFT", 0, -0.5)
-  view.text = Skin():Text(panel, "GameFontHighlightSmall", "RIGHT")
+  view.text = Skin():Text(panel, "GameFontHighlightSmall", "LEFT")
   view.capture = FRONT.Stat(panel, "scoreboard.icon.pvp", "Capture", panel, "TOPLEFT", x3 - FRONT.STAT_RIGHT, mid - 0.5)
   view.travel = FRONT.Stat(panel, "scoreboard.icon.movement", "Travel", view.capture.icon, "LEFT", -FRONT.STAT_GAP, -0.5)
   -- The divider follows the right-aligned cuts (user, 2026-11-16).
@@ -377,7 +371,9 @@ function FRONT.NetworkStrip(panel, continent, top)
   divider:SetWidth(FRONT.DIVIDER_W)
   divider:SetHeight(FRONT.DIVIDER_H)
   divider:SetPoint("CENTER", view.travel.icon, "LEFT", -FRONT.DIVIDER_GAP, 0)
-  view.text:SetPoint("RIGHT", divider, "CENTER", -FRONT.COUNT_RIGHT, -0.5)
+  -- The count follows the bar, whose camps share one width on both
+  -- continents, so both counts line up (user, 2026-11-21).
+  view.text:SetPoint("LEFT", view.bar, "RIGHT", FRONT.COUNT_GAP, -0.5)
   local height, lift = y0 - y3, y0 - mid
   local hit = FRONT.Hit(panel, height, continent, nil, FRONT.NetworkTooltip)
   hit:SetPoint("TOPLEFT", panel, "TOPLEFT", x0, y0)
@@ -557,6 +553,7 @@ function SyncDrawer:BuildPanel(parent)
     GameTooltip:SetOwner(frame, "ANCHOR_CURSOR", 10, 10)
     GameTooltip:AddLine("Allies", 1, 1, 1)
     GameTooltip:AddLine("Become Battle.net friends with a player of the other faction to help Warfront share data between factions.", 0.8, 0.8, 0.8, 1)
+    Window.AlliesTooltipState(GameTooltip)
     Window.LocalizeTooltip(GameTooltip)
     GameTooltip:Show()
   end)
@@ -586,9 +583,8 @@ function SyncDrawer:BuildPanel(parent)
     GameTooltip:SetOwner(frame, "ANCHOR_CURSOR", 10, 10)
     GameTooltip:AddLine("Warfront Companion (optional)", 1, 1, 1)
     if reason then GameTooltip:AddLine(companion.HINT_TEXTS[reason], 1, 0.82, 0, 1) end
-    GameTooltip:AddLine(companion.HINT_PITCH, 0.8, 0.8, 0.8, 1)
     GameTooltip:AddLine(companion.HINT_LIMIT, 0.8, 0.8, 0.8, 1)
-    GameTooltip:AddLine("Warfront works fully without it. /wf companion hide stops the tips.", 0.6, 0.6, 0.6, 1)
+    GameTooltip:AddLine("/wf companion hide stops the tips.", 0.6, 0.6, 0.6, 1)
     Window.LocalizeTooltip(GameTooltip)
     GameTooltip:Show()
   end)
@@ -625,10 +621,12 @@ function FRONT.Cut(mine, percent)
   return "0%"
 end
 
-function Territory:UpdateNetworkBar(network, view, continent, mine)
+-- Sets one strip's texts and returns the widest camp segment its room fits,
+-- or nil without War Camps.
+function Territory:UpdateNetworkText(network, view, continent, mine)
   local camps = network:Camps(continent)
   local total = #camps
-  local segments = view.segments
+  view.camps = camps
   local held, travel, capture = 0, 0, 0
   if mine then
     local _
@@ -639,8 +637,8 @@ function Territory:UpdateNetworkBar(network, view, continent, mine)
   if total == 0 then
     SetText(view.text, "")
     SetText(view.empty, "No War Camps")
-    for index = 1, #segments do segments[index]:Hide() end
-    return
+    for index = 1, #view.segments do view.segments[index]:Hide() end
+    return nil
   end
   SetText(view.empty, "")
   SetText(view.text, (mine and (held .. "/") or "") .. total .. (total == 1 and " Camp" or " Camps"))
@@ -652,8 +650,17 @@ function Territory:UpdateNetworkBar(network, view, continent, mine)
   local room = math.floor(divider - FRONT.COUNT_RIGHT - (view.text:GetStringWidth() or 0) - FRONT.COUNT_GAP
     - view.barLeft)
   room = math.max(total, room)
+  return math.max(1, math.floor((room - FRONT.CAMP_GAP * (total - 1)) / total))
+end
+
+-- Lays out one strip's segments at `width` (shared by both continents so
+-- their camps match, user 2026-11-21) and tints them by owner.
+function Territory:UpdateNetworkBar(network, view, width, mine)
+  local camps = view.camps
+  local total = #camps
+  local segments = view.segments
   local gap = FRONT.CAMP_GAP
-  local width = math.max(1, math.floor((room - gap * (total - 1)) / total))
+  local room = width * total + gap * (total - 1)
   if view.segmentCount ~= total or view.width ~= room then
     view.segmentCount, view.width = total, room
     view.bar:SetWidth(room)
@@ -689,9 +696,16 @@ function Territory:UpdateNetwork()
   local network = WF.FrontNetwork
   if not network then return end
   local mine = MyFaction()
+  local width
   for index = 1, #network.CONTINENTS do
     local continent = network.CONTINENTS[index]
-    self:UpdateNetworkBar(network, self.networks[continent], continent, mine)
+    local fit = self:UpdateNetworkText(network, self.networks[continent], continent, mine)
+    if fit and (not width or fit < width) then width = fit end
+  end
+  if not width then return end
+  for index = 1, #network.CONTINENTS do
+    local view = self.networks[network.CONTINENTS[index]]
+    if #view.camps > 0 then self:UpdateNetworkBar(network, view, width, mine) end
   end
 end
 
@@ -1181,6 +1195,7 @@ end
 
 function SyncDrawer:Update(now)
   if not self.channel then return end
+  Window.MarkAllies(self.allies)
   local capture = WF.Capture
   local catchup = WF.Catchup
   local state, age = "waiting", nil

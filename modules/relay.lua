@@ -183,11 +183,24 @@ local function ServerTime()
   return mathFloor(value)
 end
 
-local function MyRealmID()
-  if type(GetRealmID) ~= "function" then return nil end
-  local ok, value = pcall(GetRealmID)
-  if not ok or type(value) ~= "number" then return nil end
+local function RealmIDValue(value)
+  if type(value) ~= "number" or IsSecret(value) or value ~= mathFloor(value) then return nil end
+  if value < 1 or value > 4294967295 then return nil end
   return value
+end
+
+-- Our realm id, or nil. Build 71037 answers GetRealmID() = 0 (decision 0137):
+-- the GUID server ("Player-<id>-…", measured equal to the realm id) stands in.
+local function MyRealmID()
+  if type(GetRealmID) == "function" then
+    local ok, value = pcall(GetRealmID)
+    value = ok and RealmIDValue(value) or nil
+    if value then return value end
+  end
+  if type(UnitGUID) ~= "function" then return nil end
+  local ok, guid = pcall(UnitGUID, "player")
+  if not ok or type(guid) ~= "string" or IsSecret(guid) then return nil end
+  return RealmIDValue(tonumber(strMatch(guid, "^Player%-(%d+)%-") or ""))
 end
 
 -- Our game-mode record (decision 0072: 14 = PvP, 15 = Normal), or nil while the
@@ -593,13 +606,25 @@ local function Candidate(info, opposite)
   return { id = info.gameAccountID, name = name, faction = opposite }
 end
 
+-- Whether a friend's game account is on our realm. Build 71037 hides realms
+-- (decision 0137): C_BattleNet.IsGameAccountOnSameRealm (added in 71037)
+-- answers when present; else the realm ids, where nil or a blank 0 never match.
+function Relay.SameRealm(info, realmID)
+  local fn = type(C_BattleNet) == "table" and C_BattleNet.IsGameAccountOnSameRealm or nil
+  if type(fn) == "function" and type(info.gameAccountID) == "number" then
+    local ok, same = pcall(fn, info.gameAccountID)
+    if ok and type(same) == "boolean" and not IsSecret(same) then return same end
+  end
+  return type(realmID) == "number" and info.realmID == realmID
+end
+
 -- A same-realm, same-faction WoW character of a Battle.net friend: its chat
 -- name, "First Surname", for the directory of contacts (decision 0077 § 5f).
 -- An addon whisper never crosses factions, so only our own faction is kept.
 function Relay.Ally(info, mine, realmID)
   if type(info) ~= "table" or info.isOnline ~= true then return nil end
   if info.clientProgram ~= (BNET_CLIENT_WOW or "WoW") or info.isInCurrentRegion == false then return nil end
-  if info.realmID ~= realmID or FACTION_OF_TAG[info.factionName] ~= mine then return nil end
+  if FACTION_OF_TAG[info.factionName] ~= mine or not Relay.SameRealm(info, realmID) then return nil end
   local name = info.characterName
   if type(name) ~= "string" or IsSecret(name) then return nil end
   local names = WF.Names

@@ -8,7 +8,7 @@
 ## Category: PvP
 ## IconTexture: Interface\AddOns\Warfront\media\Textures\UI\WarfrontMinimapIcon
 ## Author: Warfront contributors
-## Version: 0.1.1
+## Version: 0.1.2
 ## SavedVariables: WarfrontDB, WarfrontJournal
 ## SavedVariablesPerCharacter: WarfrontImport
 

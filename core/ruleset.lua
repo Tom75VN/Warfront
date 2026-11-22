@@ -13,7 +13,8 @@ local Ruleset = WF.Ruleset
 -- map: the scope and the commercial region (GetCurrentRegion()). While the
 -- region is unknown the scope stays unresolved: nothing is written, sent or
 -- imported. The realm name, realm id and the character's surname never decide
--- anything: they are bounded diagnostic metadata for the companion and the cloud.
+-- anything: they are bounded diagnostic metadata for the companion and the cloud,
+-- optional since decision 0137.
 --
 -- SavedVariables, read by the companion (contract v2, docs/companion.md):
 --   WarfrontDB.scopeSchema = 2
@@ -119,13 +120,29 @@ function Ruleset:ReadRecord()
   return record
 end
 
+-- The realm id carried by the player's GUID ("Player-<id>-…"; the GUID server
+-- was measured equal to GetRealmID() on 2026-11-10), or nil.
+local function GuidRealm()
+  local guid = Call(Global("UnitGUID"), "player")
+  if type(guid) ~= "string" then return nil end
+  local ok, _, _, server = pcall(string.find, guid, "^Player%-(%d+)%-")
+  if not ok then return nil end
+  return Whole(tonumber(server), 1, 4294967295)
+end
+
+-- Build 71037 answers GetRealmID() = 0 and empty realm names (decision 0137):
+-- the GUID gives the id, and "Realm <id>" stands in for the name that released
+-- companions still require. Diagnostics only.
 local function ReadContext(scope, record, region)
   local context = { scope = scope, rulesetRecord = record }
   context.regionId = region
   context.regionName = Ruleset.Clean(Call(Global("GetCurrentRegionName")))
-  context.realmId = Whole(Call(Global("GetRealmID")), 1, 4294967295)
-  context.realmName = Ruleset.Clean(Call(Global("GetRealmName")))
+  context.realmId = Whole(Call(Global("GetRealmID")), 1, 4294967295) or GuidRealm()
   context.normalizedRealmName = Ruleset.Clean(Call(Global("GetNormalizedRealmName")))
+  context.realmName = Ruleset.Clean(Call(Global("GetRealmName"))) or context.normalizedRealmName
+  if not context.realmName and context.realmId then
+    context.realmName = string.format("Realm %d", context.realmId)
+  end
   local version, build, _, interface = Call(Global("GetBuildInfo"))
   context.clientVersion = Ruleset.Clean(version)
   context.build = Ruleset.Clean(build)

@@ -465,6 +465,13 @@ function Ticket:Admit(sender, kind, now, relayed)
   return true
 end
 
+-- True when the sender's ticket verified: signed for our ruleset scope and
+-- region (Ticket.Text). Display only (decision 0138), never admission.
+function Ticket:Verified(sender)
+  local entry = type(sender) == "string" and self.peers[sender]
+  return type(entry) == "table" and entry.status == "VALID" or false
+end
+
 -- A presence from a member with a verified ticket of the other faction.
 function Ticket:NoteFaction(sender, faction)
   local entry = self.peers[sender]

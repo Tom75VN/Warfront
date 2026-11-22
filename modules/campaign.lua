@@ -17,12 +17,16 @@ local WF = Warfront
 --   * Every line carries <N>.<S>.<set> in its header (modules/p2ptest.lua):
 --     a line of another campaign is not applied (Campaign:Admit), except V,
 --     CE, CQ and CL, which carry their own campaign.
+--   * Decision 0139: the field also names the sender's ruleset by its
+--     game-mode record, bare for 14 (PvP) and .<record in base 36> for any
+--     other; a line of another ruleset is never applied, CE, CQ and CL
+--     included (only V, HI and D pass).
 --   * A campaign change runs the 0102 § 4 reset once per (N, S).
 local Campaign = {
   votes = {}, voteCount = 0,
   repeats = {},
   confirmed = {},
-  received = 0, rejected = 0, skew = 0, contradicted = 0, implausible = 0, accepted = 0,
+  received = 0, rejected = 0, skew = 0, foreign = 0, contradicted = 0, implausible = 0, accepted = 0,
   switched = 0, forks = 0, answered = 0, queried = 0,
 }
 WF.Campaign = Campaign
@@ -58,6 +62,11 @@ local MAX_STEPS = 2000
 local MAX_NUMBER = 2147483647
 local EXEMPT = { V = true, CE = true, CQ = true, CL = true, HI = true, D = true }
 local CAMPAIGN_LINES = { CE = true, CQ = true, CL = true }
+-- Decision 0139: these never mutate shared state and pass from any ruleset.
+local ANY_RULESET = { V = true, HI = true, D = true }
+-- The record that keeps the bare field, so that 0.1.1 PvP clients still hear it.
+local BARE_RECORD = 14
+local MAX_MARKER = 3
 local WINNERS = { H = true, A = true }
 local FACTION_NAMES = { H = "Horde", A = "Alliance" }
 local BASE36 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
@@ -189,12 +198,43 @@ local function SetId(n, s)
 end
 
 -- The header field <N>.<S>.<set> (decision 0103 § 4b, 0102 § 5).
+-- Our game-mode record (decision 0139), or nil while the ruleset is
+-- unresolved, unsupported or in conflict. Without a ruleset module (offline
+-- tools) the bare PvP field is kept.
+function Campaign:Record()
+  local ruleset = WF.Ruleset
+  if type(ruleset) ~= "table" or type(ruleset.Scope) ~= "function" then return BARE_RECORD end
+  local ok, scope = pcall(ruleset.Scope, ruleset)
+  local record = ruleset.record
+  if not ok or not scope or not Whole(record, 0, MAX_NUMBER) then return nil end
+  return record
+end
+
+-- "" for the bare record, ".<record in base 36>" otherwise.
+local function Marker(record)
+  if record == nil or record == BARE_RECORD then return "" end
+  return "." .. Base36(record)
+end
+
+-- The record a header field names: bare is 14; a fourth part of one to three
+-- base-36 characters is the record (14 itself is never marked); nil when malformed.
+function Campaign.FieldRecord(text)
+  if type(text) ~= "string" or #text > 20 then return nil end
+  if string.find(text, "^[0-9A-Z]+%.[0-9A-Z]+%.[A-Z0-9%-]+$") then return BARE_RECORD end
+  local marker = string.match(text, "^[0-9A-Z]+%.[0-9A-Z]+%.[A-Z0-9%-]+%.([0-9A-Z]+)$")
+  if not marker or #marker > MAX_MARKER then return nil end
+  local record = Number36(marker)
+  if record == nil or record == BARE_RECORD then return nil end
+  return record
+end
+
 function Campaign:Tag()
   local n, s = self:Current()
-  if not n then return NO_TAG end
-  if self.tagN ~= n or self.tagS ~= s then
-    self.tagN, self.tagS = n, s
-    self.tag = Base36(n) .. "." .. Base36(n >= 1 and s or 0) .. "." .. (SetId(n, s) or "-")
+  local record = self:Record()
+  if not n then return NO_TAG .. Marker(record) end
+  if self.tagN ~= n or self.tagS ~= s or self.tagR ~= record then
+    self.tagN, self.tagS, self.tagR = n, s, record
+    self.tag = Base36(n) .. "." .. Base36(n >= 1 and s or 0) .. "." .. (SetId(n, s) or "-") .. Marker(record)
   end
   return self.tag
 end
@@ -202,6 +242,9 @@ end
 function Campaign.ParseTag(text)
   if type(text) ~= "string" then return nil end
   local nText, sText, set = string.match(text, "^([0-9A-Z]+)%.([0-9A-Z]+)%.([A-Z0-9%-]+)$")
+  if not nText then
+    nText, sText, set = string.match(text, "^([0-9A-Z]+)%.([0-9A-Z]+)%.([A-Z0-9%-]+)%.[0-9A-Z]+$")
+  end
   local n, s = Number36(nText), Number36(sText)
   if not n or not s or #set > 3 then return nil end
   return n, s, set
@@ -210,8 +253,16 @@ end
 -- Whether a received line of `id` with header field `tag` may be applied
 -- (0102 § 5): a line of another campaign is counted, never applied nor
 -- answered, never a reject. CE, CQ and CL carry their own campaign and pass;
--- such a line from another campaign is a reason to ask (CQ).
+-- such a line from another campaign is a reason to ask (CQ). A line of
+-- another ruleset (decision 0139) is counted and dropped first, whatever its
+-- id, except V, HI and D.
 function Campaign:Admit(id, tag, now)
+  if ANY_RULESET[id] then return true end
+  local record = Campaign.FieldRecord(tag)
+  if record == nil or record ~= self:Record() then
+    self.foreign = self.foreign + 1
+    return false
+  end
   if not self:First() then return true end
   local mine = self:Tag()
   if EXEMPT[id] then
@@ -988,7 +1039,7 @@ function Campaign:PrintStatus()
   for _ in pairs(self.votes) do votes = votes + 1 end
   print("campaign: switched " .. self.switched .. " accepted " .. self.accepted .. " forks " .. self.forks
     .. " contradicted " .. self.contradicted .. " implausible " .. self.implausible .. " votes " .. votes
-    .. " skew " .. self.skew .. " queried " .. self.queried .. " answered " .. self.answered
+    .. " skew " .. self.skew .. " foreign " .. self.foreign .. " queried " .. self.queried .. " answered " .. self.answered
     .. " rejected " .. self.rejected .. (self.lastReject and (" last " .. self.lastReject) or ""))
   local past = self.store and self.store.past or {}
   for index = math.max(1, #past - 2), #past do

@@ -642,6 +642,7 @@ function Online:Build()
     GameTooltip:SetOwner(frame, "ANCHOR_TOP")
     GameTooltip:AddLine("Allies", 1, 1, 1)
     GameTooltip:AddLine("Become Battle.net friends with a player of the other faction to help Warfront share data between factions.", 0.8, 0.8, 0.8, 1)
+    Window.AlliesTooltipState(GameTooltip)
     Window.LocalizeTooltip(GameTooltip)
     GameTooltip:Show()
   end)
@@ -655,6 +656,7 @@ function Online:Update(now)
   local players = WF.Players
   if not players then return end
   players:Tick(now)
+  Window.MarkAllies(self.allies)
   local names, me = players.names, players.me
   local count = players.count
   local room, gap = self.nameRoom or 0, self.CELL.GAP

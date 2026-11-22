@@ -243,6 +243,15 @@ local function ChannelWire(id, session, sequence, body)
 end
 P2P.ChannelWire = ChannelWire
 
+-- The campaign header field <N>.<S>.<set>, with decision 0139's optional
+-- ruleset marker .<record>: one to three base-36 characters (modules/campaign.lua
+-- decides whether the ruleset is ours).
+function P2P.CampaignFieldOk(text)
+  if string.find(text, "^[0-9A-Z]+%.[0-9A-Z]+%.[A-Z0-9%-]+$") then return true end
+  local marker = string.match(text, "^[0-9A-Z]+%.[0-9A-Z]+%.[A-Z0-9%-]+%.([0-9A-Z]+)$")
+  return marker ~= nil and #marker <= 3
+end
+
 -- Whether a received line of the given id and campaign header may be applied
 -- (modules/campaign.lua): a line of another campaign is counted, not applied.
 function P2P.AdmitCampaign(id, campaign)
@@ -278,9 +287,9 @@ function P2P.ParseChannel(text)
   if not meta then return nil, "invalid addon version" end
 
   local _, _, id, session, sequenceText, campaign, body = string.find(tail,
-    "^([A-Z][A-Z0-9]*):([0-9A-F]+):([0-9A-Z]+):([0-9A-Z]+%.[0-9A-Z]+%.[A-Z0-9%-]+):(.*)$")
+    "^([A-Z][A-Z0-9]*):([0-9A-F]+):([0-9A-Z]+):([0-9A-Z%.%-]+):(.*)$")
   if not id then return nil, "envelope does not match WF" .. tostring(CHANNEL_LEVEL), meta end
-  if #campaign > 20 then return nil, "invalid campaign", meta end
+  if #campaign > 20 or not P2P.CampaignFieldOk(campaign) then return nil, "invalid campaign", meta end
   if not CHANNEL_TYPE_BY_ID[id] and not CAPTURE_IDS[id] then return nil, "unknown channel event id", meta end
   if #session < 4 or #session > 12 then return nil, "invalid session id", meta end
   local sequence = #sequenceText <= 6 and tonumber(sequenceText, 36)

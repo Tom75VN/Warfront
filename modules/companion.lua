@@ -236,7 +236,7 @@ local HINT_TEXTS = {
 }
 Companion.HINT_TEXTS = HINT_TEXTS
 Companion.HINT_PITCH = "Optional: the Warfront Companion keeps your map up to date between sessions."
-Companion.HINT_LIMIT = "On WoW: Forever it updates Warfront while the game is closed, not live."
+Companion.HINT_LIMIT = "Syncs your map with the cloud while the game is closed."
 
 local function HintDB()
   local storage = WF.Storage

@@ -282,6 +282,30 @@ function Boards:Ranks()
     version = c and c.v or nil, historyVersion = h and h.v or nil }
 end
 
+-- True when a verified copy (our scope and region) ranks this name with our
+-- region id. Display only (decision 0138). Each copy's name set is built once.
+function Boards:HasPlayer(name, region)
+  if type(name) ~= "string" or type(region) ~= "number" then return false end
+  for _, period in ipairs({ "c", "h" }) do
+    local copy = self.copies[period]
+    local ranks = copy and copy.ranks
+    if type(ranks) == "table" then
+      if not copy.names then
+        local set = {}
+        for _, list in pairs(type(ranks.players) == "table" and ranks.players or {}) do
+          for i = 1, #list do
+            local row = list[i]
+            if type(row) == "table" and type(row.char) == "string" then set[row.char .. "|" .. tostring(row.region)] = true end
+          end
+        end
+        copy.names = set
+      end
+      if copy.names[name .. "|" .. region] then return true end
+    end
+  end
+  return false
+end
+
 local function Pieces(blob)
   return math.max(1, math.ceil(#blob / CHUNK))
 end
