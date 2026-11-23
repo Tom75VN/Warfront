@@ -1067,6 +1067,29 @@ function Transport:Hearers(chatType, now)
   return list
 end
 
+-- True while someone can hear our capture lines (decision 0141): the channel
+-- is joined, or a Warfront group mate or guild peer was heard within its TTL.
+-- Capture:CanTalk locks an isolated client, whose actions nobody would see.
+function Transport:Reached(now)
+  now = now or Now()
+  local p2p = WF.P2PTest
+  if p2p and type(p2p.ChannelJoined) == "function" then
+    local ok, joined = pcall(p2p.ChannelJoined)
+    if ok and joined then return true end
+  end
+  if GroupType() then
+    for _, at in pairs(groupPeers) do
+      if now - at <= GROUP_PEER_TTL then return true end
+    end
+  end
+  if InGuild() then
+    for _, at in pairs(guild.peers) do
+      if now - at <= GUILD.PEER_TTL then return true end
+    end
+  end
+  return false
+end
+
 -- Whisper names of up to `limit` guild peers and contacts, the most recently
 -- heard first: where an addressed catch-up request goes (decision 0077 § 5f).
 function Transport:PullTargets(limit, now)
@@ -1264,6 +1287,13 @@ function Transport:OnAddonMessage(prefix, text, chatType, sender, target, zoneCh
     return
   end
   if identity == me then return Reject("own identity") end
+  -- The sender's ruleset for the Players tab, from any line it sent (decision
+  -- 0139 § 6): display only; by whisper only from a player we chose to hear.
+  local players = WF.Players
+  if players and type(players.NoteLine) == "function" and (chatType ~= "WHISPER" or Known(identity, now)) then
+    local noted, noteError = pcall(players.NoteLine, players, identity, parsed.version, parsed.campaign)
+    if not noted and WF.RecordError then WF.RecordError("players ruleset", noteError) end
+  end
   if chatType == "CHANNEL" then
     if not CHANNEL_CAPTURE_LINES[parsed.id] and not GROUP_LINES[parsed.id] then return Reject("channel kind") end
     self.channelRemote = self.channelRemote + 1

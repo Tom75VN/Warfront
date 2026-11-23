@@ -14,6 +14,7 @@ local function Valid(entry)
   return type(entry) == "table" and known[entry.category] and entry.category ~= "all"
     and type(entry.text) == "string" and #entry.text > 0 and #entry.text <= 2048
     and type(entry.at) == "number" and entry.at == entry.at and entry.at >= 0 and entry.at < 100000000000
+    and (entry.k == nil or (type(entry.k) == "string" and #entry.k > 0 and #entry.k <= 64))
 end
 
 function History:Initialize()
@@ -35,7 +36,7 @@ function History:Initialize()
       if Valid(entry) then
         store.entries[#store.entries + 1] = {
           category = entry.category, text = entry.text, at = entry.at, read = entry.read == true,
-          side = (entry.side == "A" or entry.side == "H") and entry.side or nil,
+          side = (entry.side == "A" or entry.side == "H") and entry.side or nil, k = entry.k,
         }
       end
     end
@@ -50,18 +51,34 @@ function History:Initialize()
   self.revision = self.revision + 1
 end
 
+-- Newest first: an entry dated in the past (a cloud capture, decision 0144)
+-- takes its place by date; a full list drops its oldest entry.
 function History:Insert(entry)
   local entries = self.store.entries
-  table.insert(entries, 1, entry)
+  local index = 1
+  while entries[index] and entries[index].at > entry.at do index = index + 1 end
+  table.insert(entries, index, entry)
   if #entries > self.MAX then table.remove(entries) end
   self.revision = self.revision + 1
 end
 
-function History:Add(category, text, side, title)
+-- An event with a key (a capture: "poi:generation", decision 0144) is listed once.
+function History:Has(key)
+  if not key then return false end
+  for _, list in ipairs({ self.store and self.store.entries or {}, self.pending }) do
+    for _, entry in ipairs(list) do if entry.k == key then return true end end
+  end
+  return false
+end
+
+-- at: the event's own time when it is not now (a cloud capture); key: see Has.
+function History:Add(category, text, side, title, key, at)
   if self.loaded then self:Initialize() end
+  if self:Has(key) then return end
   text = WF.L and WF.L(text) or text
   if title then text = (WF.L and WF.L(title) or title) .. " - " .. text end
-  local entry = { category = category, text = text, at = WF.Epoch(), read = false }
+  local now = WF.Epoch()
+  local entry = { category = category, text = text, at = math.min(type(at) == "number" and at or now, now), read = false, k = key }
   entry.side = (side == "A" or side == "H") and side or nil
   if not Valid(entry) then return end
   if not self.store then

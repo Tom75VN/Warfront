@@ -626,7 +626,40 @@ function Online:Build()
       column = column + 1
     end
   end, true)
+  -- Class and level of the name under the cursor, polled like the hover band
+  -- so the cells never take the mouse (wheel scrolling keeps working).
+  local tip = NewFrame(panel, 1, 1)
+  local wait, shown, shownName = 0, nil, nil
+  local function Release()
+    local tooltip = GetGlobal("GameTooltip")
+    if shown and tooltip and tooltip:GetOwner() == shown then tooltip:Hide() end
+    shown, shownName = nil, nil
+  end
+  tip:SetScript("OnUpdate", function(_, elapsed)
+    wait = wait - (elapsed or 0)
+    if wait > 0 then return end
+    wait = Window.HOVER_PERIOD
+    local box, name = Online:CellUnder()
+    if box == shown and name == shownName then return end
+    Release()
+    if box and Online:ShowDetails(box, name) then shown, shownName = box, name end
+  end)
+  tip:SetScript("OnHide", Release)
   self.empty = NewText(panel, "GameFontHighlight", 12, -48, panel.width - 24, "CENTER")
+  -- Turning arrow under "Not connected yet", shown only while waiting.
+  local spinner = NewFrame(panel, 32, 32)
+  Place(spinner, panel, math.floor((panel.width - 32) / 2), -72)
+  local arrow = spinner:CreateTexture(nil, "ARTWORK")
+  arrow:SetAllPoints(spinner)
+  arrow:SetTexture("Interface\\AddOns\\Warfront\\media\\Textures\\UI\\LoadingArrow")
+  local angle = 0
+  spinner:SetScript("OnUpdate", function(_, elapsed)
+    if type(arrow.SetRotation) ~= "function" then return end
+    angle = (angle - (elapsed or 0) * 4) % (2 * math.pi)
+    arrow:SetRotation(angle)
+  end)
+  spinner:Hide()
+  self.spinner = spinner
   self.updated = NewText(self.frame, "GameFontHighlightSmall", 6, -(height + 9), CONTENT_WIDTH - 260)
   self.refresh = NewButton(self.frame, "dark", 100, 24, "Refresh", Window.RefreshPlayers)
   Place(self.refresh, self.frame, CONTENT_WIDTH - 100, -(height + 4))
@@ -652,6 +685,51 @@ function Online:Build()
   end)
 end
 
+-- The shown name box under the cursor and its player name, or nil.
+function Online:CellUnder()
+  local list, panel = self.list, self.panel
+  if not list or not panel or not panel:IsMouseOver() then return nil end
+  for index = 1, #list.rows do
+    local row = list.rows[index]
+    if row:IsShown() and row.boxes and row:IsMouseOver() then
+      for column = 1, #row.boxes do
+        local box = row.boxes[column]
+        local name = row.names and row.names[column]
+        if name and box:IsShown() and box:IsMouseOver() then return box, name end
+      end
+      return nil
+    end
+  end
+  return nil
+end
+
+-- Tooltip over a name: the client's own "Level %d %s" line in the class
+-- colour (Players:Details). False when nothing is known about the player.
+function Online:ShowDetails(box, name)
+  local players, tooltip = WF.Players, GetGlobal("GameTooltip")
+  if not players or type(players.Details) ~= "function" or not tooltip then return false end
+  local class, classFile, level = players:Details(name)
+  if not class and not level then return false end
+  local line
+  local template = GetGlobal("UNIT_TYPE_LEVEL_TEMPLATE")
+  if class and level and type(template) == "string" then
+    local ok, text = pcall(string.format, template, level, class)
+    if ok and type(text) == "string" then line = text end
+  end
+  line = line or ((level and tostring(level) or "") .. ((class and level) and " " or "") .. (class or ""))
+  local colors = GetGlobal("RAID_CLASS_COLORS")
+  local color = classFile and type(colors) == "table" and colors[classFile] or nil
+  tooltip:SetOwner(box, "ANCHOR_TOP")
+  tooltip:AddLine(name, 1, 1, 1)
+  if type(color) == "table" and type(color.r) == "number" and type(color.g) == "number" and type(color.b) == "number" then
+    tooltip:AddLine(line, color.r, color.g, color.b)
+  else
+    tooltip:AddLine(line, 0.8, 0.8, 0.8)
+  end
+  tooltip:Show()
+  return true
+end
+
 function Online:Update(now)
   local players = WF.Players
   if not players then return end
@@ -664,6 +742,8 @@ function Online:Update(now)
     local column = 1
     while column <= ONLINE_COLUMNS do
       local name = names[(item - 1) * ONLINE_COLUMNS + column]
+      row.names = row.names or {}
+      row.names[column] = name
       local tag = name and players.tags and players.tags[name]
       local info = name and players.info and players.info[name] or nil
       local icon = row.icons[column]
@@ -699,6 +779,7 @@ function Online:Update(now)
     empty = players.requestedAt and "Looking for players..." or "Not connected yet. Try again in a moment."
   end
   SetText(self.empty, Paint("DIM", empty))
+  Show(self.spinner, count == 0 and not players.requestedAt)
   local updated = ""
   if players.updatedAt then
     updated = "Updated " .. Duration(math.max(0, now - players.updatedAt)) .. " ago"

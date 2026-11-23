@@ -6,7 +6,7 @@ WF.name = "Warfront"
 -- Same value as ## Version in the .toc (checked by tools/smoke.py). Every
 -- channel line carries it so older builds learn that they are outdated.
 -- Changed only by tools/release.py prepare, once per push (decision 0035).
-WF.version = "0.1.2"
+WF.version = "0.1.3"
 -- Compatibility level n of the channel line WF<n> (decision 0029): raised by any
 -- change that can make two builds disagree on the same messages, at the next
 -- tools/release.py prepare. Lines of another level are never applied.
@@ -16,6 +16,8 @@ WF.channelLevel = 6
 WF.importAllies = 1
 -- Optional campaign archive, read from the installed addon by the companion.
 WF.importCampaignHistory = 1
+-- Optional latest cloud captures for the Journal (decision 0144), read by the companion.
+WF.importCaptures = 1
 
 local listeners = {}
 local registrations = {}

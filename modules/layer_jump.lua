@@ -6,9 +6,10 @@ local WF = Warfront
 -- it. The click asks one same-faction Warfront player standing on the arena
 -- layer at a time, by addon whisper (LJ); that player's addon invites the
 -- requester when it can, or answers why not (LN). Out of combat the game moves
--- a group member to the leader's layer; once our layer has changed we leave
--- the group (or after JUMP_TIMEOUT s anyway, JUMP_TIMEOUT_UNREAD s while our
--- new layer is still unread). Saved: the helper's choice
+-- a group member to the leader's layer and says so with SHARD_TRANSFER
+-- (decision 0142 § 6): we take the helper's layer tag (WF.Layer:Expect) and
+-- leave the pair LEAVE_AFTER_MOVE s later, never under LEAVE_MIN s after the
+-- join; with no move NO_MOVE_LEAVE s after the join we leave. Saved: the helper's choice
 -- (WarfrontDB.settings.layerHelpOff) and, per character, the time of the last
 -- jump (WarfrontDB.settings.layerJumps), so a /reload never shortens the wait.
 --   * No fleeing: the only destination is the arena layer, from a POI, out of
@@ -30,8 +31,17 @@ local LayerJump = {
 WF.LayerJump = LayerJump
 
 local ASK_WAIT, MAX_ASKED = 8, 4
-local JUMP_TIMEOUT, JUMP_TIMEOUT_UNREAD, JUMP_COOLDOWN, COMBAT_GAP = 60, 120, 600, 15
+local JUMP_TIMEOUT, JUMP_COOLDOWN, COMBAT_GAP = 60, 600, 15
+-- After the game's move; never less than LEAVE_MIN s after the join.
+local LEAVE_AFTER_MOVE, LEAVE_MIN, NO_MOVE_LEAVE = 2, 4, 15
 local MAX_SAVED_JUMPS = 16
+-- The game's own limit on layer changes: about MOVE_CAP moves of a character an
+-- hour, the hour opening with the first move after the previous hour closed
+-- (a lead from another addon's logs; unmeasured here). A move is the first
+-- SHARD_TRANSFER in a group (measured 2026-11-23: 1.8 s after a moving join).
+-- Saved per character in WarfrontDB.settings.layerMoves = { start, count }.
+local MOVE_CAP, MOVE_HOUR, MAX_SAVED_MOVES = 10, 3600, 16
+local movedInGroup = false
 local HELP_GAP, HELP_PER_REQUESTER = 10, 120
 local PARTNER_LIFE = 90
 local MAX_REQUESTERS = 64
@@ -113,9 +123,16 @@ local function PartyInfo(method, ...)
   return pcall(api[method], ...)
 end
 
+-- Our shared layer tag (what P states), or nil.
 local function MyLayer()
   local layer = WF.Layer
   return layer and layer.Current and layer:Current() or nil
+end
+
+-- Our layer tag, shared or not: a requester compares it with the arena.
+local function MyTag()
+  local layer = WF.Layer
+  return layer and layer.Mine and layer:Mine() or nil
 end
 
 local function Wire(key) return key and (string.gsub(key, ":", ".", 1)) or nil end
@@ -178,6 +195,51 @@ local function SaveJump()
   jumps[me] = { at = wall, from = previousLayer }
 end
 
+-- This character's running hour of layer changes, or nil.
+local function MoveRow()
+  local settings, me = Settings(), Me()
+  local rows = settings and type(settings.layerMoves) == "table" and settings.layerMoves or nil
+  local row = rows and me and rows[me]
+  if type(row) ~= "table" or type(row.start) ~= "number" or type(row.count) ~= "number" then return nil end
+  return row
+end
+
+-- Layer changes used in the running hour, and seconds until it closes (0, 0 when none runs).
+function LayerJump:MovesUsed()
+  local row, wall = MoveRow(), Wall()
+  if not row or not wall then return 0, 0 end
+  local left = row.start + MOVE_HOUR - wall
+  if left <= 0 or left > MOVE_HOUR then return 0, 0 end
+  return math.min(row.count, MOVE_CAP), left
+end
+
+function LayerJump:MoveCap() return MOVE_CAP end
+
+-- One move of ours by the game: counted in the running hour, or opens a new one.
+local function NoteMove()
+  local settings, me, wall = Settings(), Me(), Wall()
+  if not settings or not me or not wall then return end
+  local row = MoveRow()
+  if row and wall - row.start >= 0 and wall - row.start < MOVE_HOUR then
+    row.count = row.count + 1
+    return
+  end
+  local rows = type(settings.layerMoves) == "table" and settings.layerMoves or {}
+  settings.layerMoves = rows
+  local count, oldest, oldestAt = 0, nil, nil
+  for name, other in pairs(rows) do
+    local start = type(other) == "table" and tonumber(other.start) or nil
+    if not start or wall - start >= MOVE_HOUR or wall - start < 0 then
+      rows[name] = nil
+    else
+      count = count + 1
+      if not oldestAt or start < oldestAt then oldest, oldestAt = name, start end
+    end
+  end
+  if count >= MAX_SAVED_MOVES and oldest and not rows[me] then rows[oldest] = nil end
+  rows[me] = { start = wall, count = 1 }
+end
+
 local function Say(text)
   LayerJump.lastResult = text
   if WF.Print then WF.Print(text) end
@@ -223,7 +285,7 @@ end
 function LayerJump:Blocked(now)
   RestoreJump(now)
   local here, arena, capture = Context()
-  local mine = MyLayer()
+  local mine = MyTag()
   if not here or not arena or not mine or mine == arena then return "no arena" end
   if phase then return "Joining..." end
   if InInstance() then return "Not available here." end
@@ -235,6 +297,8 @@ function LayerJump:Blocked(now)
     return "Wait " .. Clock(JUMP_COOLDOWN - (now - lastJumpAt)) .. " before joining again."
   end
   if arena == previousLayer and now - lastJumpAt < JUMP_COOLDOWN then return "Not available yet." end
+  local used, left = self:MovesUsed()
+  if used >= MOVE_CAP then return "Layer changes used up: back in " .. Clock(left) .. "." end
   if #Helpers(capture, here.id, arena, now) == 0 then return "No one can help right now." end
   return nil
 end
@@ -242,16 +306,18 @@ end
 -- What the HUD shows: nil, or { text, button, enabled }.
 function LayerJump:HudState(now)
   local here, arena = Context()
-  local mine = MyLayer()
+  local mine = MyTag()
   if not here or not arena or not mine or mine == arena then
     if not phase then return nil end
   end
-  if phase == "asking" then return { text = "Asking a player there...", button = "Join it", enabled = false } end
-  if phase == "invited" then return { text = "Accept the group invitation to join the fight.", button = "Join it", enabled = false } end
-  if phase == "jumping" then return { text = "Joining the fight...", button = "Join it", enabled = false } end
+  -- moves: layer changes used this hour, shown beside the button against MOVE_CAP.
+  local moves = (self:MovesUsed())
+  if phase == "asking" then return { text = "Asking a player there...", button = "Join it", enabled = false, moves = moves, cap = MOVE_CAP } end
+  if phase == "invited" then return { text = "Accept the group invitation to join the fight.", button = "Join it", enabled = false, moves = moves, cap = MOVE_CAP } end
+  if phase == "jumping" then return { text = "Joining the fight...", button = "Join it", enabled = false, moves = moves, cap = MOVE_CAP } end
   local blocked = self:Blocked(now)
   return { text = "The fight is on another layer." .. (blocked and ("  " .. blocked) or ""), button = "Join it",
-    enabled = blocked == nil }
+    enabled = blocked == nil, moves = moves, cap = MOVE_CAP }
 end
 
 local function AskNext(now)
@@ -279,7 +345,7 @@ function LayerJump:Click()
   end
   local here, arena, capture = Context()
   request = {
-    id = string.format("%X", math.random(4096, 65535)), arena = arena, from = MyLayer(),
+    id = string.format("%X", math.random(4096, 65535)), arena = arena, from = MyTag(),
     queue = Helpers(capture, here.id, arena, now), next = 1, startedAt = now,
   }
   phase = "asking"
@@ -304,6 +370,8 @@ function LayerJump:OnInvite(name)
   if identity ~= request.helper then return end
   self.invites = self.invites + 1
   phase = "invited"
+  -- The game's move brings us to the helper's layer: its tag becomes ours.
+  if WF.Layer and WF.Layer.Expect then WF.Layer:Expect(request.arena, Now() + JUMP_TIMEOUT + NO_MOVE_LEAVE) end
   Say("Accept the group invitation to join the fight.")
 end
 
@@ -325,6 +393,7 @@ function LayerJump:TickRequester(now)
     if InGroup() then
       if InRaid() or PartyOthers() ~= 1 then
         -- Joined a group that is not the pair: stop here, never leave it.
+        if WF.Layer and WF.Layer.Expect then WF.Layer:Expect(nil) end
         phase, request = nil, nil
         return
       end
@@ -333,24 +402,40 @@ function LayerJump:TickRequester(now)
       lastJumpAt, previousLayer = now, request.from
       SaveJump()
     elseif now - request.startedAt >= JUMP_TIMEOUT then
+      if WF.Layer and WF.Layer.Expect then WF.Layer:Expect(nil) end
       phase, request = nil, nil
       Say("The invitation did not arrive.")
     end
     return
   end
-  -- jumping
-  local mine = MyLayer()
-  if not InGroup() then
-    if mine and mine ~= request.from then return Finish(now, "You joined the fight.", true) end
-    phase, request = nil, nil
+  -- jumping: the game's move (SHARD_TRANSFER) decides.
+  if not request.movedAt then
+    if not InGroup() then
+      -- The helper's group ended before any move.
+      if WF.Layer and WF.Layer.Expect then WF.Layer:Expect(nil) end
+      phase, request = nil, nil
+      return
+    end
+    if now - request.joinedAt >= NO_MOVE_LEAVE then
+      self.timeouts = self.timeouts + 1
+      if WF.Layer and WF.Layer.Expect then WF.Layer:Expect(nil) end
+      Finish(now, "The layer did not change.", false)
+    end
     return
   end
-  if mine and mine ~= request.from then return Finish(now, "You joined the fight.", true) end
-  -- Still unread after JUMP_TIMEOUT s: wait longer before leaving the pair.
-  local limit = mine and JUMP_TIMEOUT or JUMP_TIMEOUT_UNREAD
-  if now - request.joinedAt >= limit then
-    self.timeouts = self.timeouts + 1
-    Finish(now, mine and "The layer did not change." or "You left the group.", false)
+  if not InGroup() or now >= math.max(request.movedAt + LEAVE_AFTER_MOVE, request.joinedAt + LEAVE_MIN) then
+    Finish(now, "You joined the fight.", true)
+  end
+end
+
+-- The game moved us: the move a jump waits for, and one of the hour's moves.
+function LayerJump:OnTransfer(now)
+  if (phase == "invited" or phase == "jumping") and request and not request.movedAt and InGroup() then
+    request.movedAt = now
+  end
+  if InGroup() and not movedInGroup then
+    movedInGroup = true
+    NoteMove()
   end
 end
 
@@ -459,6 +544,11 @@ if WF.RegisterEvent then
   WF.RegisterEvent("PLAYER_REGEN_DISABLED", function() inCombat = true end)
   WF.RegisterEvent("PLAYER_REGEN_ENABLED", function() inCombat = false; lastCombatEnd = Now() end)
   WF.RegisterEvent("PARTY_INVITE_REQUEST", function(_, name) LayerJump:OnInvite(name) end)
+  -- Count the game's moves of this character: the first transfer in each group.
+  WF.RegisterEvent("SHARD_TRANSFER", function() LayerJump:OnTransfer(Now()) end)
+  WF.RegisterEvent("GROUP_ROSTER_UPDATE", function()
+    if not InGroup() then movedInGroup = false end
+  end)
 end
 
 if CreateFrame then

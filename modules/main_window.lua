@@ -11,8 +11,7 @@ Window.JOURNAL_WIDTH = 58
 -- widgets once and fills them once per second while shown, from the modules
 -- that own the data. A local view: it sends nothing itself; a recruitment
 -- goes through WF.Army, a confirmed pledge through WF.Garrison, a scout or a
--- confirmed attack through WF.Scout:Launch or WF.Attack:Launch. The classic
--- text window stays available as a backup (modules/main_window_classic.lua).
+-- confirmed attack through WF.Scout:Launch or WF.Attack:Launch.
 local NAME = "WarfrontMainWindow"
 local WIDTH = 640
 local HEIGHT = 560
@@ -1064,21 +1063,35 @@ local function Ornament(frame, name, scale, point, x, y, level)
   return image
 end
 
--- True below level 5: the server refuses channel chat, the player takes no
--- part in the conquest and the maps show nothing (decision 0039).
+-- True below level 5 (decision 0039) or while nobody can hear us (decision
+-- 0141): the player takes no part in the conquest and the maps show nothing.
 function Window.Locked()
   return WF.Capture and WF.Capture.CanTalk and not WF.Capture:CanTalk() and true or false
 end
 
+-- True when the lock is the isolation one (decision 0141), not the level.
+function Window.Connecting()
+  local capture = WF.Capture
+  return capture and type(capture.LockKind) == "function" and capture:LockKind() == "isolated" or false
+end
+
 function Window.LockTitle()
+  if Window.Connecting() then return "Connecting to Warfront" end
   return "Reach level " .. LOCK_LEVEL .. " to join the conquest"
 end
 
 function Window.LockSummary()
+  if Window.Connecting() then return "Connecting..." end
   return "Level " .. LOCK_LEVEL .. " required"
 end
 
 function Window.LockText()
+  if Window.Connecting() then
+    return "Until you are connected you cannot capture, gather, send scouts or attack, and the"
+      .. " world map and minimap show no conquest places.\n\n"
+      .. "Click anywhere in the game or press Connect at the bottom. If it takes long, update"
+      .. " Warfront, then restart the game."
+  end
   local ok, level = pcall(GetGlobal("UnitLevel") or function() return nil end, "player")
   local yours = ok and type(level) == "number" and level > 0 and (" You are level " .. level .. ".") or ""
   return "Warfront opens at level " .. LOCK_LEVEL .. "; before that, what it would show"
@@ -1101,10 +1114,27 @@ function Window:ShowLock()
     frame.text = NewText(frame, "GameFontHighlight", 48, -160, CONTENT_WIDTH - 96, "CENTER")
     frame.text:SetHeight(200)
     frame.text:SetJustifyV("TOP")
+    -- Turning arrow above the title while connecting (decision 0141).
+    local spinner = GetGlobal("CreateFrame")("Frame", nil, frame)
+    spinner:SetWidth(32)
+    spinner:SetHeight(32)
+    Place(spinner, frame, math.floor((CONTENT_WIDTH - 32) / 2), -76)
+    local arrow = spinner:CreateTexture(nil, "ARTWORK")
+    arrow:SetAllPoints(spinner)
+    arrow:SetTexture("Interface\\AddOns\\Warfront\\media\\Textures\\UI\\LoadingArrow")
+    local angle = 0
+    spinner:SetScript("OnUpdate", function(_, elapsed)
+      if type(arrow.SetRotation) ~= "function" then return end
+      angle = (angle - (elapsed or 0) * 4) % (2 * math.pi)
+      arrow:SetRotation(angle)
+    end)
+    spinner:Hide()
+    frame.spinner = spinner
     self.lock = frame
   end
   SetText(self.lock.title, Paint("GOLD", Window.LockTitle()))
   SetText(self.lock.text, Window.LockText())
+  Show(self.lock.spinner, Window.Connecting())
   if not self.lock:IsShown() then self.lock:Show() end
 end
 
@@ -1198,6 +1228,8 @@ function Window:Build()
     GameTooltip:SetOwner(button, "ANCHOR_TOP")
     GameTooltip:AddLine("Connect", 1, 1, 1)
     GameTooltip:AddLine("You are not connected to Warfront. Click to connect and see the war live with the other players.", 0.8, 0.8, 0.8, 1)
+    GameTooltip:AddLine(" ")
+    GameTooltip:AddLine("Still not connecting? Update Warfront, then restart the game.", 1, 0.82, 0, 1)
     Window.LocalizeTooltip(GameTooltip)
     GameTooltip:Show()
   end)
@@ -1309,9 +1341,11 @@ function Window:Refresh()
   end
   if not tab then return end
   local offline = self:RefreshConnect(now)
-  -- Below level 5 every tab but the Guide shows the level notice instead.
+  -- Below level 5 every tab but the Guide, Journal, Scoreboard and Players
+  -- shows the level notice instead; the last two only read (decision 0039).
   local levelLocked = Window.Locked()
   local locked = levelLocked and tab.key ~= "guide" and tab.key ~= "journal"
+    and not ((tab.key == "ranks" or tab.key == "players") and not Window.Connecting())
   if self.frontToggle then
     Show(self.frontToggle, not levelLocked and WF.Front and WF.Front:HasRoutes())
     -- Hidden while locked or without routes; reopens once available again.

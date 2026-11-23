@@ -122,7 +122,7 @@ end }
 
 P.joining = { title = "Taking part", build = function()
   return {
-    "- Normal and PvP rulesets.",
+    "- Normal, PvP, RP and RP-PvP rulesets.",
     "- Level 5 or higher.",
     "- PvP flag on to capture and gather ({professions} need none).",
     "# Counted in a place",
@@ -141,14 +141,12 @@ P.window = { title = "The Warfront window", build = function()
     "- Scoreboard: {scoreboard|rankings}.",
     "- Players: Warfront players around you.",
     "- Right drawer: your Active Front objective. Bottom drawer: {news}.",
-    "",
-    "/wf classic: text-only window.",
   }
 end }
 
 P.commands = { title = "Slash commands", build = function()
   return {
-    "- /wf: window. /wf help: this list. /wf classic: text window.",
+    "- /wf: window. /wf help: this list.",
     "- /wf welcome: the welcome window.",
     "- /wf tab: reopen the Warfront chat tab.",
     "- /wf where: your place and {layers|layer}.",

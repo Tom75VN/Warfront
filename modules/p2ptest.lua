@@ -1138,6 +1138,17 @@ function P2P.JoinChannelFromUI()
   return nil, openError
 end
 
+-- Click-driven automatic join (decision 0140, modules/channel_autojoin.lua):
+-- the same direct call as Connect, without joinAttemptAt, so a blocked result
+-- is left to the caller and never opens the chat box or marks Connect.
+function P2P.JoinChannelAuto()
+  if P2P.ChannelJoined() then return "joined" end
+  local joined, joinError = JoinDiagnosticChannel(DEFAULT_CUSTOM_CHANNEL, true)
+  if joined then return "joining" end
+  WF.RecordError("channel auto join", joinError)
+  return nil, joinError
+end
+
 local function OnJoinBlocked(_, source)
   if not joinAttemptAt then return end
   local secret = WF.Compat.Global("issecretvalue")
@@ -2070,7 +2081,6 @@ end
 -- WarfrontDev addon (/wfd, decision 0115), never in Warfront's own commands.
 local function PrintHelp()
   WF.Print("/wf or /wf ui (open or close the Warfront window); /wf help (this list)")
-  WF.Print("/wf classic (open or close the classic text window)")
   WF.Print("/wf welcome (show the welcome window again)")
   WF.Print("/wf tab (reopen the Warfront chat tab after closing it)")
   WF.Print("/wf where (your position and the place you stand in)")
@@ -2187,14 +2197,6 @@ local function SlashCommand(message)
       return
     end
     WF.MainWindow:Toggle()
-    return
-  end
-  if string.lower(scope) == "classic" then
-    if not WF.ClassicWindow or not WF.ClassicWindow.Toggle then
-      WF.Print("the classic Warfront window is unavailable (restart the client after an update)")
-      return
-    end
-    WF.ClassicWindow:Toggle()
     return
   end
   if string.lower(scope) == "welcome" then

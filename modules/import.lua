@@ -74,7 +74,7 @@ local SPEC = {
     generatedAt = Int(U32 - 1),
     catalogVersion = Int(U32 - 1),
     wf = Int(1000),
-    scope = Id(6, "^%u+$"),
+    scope = Id(6, "^%u[%u%d]*$"),
     region = REGION,
     char = CHAR,
     campaigns = {
@@ -140,6 +140,12 @@ local SPEC = {
       winner = Id(1, "^[HA%-]$"), h = Int(512), a = Int(512), captures = Int(1000000000),
       set = { kind = "string", optional = true, max = 64, pattern = "^[%w_.%-]+$" },
       rev = { kind = "int", optional = true, max = 999999 },
+    } } },
+    -- Decision 0144: the latest cloud captures of the import's campaign, for the
+    -- Journal only (WF.importCaptures); never capture or campaign input (R16).
+    captures = { kind = "list", optional = true, max = 50, value = { kind = "record", fields = {
+      p = ID, g = Int(MAX_GENERATION), o = Id(1, "^[HA]$"), f = Id(1, "^[HAN%-]$"),
+      t = Id(1, "^[WC]$"), a = Int(U32 - 1),
     } } },
     check = Int(U32 - 1),
     -- Optional latest released addon version from the Worker (decision 0108),
@@ -537,6 +543,14 @@ function Import:Validate(raw)
       seen[key] = true
     end
   end
+  if raw.captures then
+    local seen = {}
+    for _, row in ipairs(raw.captures) do
+      local key = row.p .. ":" .. row.g
+      if row.g < 1 or row.a > raw.generatedAt or row.o == row.f or seen[key] then return nil, "invalid import.captures" end
+      seen[key] = true
+    end
+  end
   if raw.campaign and (raw.campaign.n < 1 or raw.campaign.s < 1) then return nil, "invalid import.campaign" end
   if raw.release and not (WF.Version and WF.Version.Valid(raw.release.v)) then
     return nil, "invalid import.release"
@@ -642,6 +656,8 @@ local function MergeInto(into, data)
   elseif into.campaignHistory then
     into.campaignHistoryAt = archiveAt
   end
+  -- Cloud captures (decision 0144): the later import's list, like the scoreboard.
+  if data.captures and (not into.captures or data.generatedAt >= into.generatedAt) then into.captures = Copy(data.captures) end
   into.scoreboard = Copy(data.scoreboard)
   into.pvp, into.ranks = Copy(data.pvp), Copy(data.ranks)
   into.importId, into.generatedAt, into.catalogVersion = data.importId, data.generatedAt, data.catalogVersion
@@ -665,6 +681,11 @@ local function Rebuild(self)
   end
   -- Latest released addon version, trusted alone (decision 0108).
   if WF.Version and WF.Version.FromImport then WF.Version:FromImport() end
+  -- Missed captures for the Journal, display only (decision 0144).
+  if WF.CaptureHUD and WF.CaptureHUD.OnCloudCaptures and self.data and self.data.captures then
+    local ok, err = pcall(WF.CaptureHUD.OnCloudCaptures, WF.CaptureHUD, self.data.captures)
+    if not ok and WF.RecordError then WF.RecordError("cloud captures", err) end
+  end
 end
 
 local MAX_FRESH = 64

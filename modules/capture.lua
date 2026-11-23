@@ -212,6 +212,10 @@ Capture.FACTION_NAMES = FACTION_NAMES
 -- share anything, so it takes no part in any capture (decision 0039).
 local MIN_CHANNEL_LEVEL = 5
 Capture.LEVEL_REASON = "reach level " .. MIN_CHANNEL_LEVEL .. " to take part"
+-- Nobody hears an isolated client (decision 0141): it takes no part either,
+-- from load until first reached, then after this many seconds unreached.
+Capture.ISOLATED_REASON = "wait until you are connected to Warfront"
+Capture.ISOLATION_GRACE = 60
 
 local function GetGlobal(name)
   if WF.Compat and WF.Compat.Global then return WF.Compat.Global(name) end
@@ -1783,13 +1787,43 @@ end
 
 local function AlwaysTrue() return true end
 
+-- True while nobody can hear us (decision 0141): no channel, no Warfront group
+-- mate or guild peer heard (Transport:Reached), since load or for longer than
+-- ISOLATION_GRACE. A reached result is kept 1 s; an isolated one is read again
+-- at every call so a join unlocks at once. No transport or an error: not
+-- isolated (unknown does not block, like the level).
+function Capture:Isolated(now)
+  now = now or Now()
+  local at = self.reachCheckAt
+  if at and not self.isolated and now >= at and now - at < 1 then return false end
+  local transport = WF.Transport
+  if not transport or type(transport.Reached) ~= "function" then
+    self.isolated = false
+    return false
+  end
+  local ok, reached = pcall(transport.Reached, transport, now)
+  self.reachCheckAt = now
+  if not ok then
+    self.isolated = false
+    return false
+  end
+  if reached then self.reachedAt = now end
+  local last = self.reachedAt
+  self.isolated = not reached and (not last or now - last > self.ISOLATION_GRACE)
+  return self.isolated
+end
+
 -- False below level 5 (an unknown level, no API or 0 while loading, does not
--- block). The legacy companion is optional on Forever. Second result: why.
+-- block) or while isolated (decision 0141). The legacy companion is optional
+-- on Forever. Second result: why; third: "level" or "isolated".
 -- Local only: it gates what this client sends, never how a message is accepted.
 function Capture:CanTalk()
   local ok, level = Call("UnitLevel", "player")
   if ok and type(level) == "number" and level > 0 and level < MIN_CHANNEL_LEVEL then
     return false, self.LEVEL_REASON, "level"
+  end
+  if self:Isolated() then
+    return false, self.ISOLATED_REASON, "isolated"
   end
   return true
 end
@@ -1800,7 +1834,7 @@ function Capture:LockReason()
   return reason
 end
 
--- "level" or nil.
+-- "level", "isolated" or nil.
 function Capture:LockKind()
   local _, _, kind = self:CanTalk()
   return kind
@@ -1809,7 +1843,7 @@ end
 -- True for a reason set by CanTalk (the HUD shows it as a hard block).
 function Capture:IsLockReason(reason)
   if reason == nil then return false end
-  if reason == self.LEVEL_REASON then return true end
+  if reason == self.LEVEL_REASON or reason == self.ISOLATED_REASON then return true end
   return false
 end
 

@@ -45,6 +45,7 @@ local BOARDS = {
     },
     sorts = { confirmed = "confirmed", points = "points" },
     default = "confirmed",
+    fallback = "points",
   },
   pvp = {
     title = "PvP",
@@ -275,10 +276,17 @@ end
 --          faction, columns, own }.
 function Scoreboard:View(period, who, boardKey, sortKey)
   local board = BOARDS[boardKey] or BOARDS.territory
-  sortKey = board.sorts[sortKey] and sortKey or board.default
+  local data = self:Period(period)
+  if not board.sorts[sortKey] then
+    sortKey = board.default
+    -- 2026-11-23 (user): until witnessed captures exist, an empty default
+    -- ranking falls back to the claimed one; a chosen sort is kept as is.
+    local side = board.fallback and data and data[who]
+    local list = type(side) == "table" and side[board.sorts[sortKey]] or nil
+    if board.fallback and (type(list) ~= "table" or #list == 0) then sortKey = board.fallback end
+  end
   local listKey = board.sorts[sortKey]
   local rankKey = sortKey
-  local data = self:Period(period)
   local view = { board = board, boardKey = boardKey, sortKey = sortKey, rankKey = rankKey, rows = {} }
   view.empty = data == nil
   view.updated = WF.Import and WF.Import.Age and WF.Import:Age() or nil

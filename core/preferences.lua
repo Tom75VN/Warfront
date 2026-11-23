@@ -71,7 +71,6 @@ end
 function Preferences:Apply(key)
   if key == "uiScale" then
     if WF.MainWindow and WF.MainWindow.FitScale then WF.MainWindow:FitScale() end
-    if WF.ClassicWindow and WF.ClassicWindow.ApplyScale then WF.ClassicWindow:ApplyScale() end
     if WF.CaptureHUD and WF.CaptureHUD.ApplyScale then WF.CaptureHUD:ApplyScale() end
     if WF.Allies and WF.Allies.ApplyScale then WF.Allies:ApplyScale() end
     if WF.Welcome and WF.Welcome.ApplyScale then WF.Welcome:ApplyScale() end

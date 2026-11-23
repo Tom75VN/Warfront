@@ -5,10 +5,11 @@ local WF = Warfront
 WF.Ruleset = WF.Ruleset or {}
 local Ruleset = WF.Ruleset
 
--- Ruleset scope (decision 0072) and map (decision 0120). The scope, PVP or
--- NORMAL, is chosen by the client's game-mode record
+-- Ruleset scope (decisions 0072 and 0143) and map (decision 0120). The scope is
+-- chosen by the client's game-mode record
 -- (C_GameRules.GetCurrentGameModeRecordID(), measured 14 = PvP and
--- 15 = Normal/PvE on 2026-11-07); any other record (RP, RP-PvP, Hardcore,
+-- 15 = Normal/PvE on 2026-11-07, 16 = RP and 18 = RP-PvP on 2026-11-23): PVP,
+-- NORMAL, then R<record> for every later ruleset. Any other record (Hardcore,
 -- unknown) disables Warfront with one notice. Shared gameplay is partitioned by
 -- map: the scope and the commercial region (GetCurrentRegion()). While the
 -- region is unknown the scope stays unresolved: nothing is written, sent or
@@ -29,14 +30,17 @@ local Ruleset = WF.Ruleset
 
 local SCHEMA = 2
 local LEGACY_SCHEMA = 1
-local RECORDS = { [14] = "PVP", [15] = "NORMAL" }
+local RECORDS = { [14] = "PVP", [15] = "NORMAL", [16] = "R16", [18] = "R18" }
+local SCOPES = {}
+for _, scope in pairs(RECORDS) do SCOPES[scope] = true end
 local MAX_REGION = 1000
 local MAX_TEXT = 48
 
 Ruleset.SCHEMA = SCHEMA
 Ruleset.LEGACY_SCHEMA = LEGACY_SCHEMA
 Ruleset.RECORDS = RECORDS
-Ruleset.NOTICE = "Warfront is available only on the Normal and PvP rulesets."
+Ruleset.SCOPES = SCOPES
+Ruleset.NOTICE = "Warfront is available only on the Normal, PvP, RP and RP-PvP rulesets."
 Ruleset.scope = nil
 Ruleset.region = nil
 Ruleset.copyFailed = false
@@ -96,7 +100,7 @@ end
 
 -- The bucket key of a map: "<region>:<SCOPE>" (decision 0120), nil without both.
 function Ruleset.BucketKey(scope, region)
-  if scope ~= "PVP" and scope ~= "NORMAL" then return nil end
+  if type(scope) ~= "string" or not SCOPES[scope] then return nil end
   region = Whole(region, 1, MAX_REGION)
   if not region then return nil end
   return string.format("%d:%s", region, scope)

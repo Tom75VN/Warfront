@@ -41,6 +41,13 @@ local Players = {
   -- Saved realm memory (decision 0138): WarfrontDB.realmRulesets, at most this
   -- many "<region>:<GUID server>" entries.
   MAX_REALMS = 256,
+  -- Realm-free name -> ruleset label heard this session from the sender's own
+  -- lines (decision 0139 § 6); display only, never saved.
+  heard = {},
+  heardCount = 0,
+  -- The first release whose bare campaign field proves record 14: 0.1.1 sent
+  -- the bare field on every ruleset.
+  MARKER_VERSION = "0.1.2",
   ownRemembered = false,
   me = nil,
   count = 0,
@@ -142,8 +149,9 @@ local GUID_TABLES = {
   },
   REGION = { EU = "EU" },
   RULESET = { PvP = "PvP", RPPvP = "RP-PvP" },
-  -- Our ruleset scope (decision 0072: record 14 = PvP, 15 = Normal) -> label.
-  SCOPE = { PVP = "PvP", NORMAL = "PvE" },
+  -- Our ruleset scope (decisions 0072, 0143: record 14 = PvP, 15 = Normal,
+  -- 16 = RP, 18 = RP-PvP) -> label.
+  SCOPE = { PVP = "PvP", NORMAL = "PvE", R16 = "RP", R18 = "RP-PvP" },
 }
 
 local function GuidServer(guid)
@@ -174,7 +182,7 @@ local function MemberRealm(realm, server)
   return nil
 end
 
--- Our resolved ruleset scope ("PVP", "NORMAL"), or nil.
+-- Our resolved ruleset scope ("PVP", "NORMAL", "R16", "R18"), or nil.
 local function OwnScope()
   local ruleset = WF.Ruleset
   if type(ruleset) ~= "table" or type(ruleset.Scope) ~= "function" then return nil end
@@ -254,6 +262,48 @@ function Players:RealmRuleset(server)
   return type(entry) == "table" and GUID_TABLES.SCOPE[entry.s or ""] or nil
 end
 
+-- Heard rulesets (decision 0139 § 6) --------------------------------------
+-- Every line names its sender's game-mode record in the campaign header field,
+-- presence lines included: labelling a sender costs no byte. The field is not
+-- signed, so the label is display only: never saved, never in the realm
+-- memory, and every other source wins. Any record is read; it is labelled
+-- once Ruleset.RECORDS gives it a scope and GUID_TABLES.SCOPE a label (a
+-- ruleset where Warfront stays off sends nothing).
+
+-- Notes the ruleset of `sender` (the event sender) from a line it sent with
+-- addon `version` and header `field`. A marked field names its record from any
+-- version; a bare one proves record 14 only from MARKER_VERSION on. Returns
+-- true when a label is held.
+function Players:NoteLine(sender, version, field)
+  local names, campaign, ruleset = WF.Names, WF.Campaign, WF.Ruleset
+  if not names or type(campaign) ~= "table" or type(campaign.FieldRecord) ~= "function"
+      or type(ruleset) ~= "table" or type(ruleset.ScopeOf) ~= "function" then return false end
+  if type(sender) ~= "string" or IsSecret(sender) or type(field) ~= "string" then return false end
+  local chatName = names.Split(sender)
+  if not names.Valid(chatName) or chatName == MyName() then return false end
+  local record = campaign.FieldRecord(field)
+  local label = record ~= nil and GUID_TABLES.SCOPE[ruleset.ScopeOf(record) or ""] or nil
+  if not label then return false end
+  local _, dots = string.gsub(field, "%.", "")
+  if dots < 3 then
+    local compare = WF.Version and WF.Version.Compare
+    local order = type(compare) == "function" and compare(version, self.MARKER_VERSION) or nil
+    if not order or order < 0 then return false end
+  end
+  local heard = self.heard
+  if heard[chatName] == label then return true end
+  if not heard[chatName] then
+    if self.heardCount >= self.MAX_NAMES * 2 then
+      heard, self.heardCount = {}, 0
+      self.heard = heard
+    end
+    self.heardCount = self.heardCount + 1
+  end
+  heard[chatName] = label
+  self.dirty = true
+  return true
+end
+
 -- Our own character's realm, once per session as soon as the ruleset resolves.
 function Players:RememberOwn()
   if self.ownRemembered then return end
@@ -267,6 +317,24 @@ local function OwnRegion()
   local name = type(context) == "table" and context.regionName
   if type(name) ~= "string" or IsSecret(name) then return nil end
   return GUID_TABLES.REGION[name]
+end
+
+-- Gives a heard label (Players:NoteLine) to every listed name no other source
+-- labels; a channel member or a guild, group or nearby player shares our
+-- region, a Battle.net friend may not.
+function Players:ApplyHeard(names, info, tags, me)
+  local split = WF.Names and WF.Names.Split
+  if type(split) ~= "function" or not next(self.heard) then return end
+  for i = 1, #names do
+    local name = names[i]
+    local label = name ~= me and self.heard[split(name) or ""] or nil
+    local entry = info[name]
+    if label and not (entry and entry.ruleset) then
+      local region = entry and entry.region or (tags[name] ~= "friend" and OwnRegion() or nil)
+      info[name] = { faction = entry and entry.faction or nil, region = region, ruleset = label,
+        guid = entry and entry.guid or nil }
+    end
+  end
 end
 
 -- The cached entry of a roster GUID, or nil while the client cannot name it yet.
@@ -287,7 +355,7 @@ function Players:GuidInfo(guid, now, name)
   local ok, _, _, _, race, _, _, realm = pcall(read, guid)
   if not ok or IsSecret(race) then return cached end
   realm = MemberRealm(realm, server)
-  local entry = { faction = type(race) == "string" and GUID_TABLES.FACTION[race] or nil }
+  local entry = { faction = type(race) == "string" and GUID_TABLES.FACTION[race] or nil, guid = guid }
   if realm then
     local _, _, region, ruleset = string.find(string.gsub(realm, "%s", ""), "^CAMWOW(%u%u)%d+Realm%d+(%a+)$")
     entry.region = region and GUID_TABLES.REGION[region] or nil
@@ -315,6 +383,25 @@ function Players:GuidInfo(guid, now, name)
   end
   self.guidInfo[guid] = entry
   return entry
+end
+
+-- The class and level of a listed player, read live from its roster GUID, so a
+-- level gained this session shows (knowledge base, Chat channels, 2026-11-23:
+-- the level is the 8th value, also for a member far away). Returns the
+-- localized class, its file token and the level, each nil when unknown; nil
+-- for a name without a roster GUID (group, guild, friend or near only).
+function Players:Details(name)
+  local entry = type(name) == "string" and self.info[name] or nil
+  local guid = type(entry) == "table" and entry.guid or nil
+  local read = GetGlobal("GetPlayerInfoByGUID")
+  if type(guid) ~= "string" or type(read) ~= "function" then return nil end
+  local ok, class, classFile, _, _, _, _, _, level = pcall(read, guid)
+  if not ok or IsSecret(class) or IsSecret(classFile) or IsSecret(level) then return nil end
+  if type(class) ~= "string" or class == "" then class = nil end
+  if type(classFile) ~= "string" or classFile == "" then classFile = nil end
+  if type(level) ~= "number" or level < 1 or level ~= math.floor(level) then level = nil end
+  if not class and not level then return nil end
+  return class, classFile, level
 end
 
 -- True when a signed proof puts this roster name in our ruleset scope: a
@@ -391,6 +478,7 @@ function Players:Read(now)
   if not self:Joined() then
     self.displayIndex = nil
     if me and #names > 0 then names[#names + 1] = me end
+    self:ApplyHeard(names, info, tags, me)
     table.sort(names, function(a, b) return string.lower(a) < string.lower(b) end)
     self.count = #names
     self.updatedAt = #names > 0 and now or self.updatedAt
@@ -425,6 +513,7 @@ function Players:Read(now)
   end
   -- Entries the server has not sent yet: read again shortly.
   if missing then self.dirty = true end
+  self:ApplyHeard(names, info, tags, me)
   table.sort(names, function(a, b) return string.lower(a) < string.lower(b) end)
   self.count = #names
   self.updatedAt = now

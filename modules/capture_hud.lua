@@ -292,6 +292,10 @@ function HUD:Build()
     end)
     if self.jump.SetFrameLevel and frame.GetFrameLevel then self.jump:SetFrameLevel(frame:GetFrameLevel() + 4) end
     self.jump:Hide()
+    -- Beside the button: the layer changes used this hour against the game's limit.
+    self.jumpCount = self.jump:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    self.jumpCount:SetPoint("LEFT", self.jump, "RIGHT", 6, 0)
+    if self.jumpCount.SetJustifyH then self.jumpCount:SetJustifyH("LEFT") end
   end
 
   local bar = create("Frame", nil, frame)
@@ -927,6 +931,10 @@ function HUD:Update()
   if self.jump then
     if jump and not self.collapsed and WF.Skin then
       WF.Skin:SetButton(self.jump, jump.button, jump.enabled)
+      if self.jumpCount then
+        local count = WF.L and WF.L("%d/%d this hour", jump.moves or 0, jump.cap or 0) or ""
+        if (self.jumpCount:GetText() or "") ~= count then self.jumpCount:SetText(count) end
+      end
       SetShown(self.jump, true)
     else
       SetShown(self.jump, false)
@@ -1067,13 +1075,21 @@ function HUD:OnCaptureEvent(kind, id, side, previousOwner)
     WF.Alerts:Push("captures", "The " .. FactionName(side) .. " is attacking " .. where .. "!",
       { title = "Enemy capture at " .. AreaName(area) .. "!", side = side, sound = true })
   elseif kind == "CAPTURED" then
-    local text = "The " .. FactionName(side) .. " captured " .. where .. "."
+    local verb = previousOwner == "N" and " captured the neutral place " or " captured "
+    local text = "The " .. FactionName(side) .. verb .. where .. "."
     local mine = Capture:MyFaction()
     local titles = CAPTURE_TITLES[area.type]
+    -- The same key as a cloud capture of this generation (decision 0144): listed once.
+    local generation = Capture.captured and Capture.captured[id]
+    local key = generation and (id .. ":" .. generation) or nil
     if side == mine then
-      WF.Alerts:Push("captures", text, { title = titles and titles[1] or "Territory captured", side = side, historyTitle = true })
+      WF.Alerts:Push("captures", text, { title = titles and titles[1] or "Territory captured", side = side, historyTitle = true, key = key })
     elseif previousOwner == mine then
-      WF.Alerts:Push("captures", text, { title = titles and titles[2] or "Territory lost", side = side, sound = true, historyTitle = true })
+      WF.Alerts:Push("captures", text, { title = titles and titles[2] or "Territory lost", side = side, sound = true, historyTitle = true, key = key })
+    elseif previousOwner == "N" then
+      -- Enemy capture of a neutral place: Journal and chat, no banner (2026-11-23).
+      if WF.AlertHistory then WF.AlertHistory:Add("captures", text, side, nil, key) end
+      if WF.Print then WF.Print(text) end
     elseif WF.Print then
       WF.Print(text)
     end
@@ -1082,6 +1098,34 @@ end
 
 if Capture then
   Capture:OnEvent(function(kind, id, side, previousOwner) HUD:OnCaptureEvent(kind, id, side, previousOwner) end)
+end
+
+-- Cloud captures of the validated import (decision 0144): Journal only, at the
+-- time the cloud learned them, with the live text and titles; never capture
+-- state, never a banner, sound or chat line. A claimed row is marked unconfirmed.
+function HUD:OnCloudCaptures(rows)
+  local history = WF.AlertHistory
+  if type(rows) ~= "table" or not history then return 0 end
+  if WF.Campaign and not WF.Campaign:CloudAllowed(WF.Import and WF.Import.data) then return 0 end
+  local mine = Capture and Capture:MyFaction()
+  if not mine then return 0 end
+  local added = 0
+  for index = #rows, 1, -1 do
+    local row = rows[index]
+    local area = type(row) == "table" and Capture:Capturable(row.p)
+    local key = area and (row.p .. ":" .. row.g)
+    if area and row.f ~= row.o and not history:Has(key) then
+      local verb = row.f == "N" and " captured the neutral place " or " captured "
+      local text = "The " .. FactionName(row.o) .. verb .. AreaName(area) .. " (" .. tostring(area.map) .. ")."
+      local titles = CAPTURE_TITLES[area.type]
+      local title = row.o == mine and (titles and titles[1] or "Territory captured")
+        or row.f == mine and (titles and titles[2] or "Territory lost") or nil
+      if row.t == "C" then title = "Reported, not confirmed" end
+      history:Add("captures", text, row.o, title, key, row.a)
+      added = added + 1
+    end
+  end
+  return added
 end
 
 local create = GetGlobal("CreateFrame")
