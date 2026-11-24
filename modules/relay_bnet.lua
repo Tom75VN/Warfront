@@ -13,6 +13,7 @@ local BN_PACKET = Kit.BN_PACKET
 local BULK = Kit.BULK
 local BattleNetReady = Kit.BattleNetReady
 local Candidate = Kit.Candidate
+local CanTakePresence = Kit.CanTakePresence
 local CheckAcks = Kit.CheckAcks
 local DropLink = Kit.DropLink
 local Enqueue = Kit.Enqueue
@@ -67,16 +68,32 @@ local candidates = {}     -- gameAccountID -> character name, from the last scan
 local scan
 local nextScanAt, lastScanAt
 local nextSlowAt, nextTickAt = 0, 0
+-- gameAccountID -> { at, record }: a bare ask of another ruleset we answered
+-- (decision 0148 § 1); its reply or summary then proves the far client.
+local presenceAsked = {}
 
 -- Battle.net game data -------------------------------------------------------------
+
+-- A bare ask of another ruleset without a link: answered, never linked. An old
+-- client only ever sends such asks to another ruleset, so it never holds a
+-- presence slot; an updated one proves itself by its reply or keepalive, or by
+-- a summary after our answer (decision 0148 § 1).
+local function AnswerPresenceAsk(account, record, now)
+  local asked = presenceAsked[account.id]
+  if asked and now - asked.at < K.REPLY_GAP then return true end
+  if not CanTakePresence() then return Reject("presence full") end
+  presenceAsked[account.id] = { at = now, record = record }
+  SendHello(account.id, "R", now)
+  Relay.presenceAsks = (Relay.presenceAsks or 0) + 1
+  return true
+end
 
 local function OnHello(account, rest, now)
   local flag, faction, record, version = strMatch(rest, "^([ARK]):([AH]):(%d+):([%d%.]+)$")
   if not flag then return Reject("hello format") end
   if faction ~= account.faction then return Reject("hello mismatch") end
-  -- Another ruleset never links (decision 0112); a link that changes ruleset
-  -- mid-session is dropped.
-  if #record > 10 or tonumber(record) ~= MyRecord() then
+  local theirs, mine = tonumber(record), MyRecord()
+  if #record > 10 or not theirs or not mine then
     if links[account.id] then DropLink(account.id, "ruleset") end
     return Reject("hello ruleset")
   end
@@ -84,9 +101,17 @@ local function OnHello(account, rest, now)
   if #version > 16 or (versions and versions.Valid and not versions.Valid(version)) then
     return Reject("hello version")
   end
-  local link = UpsertLink(account, now)
+  -- Another ruleset links for the online players list only (decision 0148
+  -- § 1, amending 0112 § 3); a ruleset change mid-session switches the mode.
+  local presence = theirs ~= mine
+  if presence and not links[account.id] and flag == "A" then return AnswerPresenceAsk(account, theirs, now) end
+  local link = UpsertLink(account, now, presence)
   if not link then return Reject("links full") end
+  presenceAsked[account.id] = nil
   link.version = version
+  -- An ask on a live link: the far client started again and holds nothing of
+  -- ours, so our summary goes again soon (modules/far_players.lua).
+  if flag == "A" then link.askedAt = now end
   link.received = link.received + 1
   Relay.hellosHeard = Relay.hellosHeard + 1
   if versions and versions.Note then pcall(versions.Note, versions, version, K.LEVEL, link.name) end
@@ -133,6 +158,67 @@ local function OnBridgePacket(account, rest, now, campaign)
   return Accept(packet, LinkIdentity(link), "B", account.id, now)
 end
 
+-- The online players summary of a link (decision 0148 § 2): any link, game or
+-- presence. modules/far_players.lua parses it; nothing here reaches gameplay.
+local function OnPresence(account, rest, now)
+  local link = links[account.id]
+  if not link then
+    -- A summary right after our answer to its ask proves the far client.
+    local asked, mine = presenceAsked[account.id], MyRecord()
+    if not asked or now - asked.at > K.LINK_TTL or not mine or asked.record == mine then
+      return Reject("presence unlinked")
+    end
+    link = UpsertLink(account, now, true)
+    if not link then return Reject("links full") end
+    presenceAsked[account.id] = nil
+  end
+  link.name, link.lastHeard = account.name, now
+  link.received = link.received + 1
+  local far = WF.FarPlayers
+  if not far or type(far.OnSummary) ~= "function" then return Reject("far players") end
+  local ok, result = pcall(far.OnSummary, far, account.id, account.faction, rest, now)
+  if not ok then
+    if WF.RecordError then WF.RecordError("relay presence", result) end
+    return false
+  end
+  if not result then return Reject("presence format") end
+  return true
+end
+
+-- Live links of either mode for the summary: { id, faction, askedAt }, by id.
+function Relay:PresenceTargets(now)
+  now = now or Now()
+  local list = {}
+  if not status.sendable then return list end
+  for id, link in pairs(links) do
+    if LinkAlive(link, now) then list[#list + 1] = { id = id, faction = link.faction, askedAt = link.askedAt } end
+  end
+  table.sort(list, function(a, b) return a.id < b.id end)
+  return list
+end
+
+-- True while link `id` lives, in either mode.
+function Relay:LinkLive(id, now)
+  local link = links[id]
+  return link ~= nil and LinkAlive(link, now or Now())
+end
+
+-- One summary part for link `id`, in the presence lane: a newer part of the
+-- same index replaces a queued one; the shared budget paces it.
+function Relay:SendPresence(id, part, body, now)
+  now = now or Now()
+  if not status.sendable or type(body) ~= "string" or not IsPrintableBody(body) then return false end
+  local link = links[id]
+  if not link or not LinkAlive(link, now) then return false end
+  local payload = Header("P") .. body
+  if #payload > K.WIRE_MAX then
+    self.oversize = self.oversize + 1
+    return false
+  end
+  return Enqueue({ lane = "presence", target = id, payload = payload, bytes = #payload, anyLink = true,
+    coalesce = "presence:" .. id .. ":" .. tostring(part) }, now)
+end
+
 -- Owner catch-up with our links (decision 0081 § 1) ------------------------------
 -- Battle.net names the link's character (Candidate), so its D digest and O
 -- owner lines need no relayed origin: modules/catchup.lua counts each answer
@@ -144,7 +230,7 @@ function Relay:CatchupLinks(now)
   local list = {}
   if not status.sendable then return list end
   for id, link in pairs(links) do
-    if LinkAlive(link, now) then
+    if LinkAlive(link, now) and not link.presence then
       list[#list + 1] = { id = id, identity = LinkIdentity(link), firstAt = link.firstAt }
     end
   end
@@ -173,7 +259,8 @@ end
 -- waits, the shared budget is full and nothing slows the relay; it takes no
 -- budget, and a refusal stops the board lane for 10 minutes without slowing
 -- the relay. Never queued, never relayed further.
-local BOARD_IDS = { BD = true, BQ = true, BP = true, AM = true }
+-- SR: the link partner's own scoreboard row (decision 0146), same lane.
+local BOARD_IDS = { BD = true, BQ = true, BP = true, AM = true, SR = true }
 Relay.boardSent, Relay.boardRefused, Relay.boardIn, Relay.boardBackoffUntil = 0, 0, 0, 0
 
 function Relay:BoardLinks(now)
@@ -181,7 +268,7 @@ function Relay:BoardLinks(now)
   local out = {}
   if not status.sendable then return out end
   for id, link in pairs(links) do
-    if LinkAlive(link, now) then out[#out + 1] = id end
+    if LinkAlive(link, now) and not link.presence then out[#out + 1] = id end
   end
   return out
 end
@@ -191,7 +278,8 @@ function Relay:SendBoard(id, boardId, body, now)
   if not BOARD_IDS[boardId] or type(body) ~= "string" or not status.sendable or Lockdown() then return false end
   if now < self.boardBackoffUntil or Queued() > 0 then return false end
   local link = links[id]
-  if not link or not LinkAlive(link, now) then return false end
+  -- A presence link carries only hellos and summaries (decision 0148 § 1).
+  if not link or link.presence or not LinkAlive(link, now) then return false end
   Refill(now)
   if bucket.slowUntil or bucket.tokens < K.BUDGET_BURST then return false end
   local payload = Header("W") .. boardId .. "," .. body
@@ -239,7 +327,10 @@ function Relay:OnGameData(prefix, text, channel, senderID)
   end
   local now = Now()
   if not Allow(linkBytes, senderID, now, #text) then return Reject("link rate") end
+  local held = links[senderID]
+  if held and held.presence and kind ~= "H" and kind ~= "P" then return Reject("presence link") end
   if kind == "H" then return OnHello(account, rest, now) end
+  if kind == "P" then return OnPresence(account, rest, now) end
   if kind == "R" then return OnBridgePacket(account, rest, now, campaign) end
   if kind == "A" then return OnAck(account, rest, now) end
   if kind == "Z" then
@@ -277,7 +368,17 @@ function Relay:OnGameData(prefix, text, channel, senderID)
     link.lastHeard = now
     link.received = link.received + 1
     self.boardIn = self.boardIn + 1
-    if boardId == "AM" and not CampaignOk(boardId, campaign) then return false end
+    if (boardId == "AM" or boardId == "SR") and not CampaignOk(boardId, campaign) then return false end
+    if boardId == "SR" then
+      local rows = WF.ScoreRows
+      if not rows or type(rows.OnLine) ~= "function" then return Reject("score rows") end
+      local okRows, taken = pcall(rows.OnLine, rows, data, LinkIdentity(link))
+      if not okRows then
+        if WF.RecordError then WF.RecordError("relay score row", taken) end
+        return false
+      end
+      return taken
+    end
     local boards = boardId == "AM" and WF.AlliesMesh or WF.Boards
     if not boards or type(boards.OnLine) ~= "function" then return Reject("boards") end
     local ok, result = pcall(boards.OnLine, boards, boardId, data, LinkIdentity(link), "L:" .. tostring(senderID), now)
@@ -439,8 +540,11 @@ local function SlowTick(now)
       DropLink(id, "silent")
     else
       if status.sendable and now - link.lastSentAt >= K.KEEPALIVE then SendHello(id, "K", now) end
-      if status.sendable then BULK.Probe(id, link, now) end
+      if status.sendable and not link.presence then BULK.Probe(id, link, now) end
     end
+  end
+  for id, asked in pairs(presenceAsked) do
+    if now - asked.at > K.LINK_TTL then presenceAsked[id] = nil end
   end
   PruneHolders(now)
   PurgeSeen(now)
@@ -487,13 +591,15 @@ function Relay:PrintStatus()
     .. " candidates=" .. CountKeys(candidates) .. " other bridges=" .. HolderCount())
   for _, link in pairs(links) do
     print("relay: link " .. link.name .. " (" .. link.faction .. ", " .. tostring(link.version or "?")
+      .. (link.presence and ", presence" or "")
       .. ") heard " .. mathFloor(now - link.lastHeard) .. "s ago, sent=" .. link.sent .. " received=" .. link.received
       .. " bulk=" .. (link.bulk == true and "yes" or (link.bulk == false and "no" or "?")))
   end
   print("relay: bulk probes=" .. self.probesSent .. "/" .. self.probesAnswered .. " sent=" .. self.bulkSent
     .. " parts=" .. self.bulkParts .. " in=" .. self.bulkIn)
   print("relay: queue control=" .. #lanes.control .. " critical=" .. #lanes.critical .. " state=" .. #lanes.state
-    .. " routine=" .. #lanes.routine .. " catchup=" .. #lanes.catchup .. " aged=" .. (Relay.agedServed or 0)
+    .. " routine=" .. #lanes.routine .. " catchup=" .. #lanes.catchup .. " presence=" .. #lanes.presence
+    .. " held=" .. (Relay.presenceHeld or 0) .. " aged=" .. (Relay.agedServed or 0)
     .. " acks=" .. AckCount() .. " rebroadcast=" .. #rebroadcast
     .. " budget=" .. mathFloor(bucket.tokens) .. "/" .. K.BUDGET_BURST .. " (" .. K.BUDGET_RATE .. " B/s)"
     .. ((bucket.slowUntil and now < bucket.slowUntil)

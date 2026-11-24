@@ -37,6 +37,7 @@ function History:Initialize()
         store.entries[#store.entries + 1] = {
           category = entry.category, text = entry.text, at = entry.at, read = entry.read == true,
           side = (entry.side == "A" or entry.side == "H") and entry.side or nil, k = entry.k,
+          e = entry.e == true or nil,
         }
       end
     end
@@ -71,8 +72,10 @@ function History:Has(key)
   return false
 end
 
--- at: the event's own time when it is not now (a cloud capture); key: see Has.
-function History:Add(category, text, side, title, key, at)
+-- at: the event's own time when it is not now (a cloud capture); key: see Has;
+-- estimated: the date is when this client learned of the event (a missed
+-- capture, decision 0149 § 1), until Redate gives the real one.
+function History:Add(category, text, side, title, key, at, estimated)
   if self.loaded then self:Initialize() end
   if self:Has(key) then return end
   text = WF.L and WF.L(text) or text
@@ -80,6 +83,7 @@ function History:Add(category, text, side, title, key, at)
   local now = WF.Epoch()
   local entry = { category = category, text = text, at = math.min(type(at) == "number" and at or now, now), read = false, k = key }
   entry.side = (side == "A" or side == "H") and side or nil
+  entry.e = key and estimated and true or nil
   if not Valid(entry) then return end
   if not self.store then
     self.pending[#self.pending + 1] = entry
@@ -87,6 +91,29 @@ function History:Add(category, text, side, title, key, at)
     return
   end
   self:Insert(entry)
+end
+
+-- The real date of an entry listed with an estimated one (decision 0149 § 3):
+-- the entry keeps its text and read state and moves to its place by date.
+function History:Redate(key, at)
+  if self.loaded then self:Initialize() end
+  if not key or type(at) ~= "number" or at ~= at or at < 0 then return false end
+  local at2 = math.min(at, WF.Epoch())
+  local list = self.store and self.store.entries or self.pending
+  for index, entry in ipairs(list) do
+    if entry.k == key then
+      if not entry.e then return false end
+      entry.at, entry.e = at2, nil
+      if self.store then
+        table.remove(list, index)
+        self:Insert(entry)
+      else
+        self.revision = self.revision + 1
+      end
+      return true
+    end
+  end
+  return false
 end
 
 function History:Entries()

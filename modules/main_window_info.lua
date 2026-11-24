@@ -574,7 +574,11 @@ local ONLINE_FOOTER = 30
 local ONLINE_TAGS = { near = "(near you)", group = "(group)", guild = "(guild)", friend = "(friend)" }
 -- A cell: faction emblem (the map's front emblems), name, then region and
 -- ruleset at the right edge, dropped when the name needs the room.
-Online.CELL = { ICON = 12, NAME_X = 22, PAD = 6, GAP = 4 }
+-- The emblem (user, 2026-11-24) fills the cell between its borders: cropped
+-- to the ink of both 64 x 64 emblems (CROP = left, right, top, bottom px),
+-- ICON_H tall and centred on ICON_X, where the first 12-unit emblem sat, so
+-- the name keeps its place.
+Online.CELL = { ICON_H = 18, ICON_X = 12, CROP = { 11, 53, 6, 58 }, NAME_X = 22, PAD = 6, GAP = 4 }
 Online.FACTION_ICONS = {
   Alliance = "Interface\\AddOns\\Warfront\\media\\Textures\\UI\\Front\\FactionAlliance",
   Horde = "Interface\\AddOns\\Warfront\\media\\Textures\\UI\\Front\\FactionHorde",
@@ -614,9 +618,11 @@ function Online:Build()
       row.cellHover = true
       row.icons = row.icons or {}
       local icon = box:CreateTexture(nil, "OVERLAY")
-      icon:SetWidth(layout.ICON)
-      icon:SetHeight(layout.ICON)
-      Place(icon, box, layout.PAD, -4)
+      local crop = layout.CROP
+      local width = layout.ICON_H * (crop[2] - crop[1]) / (crop[4] - crop[3])
+      icon:SetWidth(width)
+      icon:SetHeight(layout.ICON_H)
+      Place(icon, box, layout.ICON_X - width / 2, -(20 - layout.ICON_H) / 2)
       icon:Hide()
       row.icons[column] = icon
       row.cells[column] = NewText(box, "GameFontHighlightSmall", layout.NAME_X, -4, self.nameRoom)
@@ -660,13 +666,16 @@ function Online:Build()
   end)
   spinner:Hide()
   self.spinner = spinner
-  self.updated = NewText(self.frame, "GameFontHighlightSmall", 6, -(height + 9), CONTENT_WIDTH - 260)
+  self.updated = NewText(self.frame, "GameFontHighlightSmall", 6, -(height + 9), CONTENT_WIDTH - 392)
   self.refresh = NewButton(self.frame, "dark", 100, 24, "Refresh", Window.RefreshPlayers)
   Place(self.refresh, self.frame, CONTENT_WIDTH - 100, -(height + 4))
   self.allies = NewButton(self.frame, "dark", 128, 24, "Allies", function()
     if WF.Allies then WF.Allies:Command("") end
   end)
   Place(self.allies, self.frame, CONTENT_WIDTH - 234, -(height + 4))
+  -- The Group Finder page (decision 0145), left of Allies.
+  self.groups = NewButton(self.frame, "dark", 128, 24, "Group Finder", function() Window:ToggleHidden("groups") end)
+  Place(self.groups, self.frame, CONTENT_WIDTH - 366, -(height + 4))
   -- Same short tooltip as the Synchronization panel button; the skin's own
   -- hover scripts keep running (wrapped).
   local skinEnter, skinLeave = self.allies:GetScript("OnEnter"), self.allies:GetScript("OnLeave")
@@ -749,8 +758,9 @@ function Online:Update(now)
       local icon = row.icons[column]
       local path = info and info.faction and self.FACTION_ICONS[info.faction] or nil
       if path then
+        local crop = self.CELL.CROP
         icon:SetTexture(path)
-        icon:SetTexCoord(0, 1, 0, 1)
+        icon:SetTexCoord(crop[1] / 64, crop[2] / 64, crop[3] / 64, crop[4] / 64)
         icon:Show()
       else
         icon:Hide()

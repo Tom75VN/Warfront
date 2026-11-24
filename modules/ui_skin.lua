@@ -679,9 +679,22 @@ function Skin:Panel(parent, title, width, height)
   return panel
 end
 
--- A row background (three-slice) across `frame`.
+-- A row background (three-slice) across `frame`. The art (72 px tall) has a
+-- 1-pixel bottom edge that vanishes once shrunk to a list row's height, so
+-- the edge is redrawn as one unit in the colour of the art's top edge,
+-- starting where the art's corners do (12 px in from each side).
 function Skin:RowBackground(frame, height)
-  return self:Slice3(frame, "row", height, "BACKGROUND")
+  local slice = self:Slice3(frame, "row", height, "BACKGROUND")
+  local piece = self:Piece("row")
+  local inset = piece and 12 * height / piece.h or 3
+  local edge = frame:CreateTexture(nil, "BORDER")
+  edge:SetTexture("Interface\\Buttons\\WHITE8X8")
+  edge:SetVertexColor(80 / 255, 87 / 255, 85 / 255, 1)
+  edge:SetHeight(1)
+  edge:SetPoint("BOTTOMLEFT", frame, "BOTTOMLEFT", inset, 0)
+  edge:SetPoint("BOTTOMRIGHT", frame, "BOTTOMRIGHT", -inset, 0)
+  slice.edge = edge
+  return slice
 end
 
 -- The faint white band of every other list row (the scoreboard's, 2026-11-15),

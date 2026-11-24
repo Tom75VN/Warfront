@@ -57,6 +57,9 @@ K.MAX_NAME_BYTES = 48
 -- Links and discovery -------------------------------------------------------------
 
 K.MAX_LINKS = 6
+-- Presence links (decision 0148 § 1): a friend of another ruleset links only
+-- to exchange the online players list, in a free slot, at most this many.
+K.MAX_PRESENCE_LINKS = 2
 K.LINK_TTL = 300
 K.KEEPALIVE = 120
 -- An unanswered hello waits HELLO.first, then twice as long each time, up to
@@ -82,10 +85,11 @@ K.BUDGET_BURST = 1200
 -- bucket.slowFor seconds (decision 0077 § 3); a new refusal extends it.
 K.QUEUE_MAX = 64
 K.MAX_SENDS_PER_PUMP = 8
--- "catchup": owner catch-up with links (decision 0081 § 1), always last.
-local LANE_ORDER = { "control", "critical", "state", "routine", "catchup" }
+-- "catchup": owner catch-up with links (decision 0081 § 1); "presence": the
+-- online players summary (decision 0148 § 2), always last, never aged forward.
+local LANE_ORDER = { "control", "critical", "state", "routine", "catchup", "presence" }
 local LANE_OF_CLASS = { C = "critical", S = "state", N = "routine" }
-local TTL_OF_LANE = { control = 30, critical = 120, state = 30, routine = 60, catchup = 120 }
+local TTL_OF_LANE = { control = 30, critical = 120, state = 30, routine = 60, catchup = 120, presence = 60 }
 K.ACK_TIMEOUT = 5
 K.MAX_RETRIES = 2
 K.MAX_ACKS = 64
@@ -141,7 +145,7 @@ local linkCount = 0
 local hello = { at = {}, wait = {} }
 local holders = {}        -- elect name -> { links, at, expireAt } from B lines
 local holderCount = 0
-local lanes = { control = {}, critical = {}, state = {}, routine = {}, catchup = {} }
+local lanes = { control = {}, critical = {}, state = {}, routine = {}, catchup = {}, presence = {} }
 local queued = 0
 local coalesceIndex = {}  -- coalescing key -> queued item
 local acks = {}           -- dedup key -> pending acknowledgement
@@ -199,8 +203,9 @@ local function MyRealmID()
   end
   if type(UnitGUID) ~= "function" then return nil end
   local ok, guid = pcall(UnitGUID, "player")
-  if not ok or type(guid) ~= "string" or IsSecret(guid) then return nil end
-  return RealmIDValue(tonumber(strMatch(guid, "^Player%-(%d+)%-") or ""))
+  local names = WF.Names
+  if not ok or type(names) ~= "table" or type(names.GuidRealm) ~= "function" then return nil end
+  return RealmIDValue(names.GuidRealm(guid))
 end
 
 -- Our game-mode record (decision 0072: 14 = PvP, 15 = Normal), or nil while the
@@ -567,12 +572,27 @@ local function LinkAlive(link, now)
   return now - link.lastHeard <= K.LINK_TTL
 end
 
+-- Game links only: a presence link (decision 0148 § 1) never bridges.
 local function LiveLinkCount(now)
   local count = 0
   for _, link in pairs(links) do
-    if LinkAlive(link, now) then count = count + 1 end
+    if LinkAlive(link, now) and not link.presence then count = count + 1 end
   end
   return count
+end
+
+local function PresenceCount()
+  local count = 0
+  for _, link in pairs(links) do
+    if link.presence then count = count + 1 end
+  end
+  return count
+end
+
+-- True when a new presence link would get a slot (UpsertLink's rule): a free
+-- presence place and a free link slot.
+local function CanTakePresence()
+  return PresenceCount() < K.MAX_PRESENCE_LINKS and linkCount < K.MAX_LINKS
 end
 
 local function DropLink(id, reason)
@@ -580,6 +600,12 @@ local function DropLink(id, reason)
   links[id] = nil
   linkCount = linkCount - 1
   if reason then Reject("link " .. reason) end
+  -- Its online players leave the Players tab at once (decision 0148 § 2).
+  local far = WF.FarPlayers
+  if far and type(far.OnLinkDropped) == "function" then
+    local ok, err = pcall(far.OnLinkDropped, far, id)
+    if not ok and WF.RecordError then WF.RecordError("far players drop", err) end
+  end
 end
 
 -- Server facts about a Battle.net game account: an opposite-faction WoW
@@ -651,24 +677,47 @@ local function ResolveAccount(id)
   return account
 end
 
-local function UpsertLink(account, now)
+-- `presence`: the hello named another ruleset (decision 0148 § 1). A presence
+-- link only takes a free slot; a game link pushes the stalest presence link out
+-- first, so gameplay never loses a slot to presence.
+local function UpsertLink(account, now, presence)
+  presence = presence == true
   local link = links[account.id]
   if link then
     link.name, link.faction, link.lastHeard = account.name, account.faction, now
+    if link.presence ~= presence then
+      if presence and PresenceCount() >= K.MAX_PRESENCE_LINKS then
+        DropLink(account.id, "presence full")
+        return nil
+      end
+      -- Packets already queued for it are held back by Pump; a new game link
+      -- measures its size again.
+      link.presence, link.bulk, link.probeNonce, link.probeAt = presence, nil, nil, nil
+    end
     return link
   end
+  if presence and PresenceCount() >= K.MAX_PRESENCE_LINKS then return nil end
   if linkCount >= K.MAX_LINKS then
-    local stalestId, stalest
+    if presence then return nil end
+    local stalestId, stalest, presenceId, presenceLink
     for id, other in pairs(links) do
-      if not stalest or other.lastHeard < stalest.lastHeard then stalestId, stalest = id, other end
+      if other.presence then
+        if not presenceLink or other.lastHeard < presenceLink.lastHeard then presenceId, presenceLink = id, other end
+      elseif not stalest or other.lastHeard < stalest.lastHeard then
+        stalestId, stalest = id, other
+      end
     end
-    if not stalest or now - stalest.lastHeard <= K.KEEPALIVE then return nil end
-    DropLink(stalestId, "replaced")
+    if presenceId then
+      DropLink(presenceId, "replaced")
+    else
+      if not stalest or now - stalest.lastHeard <= K.KEEPALIVE then return nil end
+      DropLink(stalestId, "replaced")
+    end
   end
   link = {
     id = account.id, name = account.name, faction = account.faction,
     firstAt = now, lastHeard = now, lastSentAt = now, repliedAt = nil,
-    sent = 0, received = 0,
+    sent = 0, received = 0, presence = presence,
   }
   links[account.id] = link
   linkCount = linkCount + 1
@@ -680,7 +729,7 @@ end
 local function PickLinks(electKey, count, exclude, now)
   local list = {}
   for id, link in pairs(links) do
-    if LinkAlive(link, now) and not (exclude and exclude[id]) then
+    if LinkAlive(link, now) and not link.presence and not (exclude and exclude[id]) then
       list[#list + 1] = { id = id, name = link.name, score = Score(electKey, link.name) }
     end
   end
@@ -720,11 +769,12 @@ end
 -- What a new packet may push out of a full queue, oldest first: never a lane
 -- worth more than its own; control packets (hellos, acks) are never pushed out.
 local EVICTABLE = {
-  catchup = { "catchup" },
-  routine = { "catchup", "routine" },
-  state = { "catchup", "routine", "state" },
-  critical = { "catchup", "routine", "state", "critical" },
-  control = { "catchup", "routine", "state", "critical" },
+  presence = { "presence" },
+  catchup = { "presence", "catchup" },
+  routine = { "presence", "catchup", "routine" },
+  state = { "presence", "catchup", "routine", "state" },
+  critical = { "presence", "catchup", "routine", "state", "critical" },
+  control = { "presence", "catchup", "routine", "state", "critical" },
 }
 
 local function MakeRoom(item)
@@ -848,7 +898,7 @@ local function Front(now)
     if head then
       if not first then
         first, firstName = head, name
-      elseif i > 2 and now - (head.queuedAt or now) >= BULK.AGED.WAIT
+      elseif i > 2 and name ~= "presence" and now - (head.queuedAt or now) >= BULK.AGED.WAIT
           and (not aged or head.queuedAt < aged.queuedAt) then
         aged, agedName = head, name
       end
@@ -936,7 +986,13 @@ local function Pump(now)
     local item, laneName = Front(now)
     if not item then return end
     local target = BULK.Targets(item, now)
-    if not target then
+    local held = target and links[target] and links[target].presence and not item.anyLink
+    if held then
+      -- A presence link carries only hellos and summaries (decision 0148 § 1).
+      Relay.presenceHeld = (Relay.presenceHeld or 0) + 1
+      item.nextTarget = item.nextTarget + 1
+      if item.nextTarget > #item.targets then FinishItem(item, laneName, now) end
+    elseif not target then
       if (item.sentCopies or 0) == 0 then Relay.noLink = Relay.noLink + 1 end
       FinishItem(item, laneName, now)
     else
@@ -989,7 +1045,9 @@ local function SendHello(id, flag, now)
   local faction, record = MyFaction(), MyRecord()
   if not faction or not record then return false end
   local payload = Header("H") .. flag .. ":" .. faction .. ":" .. record .. ":" .. tostring(WF.version)
-  if not QueueControl(id, payload, now) then return false end
+  if not Enqueue({ lane = "control", target = id, payload = payload, bytes = #payload, anyLink = true }, now) then
+    return false
+  end
   Relay.hellosSent = Relay.hellosSent + 1
   local link = links[id]
   if link then link.lastSentAt = now end
@@ -1563,6 +1621,9 @@ Relay.Kit = {
   BULK = BULK,
   BattleNetReady = BattleNetReady,
   Candidate = Candidate,
+  CanTakePresence = CanTakePresence,
+  DecodeName = DecodeName,
+  EncodeName = EncodeName,
   CheckAcks = CheckAcks,
   DropLink = DropLink,
   Enqueue = Enqueue,

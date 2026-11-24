@@ -58,7 +58,7 @@ local CHANNEL_CAPTURE_LINES = {
 }
 -- What an addressed whisper may carry (decision 0077 step 3).
 local ADDRESSED = { OD = true, OL = true, AQ = true, AL = true, SQ = true, SL = true, FQ = true, FW = true,
-  CQ = true, CL = true, LJ = true, LN = true }
+  CQ = true, CL = true, LJ = true, LN = true, GF = true }
 -- A request to join a layer and its refusal (decision 0119 step 4): accepted by
 -- whisper from any player of our faction, not only a contact, and never routed
 -- to capture.
@@ -1294,8 +1294,17 @@ function Transport:OnAddonMessage(prefix, text, chatType, sender, target, zoneCh
     local noted, noteError = pcall(players.NoteLine, players, identity, parsed.version, parsed.campaign)
     if not noted and WF.RecordError then WF.RecordError("players ruleset", noteError) end
   end
+  -- A line of our own realm settles a pending ruleset answer (decision 0147).
+  local realmAsk = WF.RealmAsk
+  if realmAsk and type(realmAsk.Heard) == "function" and chatType == "CHANNEL" then
+    local heardOk, heardError = pcall(realmAsk.Heard, realmAsk, identity)
+    if not heardOk and WF.RecordError then WF.RecordError("realm ask", heardError) end
+  end
   if chatType == "CHANNEL" then
-    if not CHANNEL_CAPTURE_LINES[parsed.id] and not GROUP_LINES[parsed.id] then return Reject("channel kind") end
+    if not CHANNEL_CAPTURE_LINES[parsed.id] and not GROUP_LINES[parsed.id] and parsed.id ~= "GF" and parsed.id ~= "SR"
+        and parsed.id ~= "RQ" and parsed.id ~= "RA" and parsed.id ~= "PW" then
+      return Reject("channel kind")
+    end
     self.channelRemote = self.channelRemote + 1
   end
   -- A line of another campaign is never applied (decision 0103 § 4b).
@@ -1307,6 +1316,79 @@ function Transport:OnAddonMessage(prefix, text, chatType, sender, target, zoneCh
   if GROUP_TYPES[chatType] and WF.LayerJump and type(WF.LayerJump.IsPartner) == "function" then
     local okPartner, isPartner = pcall(WF.LayerJump.IsPartner, WF.LayerJump, identity, now)
     if okPartner and isPartner then return Reject("jump partner") end
+  end
+  -- Group finder (decision 0145): listings on the channel and the guild,
+  -- applications and replies by whisper from anyone (whisper intake first);
+  -- outside the guild intake, never relayed, never passed to capture.
+  if parsed.id == "GF" then
+    if GROUP_TYPES[chatType] then return Reject("finder kind") end
+    if chatType == "WHISPER" and not WhisperIntake(identity, now) then return Reject("whisper intake") end
+    PurgeSeen(now)
+    if not MarkSeen(SeenKey(identity, parsed.session, parsed.sequence, parsed.id), now) then
+      self.duplicates = self.duplicates + 1
+      return false
+    end
+    if capture.AllowSender and not capture:AllowSender(identity, parsed.id, now) then return Reject("quota GF") end
+    local ticket = WF.Ticket
+    if ticket and type(ticket.Admit) == "function" and not ticket:Admit(identity, parsed.id, now, true) then return false end
+    local finder = WF.GroupFinder
+    if not finder or type(finder.OnLine) ~= "function" then return Reject("group finder") end
+    local okFinder, result = pcall(finder.OnLine, finder, parsed.data, identity, WhisperTarget(sender), chatType, now)
+    if not okFinder and WF.RecordError then WF.RecordError("group finder", result) end
+    return okFinder and result
+  end
+  -- Ruleset question and answer (decision 0147): hidden channel only, any
+  -- ruleset (Campaign ANY_RULESET); never relayed, never passed to capture.
+  if parsed.id == "RQ" or parsed.id == "RA" then
+    if chatType ~= "CHANNEL" then return Reject("realm ask kind") end
+    PurgeSeen(now)
+    if not MarkSeen(SeenKey(identity, parsed.session, parsed.sequence, parsed.id), now) then
+      self.duplicates = self.duplicates + 1
+      return false
+    end
+    if capture.AllowSender and not capture:AllowSender(identity, parsed.id, now) then return Reject("quota " .. parsed.id) end
+    local ticket = WF.Ticket
+    if ticket and type(ticket.Admit) == "function" and not ticket:Admit(identity, parsed.id, now, true) then return false end
+    if not realmAsk or type(realmAsk.OnLine) ~= "function" then return Reject("realm ask") end
+    local okAsk, result = pcall(realmAsk.OnLine, realmAsk, parsed.id, parsed.data, identity, now)
+    if not okAsk and WF.RecordError then WF.RecordError("realm ask", result) end
+    return okAsk and result
+  end
+  -- The other side's online players (decision 0148): hidden channel only, any
+  -- ruleset (Campaign ANY_RULESET); display only, never relayed, never passed on.
+  if parsed.id == "PW" then
+    if chatType ~= "CHANNEL" then return Reject("far players kind") end
+    PurgeSeen(now)
+    if not MarkSeen(SeenKey(identity, parsed.session, parsed.sequence, parsed.id), now) then
+      self.duplicates = self.duplicates + 1
+      return false
+    end
+    if capture.AllowSender and not capture:AllowSender(identity, parsed.id, now) then return Reject("quota PW") end
+    local ticket = WF.Ticket
+    if ticket and type(ticket.Admit) == "function" and not ticket:Admit(identity, parsed.id, now, true) then return false end
+    local far = WF.FarPlayers
+    if not far or type(far.OnLine) ~= "function" then return Reject("far players") end
+    local okFar, result = pcall(far.OnLine, far, parsed.data, identity, now)
+    if not okFar and WF.RecordError then WF.RecordError("far players", result) end
+    return okFar and result
+  end
+  -- Scoreboard rows (decision 0146): each player's own row, on the channel
+  -- and the guild only; never relayed, never passed to capture.
+  if parsed.id == "SR" then
+    if chatType ~= "CHANNEL" and chatType ~= "GUILD" then return Reject("score row kind") end
+    PurgeSeen(now)
+    if not MarkSeen(SeenKey(identity, parsed.session, parsed.sequence, parsed.id), now) then
+      self.duplicates = self.duplicates + 1
+      return false
+    end
+    if capture.AllowSender and not capture:AllowSender(identity, parsed.id, now) then return Reject("quota SR") end
+    local ticket = WF.Ticket
+    if ticket and type(ticket.Admit) == "function" and not ticket:Admit(identity, parsed.id, now, true) then return false end
+    local rows = WF.ScoreRows
+    if not rows or type(rows.OnLine) ~= "function" then return Reject("score rows") end
+    local okRows, result = pcall(rows.OnLine, rows, parsed.data, identity)
+    if not okRows and WF.RecordError then WF.RecordError("score rows", result) end
+    return okRows and result
   end
   -- Board copies (decision 0110): group and guild only, outside the guild
   -- intake and its ceiling, never relayed, never passed to capture.
@@ -1592,9 +1674,10 @@ end
 -- line waits anywhere (decision 0110 § 3). False when it did not leave now;
 -- the caller tries again later. A refusal backs the board lane off alone.
 function Transport:SendBoard(audience, id, body)
-  if not BOARD_LINES[id] or type(body) ~= "string" then return false end
+  if not (BOARD_LINES[id] or id == "GF" or id == "SR") or type(body) ~= "string" then return false end
   local now = Now()
   if type(audience) == "string" and strSub(audience, 1, 2) == "L:" then
+    if id == "GF" then return false end
     -- A Battle.net link: only when the gate and the guild are idle too.
     local relay, queue = WF.Relay, WF.SendQueue
     local linkId = tonumber(strSub(audience, 3))
@@ -1623,8 +1706,8 @@ function Transport:SendBoard(audience, id, body)
     self.oversize = self.oversize + 1
     return false
   end
-  local ok, _, attempted = queue:SendIdle({ fn = AddonCall, n = target and 4 or 3, a1 = PREFIX, a2 = line, a3 = chatType, a4 = target, accounted = id == "AM" }, BOARD_QUIET)
-  if attempted and id == "AM" then TakeAddonToken(now) end
+  local ok, _, attempted = queue:SendIdle({ fn = AddonCall, n = target and 4 or 3, a1 = PREFIX, a2 = line, a3 = chatType, a4 = target, accounted = id == "AM" or id == "GF" or id == "SR" }, BOARD_QUIET)
+  if attempted and (id == "AM" or id == "GF" or id == "SR") then TakeAddonToken(now) end
   if ok then
     self.boardSent = self.boardSent + 1
   elseif attempted then
@@ -1632,6 +1715,83 @@ function Transport:SendBoard(audience, id, body)
     self.boardBackoffUntil = now + BOARD_BACKOFF
   end
   return ok == true
+end
+
+-- A group finder listing or close (decision 0145): one hidden-channel copy
+-- once the lane is confirmed, replaceable per listing. True when it was queued.
+function Transport:SendFinder(body, key)
+  if type(body) ~= "string" or not Usable() then return false end
+  local storage = WF.Storage
+  local session = MySession()
+  local sequence = storage and type(storage.NextSequence) == "function" and storage:NextSequence() or nil
+  if not session or not sequence then return false end
+  local line = Wire("GF", session, sequence, body)
+  if not line or #line > MAX_BYTES then
+    self.oversize = self.oversize + 1
+    return false
+  end
+  return SubmitChannel(line, key and ("gf:" .. key) or nil)
+end
+
+-- Its guild copy, by the idle board lane: false until it left.
+function Transport:SendFinderGuild(body)
+  if not InGuild() then return true end
+  return self:SendBoard("GUILD", "GF", body)
+end
+
+-- Our own scoreboard row (decision 0146): one hidden-channel copy once the
+-- lane is confirmed, replaceable. True when it was queued.
+function Transport:SendScoreRow(body)
+  if type(body) ~= "string" or not Usable() then return false end
+  local storage = WF.Storage
+  local session = MySession()
+  local sequence = storage and type(storage.NextSequence) == "function" and storage:NextSequence() or nil
+  if not session or not sequence then return false end
+  local line = Wire("SR", session, sequence, body)
+  if not line or #line > MAX_BYTES then
+    self.oversize = self.oversize + 1
+    return false
+  end
+  return SubmitChannel(line, "sr")
+end
+
+-- The ruleset question or its answer (decision 0147): one hidden-channel copy
+-- once the lane is confirmed, replaceable. True when it was queued.
+function Transport:SendRealmAsk(id, body)
+  if (id ~= "RQ" and id ~= "RA") or type(body) ~= "string" or not Usable() then return false end
+  local storage = WF.Storage
+  local session = MySession()
+  local sequence = storage and type(storage.NextSequence) == "function" and storage:NextSequence() or nil
+  if not session or not sequence then return false end
+  local line = Wire(id, session, sequence, body)
+  if not line or #line > MAX_BYTES then
+    self.oversize = self.oversize + 1
+    return false
+  end
+  return SubmitChannel(line, id == "RQ" and "rq" or "ra")
+end
+
+-- One part of the other side's online players (decision 0148): one
+-- hidden-channel copy once the lane is confirmed, a newer part of the same
+-- index replacing a queued one. True when it was queued.
+function Transport:SendFarPlayers(part, body)
+  if type(body) ~= "string" or type(part) ~= "number" or not Usable() then return false end
+  local storage = WF.Storage
+  local session = MySession()
+  local sequence = storage and type(storage.NextSequence) == "function" and storage:NextSequence() or nil
+  if not session or not sequence then return false end
+  local line = Wire("PW", session, sequence, body)
+  if not line or #line > MAX_BYTES then
+    self.oversize = self.oversize + 1
+    return false
+  end
+  return SubmitChannel(line, "pw:" .. part)
+end
+
+-- Its guild copy, by the idle board lane: false until it left.
+function Transport:SendScoreRowGuild(body)
+  if not InGuild() then return true end
+  return self:SendBoard("GUILD", "SR", body)
 end
 
 local function CountKeys(map)

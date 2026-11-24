@@ -270,6 +270,68 @@ local function SameOwn(a, b)
     and a.plus == b.plus and a.share == b.share and SameSource(a.stats, b.stats)
 end
 
+-- Rows heard from other players (decision 0146), merged into a current
+-- Players board: a heard row replaces the imported one of the same player
+-- when its counters add up to more. Confirmed stays the Worker's alone.
+-- Cached per board list, heard revision and region.
+local heardCache = {}
+local function Total(source)
+  local total = 0
+  for index = 1, #STAT_KEYS do
+    local key = STAT_KEYS[index]
+    if key ~= "conf" then total = total + Num(source[key]) end
+  end
+  return total
+end
+
+local function WithHeard(list, listKey, rankKey, region)
+  local heard = WF.ScoreRows
+  if listKey == "confirmed" or not heard or type(heard.Rows) ~= "function" then return list end
+  local rows = heard:Rows()
+  if #rows == 0 then return list end
+  local cached = heardCache[listKey]
+  if cached and cached.list == list and cached.revision == heard.revision and cached.region == region then
+    return cached.merged
+  end
+  local byKey, merged = {}, {}
+  if type(list) == "table" then
+    for index = 1, #list do
+      local source = list[index]
+      merged[#merged + 1] = source
+      if source.char and source.region == region then byKey[source.char] = #merged end
+    end
+  end
+  for index = 1, #rows do
+    local row = rows[index]
+    local copy = { char = row.char, region = region, faction = row.faction, class = row.class, race = row.race }
+    for f = 1, #STAT_KEYS do
+      local key = STAT_KEYS[f]
+      if key ~= "conf" then copy[key] = row[key] end
+    end
+    local at = byKey[row.char]
+    local columns = Scoreboard.Columns(copy)
+    local shown
+    if listKey == "pvp" then shown = columns.kills + columns.deaths > 0 else shown = (columns[rankKey] or 0) > 0 end
+    if at then
+      if Total(copy) > Total(merged[at]) then
+        copy.conf = merged[at].conf
+        merged[at] = copy
+      end
+    elseif shown then
+      merged[#merged + 1] = copy
+    end
+  end
+  local value = {}
+  for index = 1, #merged do value[merged[index]] = Scoreboard.Columns(merged[index])[rankKey] or 0 end
+  table.sort(merged, function(a, b)
+    if value[a] ~= value[b] then return value[a] > value[b] end
+    return tostring(a.char) < tostring(b.char)
+  end)
+  while #merged > TOP do table.remove(merged) end
+  heardCache[listKey] = { list = list, revision = heard.revision, region = region, merged = merged }
+  return merged
+end
+
 -- The rows of one board with the own row placed (0104 § 3, 0109 § 6):
 -- view = { board, rankKey, rows = { row... }, own = row|nil, outside, gap,
 --          plus, empty, updated }. row = { rank, name, region, class, race,
@@ -294,6 +356,10 @@ function Scoreboard:View(period, who, boardKey, sortKey)
   local side = data and data[who]
   local list = type(side) == "table" and side[listKey] or nil
   local region = Region()
+  if period ~= "history" and who == "players" then
+    list = WithHeard(list, listKey, rankKey, region)
+    if type(list) == "table" and #list > 0 then view.empty = false end
+  end
   local ownKey
   if who == "guilds" then
     ownKey = WF.WarRecord and WF.WarRecord:GuildKey() or nil

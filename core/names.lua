@@ -43,6 +43,41 @@ local function Regional()
   return ok and enabled == true
 end
 
+-- Realm ids in player GUIDs (decision 0137) ------------------------------------
+-- Measured shape (builds 70862 to 71037): "Player-<realm id>-<character>", the
+-- realm id equal to GetRealmID() while that answered. Any other shape reads as
+-- no realm, never a guess. Once GetRealmID() answers an id our own GUID
+-- contradicts, no GUID is read for the session: a format change leaves realms
+-- unknown rather than filing players under a wrong one.
+local MAX_REALM_ID = 4294967295
+local guidRealmBroken = false
+
+local function ParseGuidRealm(guid)
+  if not Plain(guid) then return nil end
+  local digits = strMatch(guid, "^Player%-([1-9]%d*)%-[^%-]")
+  if not digits or #digits > 10 then return nil end
+  local realm = tonumber(digits)
+  if not realm or realm > MAX_REALM_ID then return nil end
+  return realm
+end
+
+-- The realm id a player GUID carries, or nil.
+function Names.GuidRealm(guid)
+  if guidRealmBroken then return nil end
+  local okApi, apiRealm = Call("GetRealmID")
+  if okApi and type(apiRealm) == "number" and not IsSecret(apiRealm) and apiRealm >= 1
+    and apiRealm <= MAX_REALM_ID and apiRealm % 1 == 0 then
+    local okGuid, own = Call("UnitGUID", "player")
+    local ownRealm = okGuid and ParseGuidRealm(own) or nil
+    if not ownRealm then return nil end
+    if ownRealm ~= apiRealm then
+      guidRealmBroken = true
+      return nil
+    end
+  end
+  return ParseGuidRealm(guid)
+end
+
 function Names.Realm()
   local ok, realm = Call("GetRealmName")
   if ok and Plain(realm) then return realm end

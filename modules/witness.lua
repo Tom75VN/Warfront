@@ -70,6 +70,16 @@ local function Key(level, sender, kind, poi, generation, campaign)
 end
 
 -- The running campaign number and start (0 and nil before campaigns).
+-- The server epoch of a capture (decision 0149 § 3), nil when unknown. Local
+-- storage only (field `at`), never on the wire; the companion sends it to the
+-- cloud for display.
+local function ServerTime()
+  if type(GetServerTime) ~= "function" then return nil end
+  local ok, value = pcall(GetServerTime)
+  if not ok or type(value) ~= "number" or value < 1 or value > 4294967295 then return nil end
+  return math.floor(value)
+end
+
 local function CurrentCampaign()
   local campaign = WF.Campaign
   if not campaign or type(campaign.Current) ~= "function" then return 0, nil end
@@ -165,6 +175,7 @@ function Witness:Note(sender, kind, poi, generation, owner, participants)
     sender = sender, kind = kind, poi = poi, generation = generation, owner = owner,
     campaign = campaignNumber, campaignStart = campaignStart,
     p = kind == "CAPTURED" and Participants(participants) or nil,
+    at = kind == "CAPTURED" and ServerTime() or nil,
   })
   keys[key] = true
   while #bucket.entries > MAX_ENTRIES do

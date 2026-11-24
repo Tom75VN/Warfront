@@ -8,7 +8,7 @@
 ## Category: PvP
 ## IconTexture: Interface\AddOns\Warfront\media\Textures\UI\WarfrontMinimapIcon
 ## Author: Warfront contributors
-## Version: 0.1.3
+## Version: 0.2.0
 ## SavedVariables: WarfrontDB, WarfrontJournal
 ## SavedVariablesPerCharacter: WarfrontImport
 
@@ -34,6 +34,7 @@ data\ui_atlas.lua
 data\scoreboard_art.lua
 data\gold_alphabet.lua
 data\ticket_keys.lua
+data\changelog.lua
 modules\ui_skin.lua
 modules\area_contours.lua
 modules\map.lua
@@ -77,8 +78,10 @@ modules\main_window_territory.lua
 modules\main_window_economy.lua
 modules\main_window_war.lua
 modules\main_window_info.lua
+modules\main_window_groups.lua
 modules\main_window_journal.lua
 modules\main_window_campaigns.lua
+modules\main_window_changelog.lua
 modules\main_window_wiki.lua
 modules\main_window_drawers.lua
 modules\minimap_button.lua
@@ -89,8 +92,12 @@ modules\p2ptest.lua
 modules\channel_autojoin.lua
 modules\relay.lua
 modules\relay_bnet.lua
+modules\far_players.lua
 modules\transport.lua
 modules\layer_jump.lua
+modules\group_finder.lua
+modules\score_rows.lua
+modules\realm_ask.lua
 modules\directory.lua
 modules\nearby.lua
 modules\chain.lua

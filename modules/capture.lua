@@ -132,6 +132,16 @@ local QUOTA_BY_KIND = {
   BP = 4, BD = 2, BQ = 2,
   -- LJ, LN: a request to join a layer and its refusal (decision 0119 step 4).
   LJ = 2, LN = 4,
+  -- GF: group finder listings, applications and replies (decision 0145).
+  GF = 6,
+  -- SR: a player's own scoreboard row (decision 0146): channel and guild
+  -- copies at most once a minute.
+  SR = 4,
+  -- RQ, RA: the ruleset question for unknown realms and its answer (decision
+  -- 0147): one RQ per 5 minutes and one RA per minute per client.
+  RQ = 2, RA = 2,
+  -- PW: the other side's online players (decision 0148): one part per 2 s.
+  PW = 6,
   -- CE, CQ, CL: campaign end, its request and answers (modules/campaign.lua,
   -- decision 0103 § 4b): two CE per confirmation, one CQ a minute, CL one a
   -- second and at most 8 per request.
@@ -3227,7 +3237,7 @@ function Capture:Detail(id, view, side, now)
   local locked = WF.Front and WF.Front:LockText(id, now or Now())
   if locked then return locked end
   if FACTION_KEYS[side or ""] and side ~= view.owner and WF.Front and not WF.Front:OutpostOpen(id, side) then
-    return WF.Front:FrozenText(id, side, now or Now()) or ("Closed: not on the " .. FACTION_NAMES[side] .. " front")
+    return WF.Front:FrozenText(id, side, now or Now()) or ("Locked: the " .. FACTION_NAMES[side] .. " front is not active here")
   end
   if not FACTION_KEYS[view.owner] then return "Capture time " .. Clock(CAPTURE_DURATION) end
   local used, capacity = self:GarrisonOccupancy(id)

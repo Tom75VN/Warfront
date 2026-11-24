@@ -28,6 +28,10 @@ local Players = {
   names = {},
   -- name -> "near" | "group" | "guild" | "friend" for players known beyond the roster.
   tags = {},
+  -- name -> true for the other side's players (decision 0148, Players:ApplyFar).
+  far = {},
+  -- name -> true for the names read from our channel roster at the last read.
+  roster = {},
   -- name -> { faction, region, ruleset } read from the roster GUID; each field
   -- nil when not proven. Names without a roster GUID have no entry.
   info = {},
@@ -45,6 +49,11 @@ local Players = {
   -- lines (decision 0139 § 6); display only, never saved.
   heard = {},
   heardCount = 0,
+  -- Heard realm memory (decision 0147): WarfrontDB.heardRulesets, the scope a
+  -- heard marker named for its sender's GUID server; display only, apart from
+  -- realmRulesets. heardServers: this session's "<server>" -> scope, or false
+  -- once two senders of that server named different scopes.
+  heardServers = {},
   -- The first release whose bare campaign field proves record 14: 0.1.1 sent
   -- the bare field on every ruleset.
   MARKER_VERSION = "0.1.2",
@@ -147,6 +156,10 @@ local GUID_TABLES = {
     Human = "Alliance", Dwarf = "Alliance", NightElf = "Alliance", Gnome = "Alliance",
     Orc = "Horde", Scourge = "Horde", Tauren = "Horde", Troll = "Horde",
   },
+  -- Races whose token names both factions, told apart by race id
+  -- (C_PlayerInfo.GetRace, knowledge base, Chat channels, 2026-11-24): only
+  -- the ids measured in game; any other id stays unknown.
+  RACE_ID = { [95] = "Alliance", [96] = "Horde" },
   REGION = { EU = "EU" },
   RULESET = { PvP = "PvP", RPPvP = "RP-PvP" },
   -- Our ruleset scope (decisions 0072, 0143: record 14 = PvP, 15 = Normal,
@@ -154,10 +167,26 @@ local GUID_TABLES = {
   SCOPE = { PVP = "PvP", NORMAL = "PvE", R16 = "RP", R18 = "RP-PvP" },
 }
 
+-- The faction of a race shared by both factions (Skyborne), from the race id
+-- of the GUID; nil when the id is unknown or unreadable.
+local function RaceIdFaction(guid)
+  local info, location = GetGlobal("C_PlayerInfo"), GetGlobal("PlayerLocation")
+  local read = type(info) == "table" and info.GetRace or nil
+  local create = type(location) == "table" and location.CreateFromGUID or nil
+  if type(read) ~= "function" or type(create) ~= "function" then return nil end
+  local okLocation, where = pcall(create, location, guid)
+  if not okLocation or where == nil then return nil end
+  local ok, id = pcall(read, where)
+  if not ok or IsSecret(id) or type(id) ~= "number" then return nil end
+  return GUID_TABLES.RACE_ID[id]
+end
+
+-- The GUID server as text ("6940"), or nil (WF.Names.GuidRealm).
 local function GuidServer(guid)
-  if type(guid) ~= "string" or IsSecret(guid) then return nil end
-  local _, _, server = string.find(guid, "^Player%-(%d+)%-")
-  return server
+  local names = WF.Names
+  if type(names) ~= "table" or type(names.GuidRealm) ~= "function" then return nil end
+  local realm = names.GuidRealm(guid)
+  return realm and tostring(realm) or nil
 end
 
 -- Our own GUID server, or nil.
@@ -262,6 +291,125 @@ function Players:RealmRuleset(server)
   return type(entry) == "table" and GUID_TABLES.SCOPE[entry.s or ""] or nil
 end
 
+-- Heard realm memory (decision 0147) ---------------------------------------
+-- A heard marker also labels its sender's GUID server, read from the sender's
+-- roster GUID. Saved account-wide apart from realmRulesets: a marker is not
+-- signed, so it never enters that table and every other source wins. Two
+-- senders of one server naming different scopes remove the entry for the
+-- session: a forged line can hide a label, never set a rule.
+
+-- WarfrontDB.heardRulesets, created only to write; nil when read-only.
+local function HeardMemory(write)
+  local storage = WF.Storage
+  if type(storage) ~= "table" or type(storage.GetDB) ~= "function" then return nil end
+  if write and storage.readOnly then return nil end
+  local db = storage:GetDB()
+  if type(db) ~= "table" then return nil end
+  if type(db.heardRulesets) ~= "table" then
+    if not write then return nil end
+    db.heardRulesets = {}
+  end
+  return db.heardRulesets
+end
+
+-- Lets every cached roster entry of `server` without a ruleset read again now.
+local function Unfreeze(self, server)
+  for _, entry in pairs(self.guidInfo) do
+    if type(entry) == "table" and entry.server == server and not entry.ruleset then entry.retryAt = 0 end
+  end
+  self.dirty = true
+end
+
+-- Remembers the scope a heard marker named for a GUID server other than ours.
+-- Returns true when the memory holds that scope for it.
+function Players:RememberHeard(server, scope)
+  if not GUID_TABLES.SCOPE[scope or ""] or server == OwnServer() then return false end
+  local key = RealmKey(server)
+  if not key then return false end
+  local session = self.heardServers[server]
+  if session == false then return false end
+  local memory = HeardMemory(true)
+  if session and session ~= scope then
+    self.heardServers[server] = false
+    if memory then memory[key] = nil end
+    return false
+  end
+  if not session then
+    local count = 0
+    for _ in pairs(self.heardServers) do count = count + 1 end
+    if count >= self.MAX_REALMS then self.heardServers = {} end
+    self.heardServers[server] = scope
+  end
+  if not memory then return false end
+  local old = memory[key]
+  local now = WF.Epoch and WF.Epoch() or 0
+  if type(old) == "table" and old.s == scope then
+    old.t = now
+    return true
+  end
+  if type(old) ~= "table" then
+    local count, oldest = 0, nil
+    for k, entry in pairs(memory) do
+      count = count + 1
+      local t = type(entry) == "table" and tonumber(entry.t) or -1
+      if not oldest or t < oldest[2] then oldest = { k, t } end
+    end
+    if count >= self.MAX_REALMS and oldest then memory[oldest[1]] = nil end
+  end
+  memory[key] = { s = scope, t = now }
+  Unfreeze(self, server)
+  return true
+end
+
+-- The heard ruleset label of a GUID server, or nil (conflicting this session:
+-- nil).
+function Players:HeardRuleset(server)
+  if self.heardServers[server or ""] == false then return nil end
+  local key = RealmKey(server)
+  local memory = key and HeardMemory(false)
+  local entry = memory and memory[key]
+  return type(entry) == "table" and GUID_TABLES.SCOPE[entry.s or ""] or nil
+end
+
+-- Our own GUID server as text, or nil.
+function Players:OwnServer()
+  return OwnServer()
+end
+
+-- The GUID server of a listed name from its roster entry, or nil.
+function Players:ServerOf(chatName)
+  local info = self.info
+  local entry = info[chatName]
+  if type(entry) ~= "table" then
+    local split = WF.Names and WF.Names.Split
+    if type(split) ~= "function" then return nil end
+    for name, candidate in pairs(info) do
+      if split(name) == chatName then
+        entry = candidate
+        break
+      end
+    end
+  end
+  return type(entry) == "table" and entry.server or nil
+end
+
+-- Up to `max` GUID servers of listed roster members that no source labels,
+-- sorted; our own server is never listed.
+function Players:UnknownServers(max)
+  local own, seen, list = OwnServer(), {}, {}
+  for _, entry in pairs(self.info) do
+    local server = type(entry) == "table" and entry.server or nil
+    if server and server ~= own and not entry.ruleset and not seen[server]
+        and not self:RealmRuleset(server) and not self:HeardRuleset(server) then
+      seen[server] = true
+      list[#list + 1] = server
+    end
+  end
+  table.sort(list, function(a, b) return tonumber(a) < tonumber(b) end)
+  while #list > max do table.remove(list) end
+  return list
+end
+
 -- Heard rulesets (decision 0139 § 6) --------------------------------------
 -- Every line names its sender's game-mode record in the campaign header field,
 -- presence lines included: labelling a sender costs no byte. The field is not
@@ -290,6 +438,9 @@ function Players:NoteLine(sender, version, field)
     local order = type(compare) == "function" and compare(version, self.MARKER_VERSION) or nil
     if not order or order < 0 then return false end
   end
+  -- The sender's realm too (decision 0147), once the roster names its GUID.
+  local server = self:ServerOf(chatName)
+  if server then self:RememberHeard(server, ruleset.ScopeOf(record)) end
   local heard = self.heard
   if heard[chatName] == label then return true end
   if not heard[chatName] then
@@ -332,7 +483,7 @@ function Players:ApplyHeard(names, info, tags, me)
     if label and not (entry and entry.ruleset) then
       local region = entry and entry.region or (tags[name] ~= "friend" and OwnRegion() or nil)
       info[name] = { faction = entry and entry.faction or nil, region = region, ruleset = label,
-        guid = entry and entry.guid or nil }
+        guid = entry and entry.guid or nil, server = entry and entry.server or nil }
     end
   end
 end
@@ -355,7 +506,9 @@ function Players:GuidInfo(guid, now, name)
   local ok, _, _, _, race, _, _, realm = pcall(read, guid)
   if not ok or IsSecret(race) then return cached end
   realm = MemberRealm(realm, server)
-  local entry = { faction = type(race) == "string" and GUID_TABLES.FACTION[race] or nil, guid = guid }
+  local entry = { faction = type(race) == "string" and GUID_TABLES.FACTION[race] or nil, guid = guid,
+    server = server }
+  if not entry.faction and type(race) == "string" and race ~= "" then entry.faction = RaceIdFaction(guid) end
   if realm then
     local _, _, region, ruleset = string.find(string.gsub(realm, "%s", ""), "^CAMWOW(%u%u)%d+Realm%d+(%a+)$")
     entry.region = region and GUID_TABLES.REGION[region] or nil
@@ -370,7 +523,7 @@ function Players:GuidInfo(guid, now, name)
     self:RememberRealm(server, OwnScope(), false)
     entry.ruleset = GUID_TABLES.SCOPE[OwnScope() or ""]
   end
-  entry.ruleset = entry.ruleset or self:RealmRuleset(server)
+  entry.ruleset = entry.ruleset or self:RealmRuleset(server) or self:HeardRuleset(server)
   entry.region = entry.region or OwnRegion()
   entry.faction = entry.faction or (cached and cached.faction)
   if not (entry.faction or entry.region or entry.ruleset) then return cached end
@@ -447,6 +600,30 @@ local function KnownElsewhere(now)
   return found
 end
 
+-- The other side's online players (decision 0148), mixed into the list with
+-- their faction and ruleset; same region, since links and the channel stay in
+-- one region. Display only: `self.far` marks them so that nothing else (our
+-- own summary above all) takes them for players of our side.
+function Players:ApplyFar(names, info, seen, me, now)
+  local far = {}
+  self.far = far
+  local source = WF.FarPlayers
+  if type(source) ~= "table" or type(source.Entries) ~= "function" then return end
+  local ok, list = pcall(source.Entries, source, now)
+  if not ok or type(list) ~= "table" then return end
+  local region = OwnRegion()
+  for i = 1, #list do
+    local entry = list[i]
+    local name = type(entry) == "table" and entry.name or nil
+    if type(name) == "string" and name ~= me and not seen[name] and #names < self.MAX_NAMES then
+      seen[name] = true
+      names[#names + 1] = name
+      far[name] = true
+      info[name] = { faction = entry.faction, region = region, ruleset = entry.label }
+    end
+  end
+end
+
 -- Rebuilds names from the roster and the other sources. Returns true when
 -- anything was read.
 function Players:Read(now)
@@ -465,6 +642,10 @@ function Players:Read(now)
   local info = {}
   self.info = info
   local seen = {}
+  -- name -> true for the names read from our channel roster (decision 0148:
+  -- only these go into our summary for the other side).
+  local fromRoster = {}
+  self.roster = fromRoster
   local me = MyName()
   self.me = me
   local elsewhere = KnownElsewhere(now)
@@ -477,6 +658,7 @@ function Players:Read(now)
   end
   if not self:Joined() then
     self.displayIndex = nil
+    self:ApplyFar(names, info, seen, me, now)
     if me and #names > 0 then names[#names + 1] = me end
     self:ApplyHeard(names, info, tags, me)
     table.sort(names, function(a, b) return string.lower(a) < string.lower(b) end)
@@ -505,6 +687,7 @@ function Players:Read(now)
           seen[name] = true
           names[#names + 1] = name
         end
+        fromRoster[name] = true
         if not info[name] then info[name] = self:GuidInfo(guid, now, name) end
       end
       member = member + 1
@@ -513,6 +696,7 @@ function Players:Read(now)
   end
   -- Entries the server has not sent yet: read again shortly.
   if missing then self.dirty = true end
+  self:ApplyFar(names, info, seen, me, now)
   self:ApplyHeard(names, info, tags, me)
   table.sort(names, function(a, b) return string.lower(a) < string.lower(b) end)
   self.count = #names

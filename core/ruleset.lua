@@ -124,14 +124,11 @@ function Ruleset:ReadRecord()
   return record
 end
 
--- The realm id carried by the player's GUID ("Player-<id>-…"; the GUID server
--- was measured equal to GetRealmID() on 2026-11-10), or nil.
+-- The realm id carried by the player's GUID (WF.Names.GuidRealm), or nil.
 local function GuidRealm()
-  local guid = Call(Global("UnitGUID"), "player")
-  if type(guid) ~= "string" then return nil end
-  local ok, _, _, server = pcall(string.find, guid, "^Player%-(%d+)%-")
-  if not ok then return nil end
-  return Whole(tonumber(server), 1, 4294967295)
+  local names = WF.Names
+  if type(names) ~= "table" or type(names.GuidRealm) ~= "function" then return nil end
+  return Whole(names.GuidRealm(Call(Global("UnitGUID"), "player")), 1, 4294967295)
 end
 
 -- Build 71037 answers GetRealmID() = 0 and empty realm names (decision 0137):

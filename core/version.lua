@@ -11,6 +11,9 @@ local Version = {
   -- installed version reaches it, or after this long without two players
   -- showing it again (decision 0108).
   CONFIRM_SECONDS = 30 * 24 * 3600,
+  -- While a newer version is known, the chat warning repeats this often.
+  REPEAT_SECONDS = 3600,
+  repeating = false,
   -- A reply to an older announce waits 1 to 5 s and is cancelled when a peer at
   -- least as new answers first (rule R14); at most one per REPLY_GAP seconds.
   REPLY_DELAY = 1,
@@ -95,11 +98,28 @@ function Version:Notice()
   return "Addon outdated: update to " .. self.newest
 end
 
+local function PrintWarning(self)
+  if WF.Print then WF.Print("|cffff4040" .. self:Text() .. "|r") end
+end
+
+-- One chain of hourly repeats per session; it stops once nothing is newer.
+local function ScheduleRepeat(self)
+  if self.repeating or type(C_Timer) ~= "table" or type(C_Timer.After) ~= "function" then return end
+  self.repeating = true
+  C_Timer.After(self.REPEAT_SECONDS, function()
+    self.repeating = false
+    if not self.newest then return end
+    pcall(PrintWarning, self)
+    ScheduleRepeat(self)
+  end)
+end
+
 function Version:Warn()
   if not self.newest or self.warnedFor == self.newest then return end
   self.warnedFor = self.newest
-  if WF.Print then WF.Print("|cffff4040" .. self:Text() .. "|r") end
+  PrintWarning(self)
   if WF.Record then WF.Record("VERSION_OUTDATED", { newest = self.newest, level = self.newestLevel }) end
+  ScheduleRepeat(self)
 end
 
 local function Epoch()

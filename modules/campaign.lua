@@ -60,10 +60,13 @@ local MAX_VIAS = 8
 local MAX_HISTORY = 4
 local MAX_STEPS = 2000
 local MAX_NUMBER = 2147483647
-local EXEMPT = { V = true, CE = true, CQ = true, CL = true, HI = true, D = true }
+-- GF (group finder, decision 0145) is bound to the ruleset, not to the campaign.
+local EXEMPT = { V = true, CE = true, CQ = true, CL = true, HI = true, D = true, GF = true }
 local CAMPAIGN_LINES = { CE = true, CQ = true, CL = true }
--- Decision 0139: these never mutate shared state and pass from any ruleset.
-local ANY_RULESET = { V = true, HI = true, D = true }
+-- Decision 0139: these never mutate shared state and pass from any ruleset;
+-- RQ/RA (decision 0147) exist to learn another ruleset's realms; PW (decision
+-- 0148) lists the other side's online players, display only.
+local ANY_RULESET = { V = true, HI = true, D = true, RQ = true, RA = true, PW = true }
 -- The record that keeps the bare field, so that 0.1.1 PvP clients still hear it.
 local BARE_RECORD = 14
 local MAX_MARKER = 3

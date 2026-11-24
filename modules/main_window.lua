@@ -1262,6 +1262,9 @@ function Window:Build()
     self.titleVersion:SetPoint("BOTTOMLEFT", titleArt, "BOTTOMRIGHT", 3 - 71 * TITLE_SCALE, 6)
     self.titleVersion:SetText("v" .. tostring(WF.version))
   end
+  -- Both version texts open What's new (main_window_changelog.lua).
+  self:BindVersion(self.versionLabel)
+  self:BindVersion(self.titleVersion)
   self:BuildTabs()
   local help = Skin():Button(frame, "tab", HELP_SIZE, 26, function() Window:ToggleGuide() end, NAME .. "Help")
   Skin():SetButton(help, "?", true)
@@ -1392,9 +1395,7 @@ function Window:Refresh()
   if notice then summary = Paint("BAD", notice)
   elseif offline then summary = Paint("BAD", "Not connected to Warfront.") end
   FitText(self.summary, summary, self.summaryRoom)
-  local versionText = notice and Paint("BAD", "v" .. tostring(WF.version)) or ("v" .. tostring(WF.version))
-  SetText(self.versionLabel, versionText)
-  if self.titleVersion then SetText(self.titleVersion, versionText) end
+  self:PaintVersion()
   self:RefreshTabs(now)
   self:RefreshFrontDrawer(now)
 end

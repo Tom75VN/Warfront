@@ -151,6 +151,7 @@ P.commands = { title = "Slash commands", build = function()
     "- /wf tab: reopen the Warfront chat tab.",
     "- /wf where: your place and {layers|layer}.",
     "- /wf layerhelp on or off: help allies join your layer.",
+    "- /wf groups: find a group or list yours.",
     "- /wf army, /wf recruit <unit> [count]: {reserve}.",
     "- /wf res: {resources} and the stock here.",
     "- /wf garrison, /wf pledge <unit, gold or wood> [count] confirm: {garrisons}.",

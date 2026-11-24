@@ -1108,8 +1108,11 @@ function Territory:Update(now)
       end
     end
   end
-  filled = filled + 1
-  rows[filled] = "#other"
+  -- Without a current-zone section the list needs no title (2026-11-24, user).
+  if inZone > 0 and inZone < count then
+    filled = filled + 1
+    rows[filled] = "#other"
+  end
   for index = 1, count do
     if map.areas[self.poiIds[index]].mapKey ~= zone then
       filled = filled + 1

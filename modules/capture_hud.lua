@@ -1114,6 +1114,9 @@ function HUD:OnCloudCaptures(rows)
     local row = rows[index]
     local area = type(row) == "table" and Capture:Capturable(row.p)
     local key = area and (row.p .. ":" .. row.g)
+    -- A capture already listed with an estimated date (decision 0149 § 1)
+    -- takes the cloud's date (§ 3).
+    if key and history:Has(key) then history:Redate(key, row.a) end
     if area and row.f ~= row.o and not history:Has(key) then
       local verb = row.f == "N" and " captured the neutral place " or " captured "
       local text = "The " .. FactionName(row.o) .. verb .. AreaName(area) .. " (" .. tostring(area.map) .. ")."
@@ -1123,6 +1126,63 @@ function HUD:OnCloudCaptures(rows)
       if row.t == "C" then title = "Reported, not confirmed" end
       history:Add("captures", text, row.o, title, key, row.a)
       added = added + 1
+    end
+  end
+  return added
+end
+
+-- Missed captures from the owner catch-up (decision 0149 § 1). A session-only
+-- baseline of the registry is taken as soon as the owners are loaded (again
+-- after a campaign reset or a bucket change); every 30 s, a PEER rise of a
+-- faction owner whose key is not in the Journal is listed once, Journal only.
+-- Runs from the driver, never from a message handler (R4); never capture state.
+local MISSED_INTERVAL = 30
+
+local function MissedBaseline()
+  local rows, areas = {}, WF.Map and WF.Map.areas
+  if type(areas) == "table" then
+    for id in pairs(areas) do
+      if Capture:Capturable(id) then
+        local owner, generation = Capture:GetOwner(id)
+        rows[id] = { owner = owner, generation = generation }
+      end
+    end
+  end
+  -- No saved owner: no baseline this session (the cloud rows of 0144 still apply).
+  local saved = next(Capture.owners) ~= nil
+  return { owners = Capture.owners, bucket = Capture:Bucket(), rows = saved and rows or nil }
+end
+
+function HUD:SweepMissed(now, force)
+  if not (Capture and Capture.loaded and type(Capture.owners) == "table") then return 0 end
+  local base = self.missedBase
+  if not base or base.owners ~= Capture.owners then
+    self.missedBase, self.missedAt = MissedBaseline(), now
+    return 0
+  end
+  if not force and self.missedAt and now - self.missedAt < MISSED_INTERVAL then return 0 end
+  self.missedAt = now
+  if Capture:Bucket() ~= base.bucket then
+    self.missedBase = MissedBaseline()
+    return 0
+  end
+  local rows, history = base.rows, WF.AlertHistory
+  if not rows or not history then return 0 end
+  local added = 0
+  for id, entry in pairs(Capture.owners) do
+    local was = rows[id]
+    local generation = type(entry) == "table" and entry.generation
+    if type(generation) == "number" and generation > (was and was.generation or 0) then
+      rows[id] = { owner = entry.owner, generation = generation }
+      local area = entry.source == "PEER" and (entry.owner == "H" or entry.owner == "A") and Capture:Capturable(id)
+      local key = area and (id .. ":" .. generation)
+      if key and not history:Has(key) then
+        local before = was and generation == was.generation + 1 and was.owner or nil
+        local verb = before == "N" and " captured the neutral place " or " captured "
+        local text = "The " .. FactionName(entry.owner) .. verb .. AreaName(area) .. " (" .. tostring(area.map) .. ")."
+        history:Add("captures", text, entry.owner, "Missed capture", key, nil, true)
+        added = added + 1
+      end
     end
   end
   return added
@@ -1140,6 +1200,8 @@ if type(create) == "function" then
       HUD.lastAt = now
       local updated, err = pcall(HUD.Update, HUD)
       if not updated and WF.RecordError then WF.RecordError("capture HUD", err) end
+      local swept, sweepErr = pcall(HUD.SweepMissed, HUD, now)
+      if not swept and WF.RecordError then WF.RecordError("missed captures", sweepErr) end
     end)
     HUD.driver = driver
   end

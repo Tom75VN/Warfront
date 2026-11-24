@@ -48,9 +48,15 @@ local CHANNEL_WIRE_PREFIX = "WF" .. tostring(CHANNEL_LEVEL) .. ":" .. tostring(W
 -- WF.Capture:OnMessage (docs/p2p-protocol.md).
 local CHANNEL_ID_BY_TYPE = { HELLO = "HI", DATA = "D" }
 -- LJ/LN: a request to join a layer and its refusal (modules/layer_jump.lua,
--- decision 0119 step 4), whisper only.
+-- decision 0119 step 4), whisper only. GF: the group finder (modules/group_finder.lua,
+-- decision 0145), listings on the channel and the guild, answers by whisper. SR: a
+-- player's own scoreboard row (modules/score_rows.lua, decision 0146). RQ/RA:
+-- the ruleset question for unknown realms and its answer (modules/realm_ask.lua,
+-- decision 0147), channel only. PW: the other side's online players
+-- (modules/far_players.lua, decision 0148), channel only.
 local CHANNEL_TYPE_BY_ID = { HI = "HELLO", D = "DATA", V = "VERSION", B = "BEACON", R = "RELAY", NP = "NETWORK",
-  F = "FORWARD", BD = "BOARD", BQ = "BOARD", BP = "BOARD", AM = "ALLIES", LJ = "LAYER", LN = "LAYER" }
+  F = "FORWARD", BD = "BOARD", BQ = "BOARD", BP = "BOARD", AM = "ALLIES", LJ = "LAYER", LN = "LAYER",
+  GF = "GROUPS", SR = "SCORES", RQ = "REALMS", RA = "REALMS", PW = "PLAYERS" }
 local CAPTURE_IDS = {
   P = true, S = true, Q = true, K = true, H = true, HQ = true, OD = true, OL = true, X = true,
   G = true, GD = true, GQ = true, SC = true, SQ = true, SL = true, AC = true, AQ = true, AL = true, AR = true,
@@ -2085,6 +2091,7 @@ local function PrintHelp()
   WF.Print("/wf tab (reopen the Warfront chat tab after closing it)")
   WF.Print("/wf where (your position and the place you stand in)")
   WF.Print("/wf layerhelp on|off (invite players who ask to join your layer's fight)")
+  WF.Print("/wf groups (open the Group Finder)")
   WF.Print("/wf match [on|off] (meet a Warfront player from the other faction to improve data sharing between factions)")
   WF.Print("/wf army (reserve, unit costs and whether you can recruit here)")
   WF.Print("/wf recruit <unit> [count] (in your capital, or a Settlement or War Camp held by your faction; footman, rifleman, mortar, scout)")
@@ -2220,6 +2227,12 @@ local function SlashCommand(message)
       WF.Print("Warfront chat tab restored")
     else
       WF.Print("Warfront chat tab not restored: " .. tostring(applyError))
+    end
+    return
+  end
+  if string.lower(scope or "") == "groups" or string.lower(scope or "") == "group" then
+    if not WF.MainWindow or not WF.MainWindow.OpenGroups or not WF.MainWindow:OpenGroups() then
+      WF.Print("the Warfront window is unavailable (restart the client after an update)")
     end
     return
   end

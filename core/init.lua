@@ -6,7 +6,7 @@ WF.name = "Warfront"
 -- Same value as ## Version in the .toc (checked by tools/smoke.py). Every
 -- channel line carries it so older builds learn that they are outdated.
 -- Changed only by tools/release.py prepare, once per push (decision 0035).
-WF.version = "0.1.3"
+WF.version = "0.2.0"
 -- Compatibility level n of the channel line WF<n> (decision 0029): raised by any
 -- change that can make two builds disagree on the same messages, at the next
 -- tools/release.py prepare. Lines of another level are never applied.
